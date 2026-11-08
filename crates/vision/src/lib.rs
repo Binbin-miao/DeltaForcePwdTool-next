@@ -17,7 +17,10 @@ mod stripes;
 
 pub use binary::{BinaryImage, OtsuResult};
 pub use contour::{external_contours, Contour};
-pub use led::{read_glyph_string, LED_MIN_SCORE};
+pub use led::{
+    read_glyph_string, LED_DASH_HEIGHT_RATIO, LED_SHAPE_ACCEPT, LED_SHAPE_DECISIVE,
+    LED_TEMPLATE_MIN_SCORE, LED_ZERO_ASPECT,
+};
 pub use ncc::{match_template_ncc, NccMatch};
 pub use stripes::{detect_diagonal_stripe, DiagonalStripeParams};
 
@@ -53,12 +56,24 @@ pub enum VisionError {
     NoGlyph,
     #[error("算法参数非法：{name}")]
     InvalidParams { name: &'static str },
-    #[error("第 {index} 个字符无法识别：最佳得分 {best_score:.3} < 门限 {min_score:.3}")]
-    GlyphUnrecognized {
+    #[error(
+        "第 {index} 个 LED 字符双判据都不达标：模板 NCC {template_score:.3} / 结构签名 {shape_score:.3}"
+    )]
+    LedAmbiguous {
         index: usize,
-        best_score: f32,
-        min_score: f32,
+        template_score: f32,
+        shape_score: f32,
     },
+    #[error(
+        "LED 带内没有满高字形（最高 {tallest}px < 带高 {band_height}px 的 {min_ratio:.0}%），拒绝出字"
+    )]
+    LedNoAnchor {
+        tallest: u32,
+        band_height: u32,
+        min_ratio: f32,
+    },
+    #[error("内嵌 LED 字形模板不可用（构建期资源损坏）")]
+    LedTemplateUnavailable,
 }
 
 /// 图像内的整数区域（左上原点，单位像素）。

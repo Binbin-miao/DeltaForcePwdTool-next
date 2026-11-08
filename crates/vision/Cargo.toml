@@ -7,3 +7,5 @@ publish = false
 
 [dependencies]
 thiserror = { workspace = true }
+# spec §7.1：真实 LED 字形模板以 PNG 内嵌（`include_bytes!`），构建期随二进制走，不依赖运行时路径。
+png = { workspace = true }

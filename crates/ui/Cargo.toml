@@ -6,4 +6,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
-
+thiserror = { workspace = true }
+delta-config = { path = "../config" }
+delta-geom = { path = "../geom" }
+# spec D1：egui 0.37，渲染后端由 `delta-app` 的 eframe(glow) 决定，本 crate 只画。
+egui = "0.37"
