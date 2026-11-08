@@ -6,4 +6,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
-
+delta-capture.workspace = true
+delta-config.workspace = true
+delta-geom.workspace = true
+delta-input.workspace = true
+delta-vision.workspace = true
+thiserror.workspace = true
