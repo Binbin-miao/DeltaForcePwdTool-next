@@ -1,0 +1,12 @@
+[package]
+name = "delta-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+delta-geom = { workspace = true }
+delta-vision = { workspace = true }
+windows = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/geom",
+  "crates/config",
+  "crates/capture",
+  "crates/vision",
+  "crates/templates",
+  "crates/input",
+  "crates/hotkey",
+  "crates/ocr",
+  "crates/scene",
+  "crates/flow-morse",
+  "crates/flow-fingerprint",
+  "crates/flow-console",
+  "crates/ui",
+  "crates/app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+delta-geom = { path = "crates/geom" }
+delta-vision = { path = "crates/vision" }
+# t2 依赖预算：仅 GDI / 窗口消息 / DLL 装载，不引入 HiDpi feature，
+# DPI 感知通过 LoadLibrary+GetProcAddress 动态解析（见 crates/capture/src/dpi.rs）。
+windows = { version = "0.58", default-features = false, features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_LibraryLoader",
+] }
+
+# spec D1：单 exe ≤12MB，体积/启动优先（浮光结论）。
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
