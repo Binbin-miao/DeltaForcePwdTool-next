@@ -43,13 +43,7 @@ pub struct DeltaApp {
 impl DeltaApp {
     /// 构造（配置已由 `main` 读好；DPI 感知也已在此之前完成）。
     pub fn new(monitor: MonitorInfo, config: Config, config_path: PathBuf) -> Self {
-        let missing = config.validate();
-        let state = UiState {
-            disclaimer_pending: !config.accepted_disclaimer,
-            hotkey: config.hotkeys.scene.clone(),
-            missing: missing.iter().map(ToString::to_string).collect(),
-            ..UiState::default()
-        };
+        let state = initial_state(&config, monitor);
         let config = Arc::new(Mutex::new(config));
         let worker = Worker::spawn(config.clone(), monitor);
         Self {
@@ -165,6 +159,7 @@ impl DeltaApp {
                 }
             }
             Action::ToggleFlow(scene) => self.state.toggles.toggle(scene),
+            Action::DismissNotice => self.state.dismiss_notice(),
         }
         if self.keep_topmost {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
@@ -487,6 +482,23 @@ impl eframe::App for DeltaApp {
     }
 }
 
+/// 启动时的界面状态：未确认免责声明 / 未校准项 / 换分辨率警示。
+///
+/// **分辨率判断放在这里而不是 `main`**：`config` 与 `monitor` 本就是入参，
+/// 装配根不必重复这条规则，也不会出现「算了一次又传一次」的双源。
+fn initial_state(config: &Config, monitor: MonitorInfo) -> UiState {
+    let mut state = UiState {
+        disclaimer_pending: !config.accepted_disclaimer,
+        hotkey: config.hotkeys.scene.clone(),
+        missing: config.validate().iter().map(ToString::to_string).collect(),
+        ..UiState::default()
+    };
+    if config.resolution_changed(monitor) {
+        state.warn_resolution_changed();
+    }
+    state
+}
+
 /// 全屏帧 → egui 图像（降采样，顺便把 BGRA 转成 RGBA）。
 fn frame_to_image(frame: &delta_capture::Frame) -> egui::ColorImage {
     let step = PREVIEW_STEP.max(1);
@@ -533,6 +545,37 @@ fn existing_rects(
         .into_iter()
         .filter(|(_, rect)| !rect.is_empty())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monitor(w: i32, h: i32) -> MonitorInfo {
+        MonitorInfo::new(w, h).expect("测试分辨率合法")
+    }
+
+    #[test]
+    fn resolution_change_reaches_the_ui_as_a_notice() {
+        let config = Config {
+            monitor: monitor(1920, 1080),
+            ..Config::default()
+        };
+        let state = initial_state(&config, monitor(2560, 1440));
+        let notice = state.notice_text().expect("换分辨率必须让用户看得见");
+        assert!(notice.contains("重校"), "{notice}");
+    }
+
+    #[test]
+    fn same_or_uncalibrated_resolution_stays_silent() {
+        let config = Config {
+            monitor: monitor(1920, 1080),
+            ..Config::default()
+        };
+        assert_eq!(initial_state(&config, monitor(1920, 1080)).notice_text(), None);
+        // 首次启动（基线 0x0）不算变更，不打扰。
+        assert_eq!(initial_state(&Config::default(), monitor(2560, 1440)).notice_text(), None);
+    }
 }
 
 

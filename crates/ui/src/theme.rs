@@ -83,6 +83,9 @@ pub const TOGGLE_H: f32 = 28.0;
 pub const PRIMARY_H: f32 = 36.0;
 pub const PROGRESS_H: f32 = 64.0;
 pub const FOOTER_H: f32 = 28.0;
+/// 警示条里「知道了」按钮尺寸（24 高配 28 行高，不压扁正文）。
+pub const NOTICE_BUTTON_W: f32 = 64.0;
+pub const NOTICE_BUTTON_H: f32 = 24.0;
 /// 右下角自绘抓边尺寸。
 pub const RESIZE_GRIP: f32 = 12.0;
 /// 状态点半径。

@@ -173,7 +173,29 @@ fn main_layout(ui: &egui::Ui, full: Rect, state: &mut UiState, time: f64) -> Opt
         Pos2::new(content.left(), primary.bottom() + theme::SPACE_S),
         Pos2::new(content.right(), footer.top() - theme::SPACE_S),
     );
-    paint_panel(&painter, progress);
+    if let Some(notice) = state.notice_text() {
+        if notice_bar(ui, progress, notice) {
+            action = Some(Action::DismissNotice);
+        }
+    } else {
+        progress_panel(&painter, progress, state);
+    }
+
+    // ── 底部文字链 ───────────────────────────────────────────
+    if link(ui, footer.left_center(), "校准向导", &painter) {
+        action = Some(Action::OpenCalibration);
+    }
+    if link(ui, footer.right_center() - Vec2::new(theme::SPACE_XXL, 0.0), "设置", &painter) {
+        action = Some(Action::OpenSettings);
+    }
+
+    resize_grip(ui, full);
+    action
+}
+
+/// 进度区：进度文案 + 2px 进度条。
+fn progress_panel(painter: &egui::Painter, progress: Rect, state: &UiState) {
+    paint_panel(painter, progress);
     let note = if state.missing.is_empty() {
         state.progress.label()
     } else {
@@ -200,17 +222,41 @@ fn main_layout(ui: &egui::Ui, full: Rect, state: &mut UiState, time: f64) -> Opt
         let filled = Rect::from_min_size(track.min, Vec2::new(track.width() * state.progress.ratio(), 2.0));
         painter.rect_filled(filled, theme::RADIUS_BUTTON, theme::ACCENT);
     }
+}
 
-    // ── 底部文字链 ───────────────────────────────────────────
-    if link(ui, footer.left_center(), "校准向导", &painter) {
-        action = Some(Action::OpenCalibration);
-    }
-    if link(ui, footer.right_center() - Vec2::new(theme::SPACE_XXL, 0.0), "设置", &painter) {
-        action = Some(Action::OpenSettings);
-    }
+/// 一次性警示条：**借用进度区的位置与面板底**（不新增高度，窗口固定 400×420），
+/// 描边与文字用 `WARN`（琥珀橙）—— 提醒不是错误，不用红色。
+///
+/// 返回「知道了」是否被点。
+fn notice_bar(ui: &egui::Ui, rect: Rect, notice: &str) -> bool {
+    let painter = ui.painter().clone();
+    paint_panel(&painter, rect);
+    painter.rect_stroke(
+        rect,
+        theme::RADIUS_PANEL,
+        theme::stroke_active(theme::WARN),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.left_center() + Vec2::new(theme::SPACE_M, 0.0),
+        Align2::LEFT_CENTER,
+        notice,
+        theme::text(theme::FONT_BODY),
+        theme::WARN,
+    );
+    let button = notice_button_rect(rect);
+    secondary_button(ui, button, "知道了")
+}
 
-    resize_grip(ui, full);
-    action
+/// 「知道了」按钮位置：贴右居中，四周留 `SPACE_M` 边距（窄到 64px 高也不越界）。
+fn notice_button_rect(rect: Rect) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            rect.right() - theme::SPACE_M - theme::NOTICE_BUTTON_W,
+            rect.center().y - theme::NOTICE_BUTTON_H / 2.0,
+        ),
+        Vec2::new(theme::NOTICE_BUTTON_W, theme::NOTICE_BUTTON_H),
+    )
 }
 
 /// 收起态：176×36 悬浮条（状态点 + 场景名 + 迷你进度 + 展开箭头）。
@@ -948,6 +994,20 @@ mod tests {
         assert_eq!(clamped.y, 0.0);
         assert!(clamped.x + clamped.w <= 1.0 + 1e-6);
         assert!(clamped.y + clamped.h <= 1.0 + 1e-6);
+    }
+
+    #[test]
+    fn notice_button_stays_inside_the_result_slot() {
+        // 进度区实测可用 100px，但按 spec 的 PROGRESS_H=64 这个最紧的高度兜底：
+        // 警示条只能借用这块区域，绝不能把下方元素挤出窗口。
+        let slot = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(376.0, theme::PROGRESS_H));
+        let button = notice_button_rect(slot);
+        assert!(slot.contains_rect(button), "「知道了」必须完整落在结果区内");
+        let text_room = button.left() - slot.left() - theme::SPACE_M;
+        assert!(
+            text_room >= 9.0 * theme::FONT_BODY,
+            "文案位被按钮侵占：只剩 {text_room}px"
+        );
     }
 
     #[test]

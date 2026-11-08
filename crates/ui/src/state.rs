@@ -122,6 +122,11 @@ pub const BLINK_PERIOD_SECS: f64 = 0.5;
 /// 成功单次高亮时长（spec：200ms）。
 pub const SUCCESS_HIGHLIGHT_SECS: f64 = 0.2;
 
+/// 换分辨率警示文案（≤10 字、动词开头、零技术词）。
+///
+/// 语义：百分比坐标仍然有效，但绝对像素会偏移 —— 建议重跑一次校准。
+pub const RESOLUTION_NOTICE: &str = "屏幕变了 · 建议重校";
+
 /// 用户动作。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -134,6 +139,8 @@ pub enum Action {
     OpenSettings,
     AcceptDisclaimer,
     ToggleFlow(SceneKind),
+    /// 点掉一次性警示（如「屏幕变了 · 建议重校」）。
+    DismissNotice,
 }
 
 /// 进度区内容。
@@ -186,6 +193,10 @@ pub struct UiState {
     pub collapsed: bool,
     /// 免责声明未确认 → 界面中央显示条款。
     pub disclaimer_pending: bool,
+    /// 一次性警示文案（`None` = 不显示）；当前只用于「屏幕变了 · 建议重校」。
+    pub notice: Option<String>,
+    /// 用户已点掉过警示 → 本会话不再出现。
+    pub notice_dismissed: bool,
     /// 主热键标签（如 `F8`）。
     pub hotkey: String,
     /// 未校准项（空 = 已校准）。
@@ -244,6 +255,8 @@ impl Default for UiState {
             message: String::new(),
             collapsed: false,
             disclaimer_pending: true,
+            notice: None,
+            notice_dismissed: false,
             hotkey: "F8".to_owned(),
             missing: Vec::new(),
             toggles: Toggles {
@@ -285,11 +298,30 @@ impl UiState {
         format!("{} · {}", self.phase.label(), self.scene.label())
     }
 
-    /// 进入运行态。
+    /// 进入运行态（警示让位给进度，否则用户看不见识别进展）。
     pub fn begin_run(&mut self) {
         self.phase = Phase::Running;
         self.progress = Progress::new(0, 0, "");
         self.message.clear();
+        self.notice = None;
+    }
+
+    /// 装上「屏幕变了」警示：用户已点掉过就不再打扰。
+    pub fn warn_resolution_changed(&mut self) {
+        if !self.notice_dismissed {
+            self.notice = Some(RESOLUTION_NOTICE.to_owned());
+        }
+    }
+
+    /// 当前应渲染的警示文案。
+    pub fn notice_text(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    /// 点掉当前警示：本会话不再出现。
+    pub fn dismiss_notice(&mut self) {
+        self.notice = None;
+        self.notice_dismissed = true;
     }
 
     /// 收尾成某一态。
@@ -426,6 +458,39 @@ mod tests {
         assert!(!state.flow_enabled(SceneKind::Console), "关掉的入口不响应");
         state.toggles.toggle(SceneKind::Unknown);
         assert_eq!(state.toggles.entries().len(), 3);
+    }
+
+    #[test]
+    fn resolution_change_raises_a_dismissible_notice() {
+        let mut state = UiState::default();
+        assert_eq!(state.notice_text(), None, "默认不打扰用户");
+
+        state.warn_resolution_changed();
+        let notice = state.notice_text().expect("换分辨率必须提示");
+        assert!(notice.contains("重校"), "文案要点出「重校」：{notice}");
+        // 「≤10 字」只算字面字数，空格与分隔点不计。
+        let words = notice
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '·')
+            .count();
+        assert!(words <= 10, "文案超长（{words} 字）：{notice}");
+
+        state.dismiss_notice();
+        assert_eq!(state.notice_text(), None, "点掉后立即消失");
+        state.warn_resolution_changed();
+        assert_eq!(state.notice_text(), None, "本会话不得重复弹");
+    }
+
+    #[test]
+    fn starting_a_run_clears_the_notice_but_keeps_progress_visible() {
+        let mut state = UiState {
+            disclaimer_pending: false,
+            ..UiState::default()
+        };
+        state.warn_resolution_changed();
+        state.begin_run();
+        assert_eq!(state.notice_text(), None, "识别中要能看见进度");
+        assert_eq!(state.phase, Phase::Running);
     }
 
     #[test]
