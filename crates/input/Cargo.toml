@@ -6,4 +6,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
-
+delta-geom.workspace = true
+thiserror.workspace = true
+windows.workspace = true

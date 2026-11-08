@@ -29,13 +29,33 @@ serde_json = "1"
 thiserror = "1"
 delta-geom = { path = "crates/geom" }
 delta-vision = { path = "crates/vision" }
+delta-config = { path = "crates/config" }
+delta-capture = { path = "crates/capture" }
+delta-templates = { path = "crates/templates" }
+delta-input = { path = "crates/input" }
+delta-hotkey = { path = "crates/hotkey" }
+delta-ocr = { path = "crates/ocr" }
+# t4：纯 Rust PNG 解码（模板素材 105x105 真彩），rayon 并行 612 次匹配。
+png = "0.17"
+rayon = "1"
 # t2 依赖预算：仅 GDI / 窗口消息 / DLL 装载，不引入 HiDpi feature，
 # DPI 感知通过 LoadLibrary+GetProcAddress 动态解析（见 crates/capture/src/dpi.rs）。
+# t5 追加 SendInput / RegisterHotKey；t6 追加 WinRT OCR（零模型，用系统组件）。
 windows = { version = "0.58", default-features = false, features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_LibraryLoader",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_System_Com",
+  "Win32_System_Threading",
+  "Win32_System_WinRT",
+  "Foundation",
+  "Foundation_Collections",
+  "Globalization",
+  "Graphics_Imaging",
+  "Media_Ocr",
+  "Storage_Streams",
 ] }
 
 # spec D1：单 exe ≤12MB，体积/启动优先（浮光结论）。

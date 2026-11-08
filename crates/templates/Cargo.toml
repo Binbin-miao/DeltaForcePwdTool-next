@@ -6,4 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-
+delta-vision.workspace = true
+png.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
