@@ -247,7 +247,7 @@ fn shape_ncc(mask: &GlyphMask, character: char) -> f32 {
 
 /// 墨迹分布压成 5 行 × 3 列的平均覆盖率（0.0~1.0）。
 fn shape_signature(mask: &GlyphMask) -> Vec<f32> {
-    let mut counts = vec![0u32; SIGNATURE_ROWS * SIGNATURE_COLS];
+    let mut counts = [0u32; SIGNATURE_ROWS * SIGNATURE_COLS];
     for &(x, y) in &mask.ink {
         let row = bucket(y, mask.bbox.h, SIGNATURE_ROWS);
         let column = bucket(x, mask.bbox.w, SIGNATURE_COLS);

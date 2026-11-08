@@ -5,5 +5,33 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-[dependencies]
+[[bin]]
+name = "delta-pwd-tool"
+path = "src/main.rs"
 
+[dependencies]
+thiserror = { workspace = true }
+delta-ui = { path = "../ui" }
+delta-config = { path = "../config" }
+delta-geom = { path = "../geom" }
+delta-capture = { path = "../capture" }
+delta-vision = { path = "../vision" }
+delta-templates = { path = "../templates" }
+delta-hotkey = { path = "../hotkey" }
+delta-ocr = { path = "../ocr" }
+delta-scene = { path = "../scene" }
+delta-flow-morse = { path = "../flow-morse" }
+delta-flow-fingerprint = { path = "../flow-fingerprint" }
+delta-flow-console = { path = "../flow-console" }
+# 补录指纹模板要把九格写成 PNG（与模板库解码同一套 png 0.17）。
+png = { workspace = true }
+# spec D1：glow 后端（禁 wgpu）。
+eframe = { version = "0.37", default-features = false, features = ["glow"] }
+egui = "0.37"
+# 单实例（`CreateMutexW`）与找窗激活（`EnumWindows`）需要额外打开 Security 特性。
+windows = { version = "0.58", default-features = false, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+] }

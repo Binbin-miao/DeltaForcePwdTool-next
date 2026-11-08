@@ -261,6 +261,8 @@ pub struct Wizard {
     pub verdict: Verdict,
     /// 保存完成后显示「已保存 · 换分辨率也能用」。
     pub saved: bool,
+    /// 补录模板时的角色名（只有 `Recapture` 用）。
+    pub role_name: String,
 }
 
 impl Default for Wizard {
@@ -272,6 +274,7 @@ impl Default for Wizard {
             drawn: Vec::new(),
             verdict: Verdict::Pending,
             saved: false,
+            role_name: String::new(),
         }
     }
 }
@@ -289,6 +292,7 @@ impl Wizard {
         self.drawn = vec![false; targets(scene).len()];
         self.verdict = Verdict::Pending;
         self.saved = false;
+        self.role_name.clear();
     }
 
     /// 当前场景的区域清单。
@@ -323,7 +327,11 @@ impl Wizard {
             Step::PickScene => self.scene.is_some(),
             Step::SelectRegion => self.drawn_count() > 0,
             Step::Review => self.drawn_count() > 0,
-            Step::TestRun => matches!(self.verdict, Verdict::Read(_)),
+            // 补录模板不走试跑（它不读画面，只把九格存成模板）。
+            Step::TestRun => {
+                self.scene == Some(WizardScene::Recapture)
+                    || matches!(self.verdict, Verdict::Read(_))
+            }
             Step::Save => true,
         }
     }
@@ -336,6 +344,8 @@ impl Wizard {
         self.step = match self.step {
             Step::PickScene => Step::SelectRegion,
             Step::SelectRegion => Step::Review,
+            // 补录模板没有「试跑」这一步：直接进保存。
+            Step::Review if self.scene == Some(WizardScene::Recapture) => Step::Save,
             Step::Review => Step::TestRun,
             Step::TestRun => Step::Save,
             Step::Save => {
@@ -514,6 +524,20 @@ mod tests {
         assert_eq!(wizard.step, Step::Save);
         wizard.advance();
         assert!(wizard.is_finished());
+    }
+
+    #[test]
+    fn recapture_skips_test_run_and_needs_a_role_name() {
+        let mut wizard = Wizard::new();
+        wizard.choose(WizardScene::Recapture);
+        assert_eq!(targets(WizardScene::Recapture).len(), 9, "只剩九格");
+        wizard.record_drawn();
+        assert!(wizard.advance(), "框选 → 复看");
+        assert_eq!(wizard.step, Step::Review);
+        assert!(wizard.advance(), "补录跳过试跑");
+        assert_eq!(wizard.step, Step::Save);
+        wizard.role_name = "埃德温".to_owned();
+        assert_eq!(wizard.role_name, "埃德温");
     }
 
     #[test]

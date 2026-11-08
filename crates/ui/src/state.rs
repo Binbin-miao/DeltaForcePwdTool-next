@@ -192,6 +192,8 @@ pub struct UiState {
     pub missing: Vec<String>,
     /// 三个功能入口的开关。
     pub toggles: Toggles,
+    /// 进入当前状态后经过的秒数（成功 200ms 高亮 / 呼吸相位都靠它）。
+    pub phase_elapsed: f64,
 }
 
 /// 三个功能入口开关。
@@ -249,6 +251,7 @@ impl Default for UiState {
                 fingerprint: true,
                 console: true,
             },
+            phase_elapsed: 0.0,
         }
     }
 }
@@ -381,8 +384,10 @@ mod tests {
 
     #[test]
     fn sequence_text_hides_for_non_console_scenes() {
-        let mut state = UiState::default();
-        state.sequence = Some("01 · 00 · 01 · 11".to_owned());
+        let mut state = UiState {
+            sequence: Some("01 · 00 · 01 · 11".to_owned()),
+            ..UiState::default()
+        };
         assert_eq!(state.sequence_text(), "──", "摩斯/指纹没有目标序列");
         state.scene = SceneKind::Console;
         assert_eq!(state.sequence_text(), "01 · 00 · 01 · 11");
@@ -409,8 +414,10 @@ mod tests {
 
     #[test]
     fn flow_entries_are_greyed_when_uncalibrated() {
-        let mut state = UiState::default();
-        state.disclaimer_pending = false;
+        let mut state = UiState {
+            disclaimer_pending: false,
+            ..UiState::default()
+        };
         assert!(state.flow_enabled(SceneKind::Morse));
         state.missing = vec!["摩斯区域 #1".to_owned()];
         assert!(!state.flow_enabled(SceneKind::Morse), "未校准必须灰置");
@@ -423,8 +430,10 @@ mod tests {
 
     #[test]
     fn status_line_joins_phase_and_scene() {
-        let mut state = UiState::default();
-        state.scene = SceneKind::Console;
+        let mut state = UiState {
+            scene: SceneKind::Console,
+            ..UiState::default()
+        };
         assert_eq!(state.status_line(), "待机 · 操作台");
         state.finish(Phase::Unrecognized, "未识别到游戏界面");
         assert_eq!(state.status_line(), "未识别 · 操作台");

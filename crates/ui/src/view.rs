@@ -4,7 +4,7 @@
 //! 只会出现在 2px 描边 / 状态点 / 数值文字上，不会铺成大面积色块。
 
 use delta_geom::PctRect;
-use egui::{Align2, Color32, Id, Pos2, Rect, Sense, Stroke, Vec2};
+use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
 use crate::state::{Action, Phase, UiState};
 use crate::theme;
@@ -20,7 +20,7 @@ pub const DISCLAIMER_LINES: [&str; 4] = [
 
 /// 主窗口一帧：返回用户动作（无动作为 `None`）。
 pub fn main_window(ui: &mut egui::Ui, state: &mut UiState) -> Option<Action> {
-    let time = ui.ctx().input(|input| input.time);
+    let time = state.phase_elapsed;
     let full = ui.max_rect();
     let painter = ui.painter().clone();
     paint_shell(&painter, full, state.phase, time);
@@ -73,7 +73,8 @@ fn paint_panel(painter: &egui::Painter, rect: Rect) {
 
 /// 交互区域：返回是否被点击。
 fn clickable(ui: &egui::Ui, rect: Rect, key: &str, sense: Sense) -> egui::Response {
-    ui.interact(rect, Id::new(("delta-ui", key)), sense)
+    // `make_persistent_id` 用根 Ui 的 id 加盐，跨帧稳定且天然按控件分桶。
+    ui.interact(rect, ui.make_persistent_id(key), sense)
 }
 
 /// 主布局（自上而下：标题条 32 / 序列 72 / 三开关 / 主按钮 36 / 进度 / 底部 28）。
@@ -215,7 +216,7 @@ fn main_layout(ui: &egui::Ui, full: Rect, state: &mut UiState, time: f64) -> Opt
 /// 收起态：176×36 悬浮条（状态点 + 场景名 + 迷你进度 + 展开箭头）。
 fn collapsed_strip(ui: &egui::Ui, full: Rect, state: &mut UiState) -> Option<Action> {
     let painter = ui.painter().clone();
-    let time = ui.ctx().input(|input| input.time);
+    let time = state.phase_elapsed;
     let strip = full.shrink(theme::SHADOW_EXTENT);
     let mut action = None;
     let drag = clickable(ui, strip, "collapsed-drag", Sense::click_and_drag());
@@ -522,6 +523,29 @@ pub fn wizard_window(
                 Step::Save => paint_saved(ui, stage, wizard),
             }
 
+            // 补录模板：复看步顺带填角色名（只此一处用 egui 原生输入框）。
+            if wizard.step == Step::Review && wizard.scene == Some(WizardScene::Recapture) {
+                let field = Rect::from_min_size(
+                    Pos2::new(content.left(), content.top() + theme::SPACE_XXL),
+                    Vec2::new(content.width(), theme::PRIMARY_H),
+                );
+                painter.text(
+                    Pos2::new(field.left(), field.top() - theme::SPACE_XS),
+                    Align2::LEFT_BOTTOM,
+                    "填角色名",
+                    theme::text(theme::FONT_LABEL),
+                    theme::TEXT_2,
+                );
+                let mut buffer = wizard.role_name.clone();
+                let response = ui.put(
+                    field,
+                    egui::TextEdit::singleline(&mut buffer).hint_text("角色名"),
+                );
+                if response.changed() {
+                    wizard.role_name = buffer;
+                }
+            }
+
             // 底部按钮行
             let row = Rect::from_min_size(
                 Pos2::new(content.left(), content.bottom() - theme::PRIMARY_H),
@@ -789,6 +813,106 @@ fn dashed_pct_rect(painter: &egui::Painter, stage: Rect, rect: PctRect, color: C
         );
         y += dash * 2.0;
     }
+}
+
+
+/// 设置浮层素材（v1 只暴露三项：热键、OCR 兜底、配置路径）。
+pub struct SettingsView<'a> {
+    pub hotkey: &'a str,
+    pub ocr_enabled: bool,
+    pub config_path: &'a str,
+}
+
+/// 设置浮层动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsAction {
+    /// 只读检查游戏与场景，不产生任何输入。
+    Probe,
+    ToggleOcr,
+    Close,
+}
+
+/// 设置浮层（覆在主界面上，不新开窗口）。
+pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<SettingsAction> {
+    let mut action = None;
+    if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
+        action = Some(SettingsAction::Close);
+    }
+    let full = ui.max_rect();
+    let painter = ui.painter().clone();
+    paint_shell(&painter, full, Phase::Idle, 0.0);
+    let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
+    painter.text(
+        content.left_top(),
+        Align2::LEFT_TOP,
+        "设置",
+        theme::text(theme::FONT_TITLE),
+        theme::TEXT_1,
+    );
+
+    // 热键（只读，改键请编辑配置文件）
+    let hotkey_row = Rect::from_min_size(
+        Pos2::new(content.left(), content.top() + theme::SPACE_XXL),
+        Vec2::new(content.width(), theme::TOGGLE_H),
+    );
+    paint_panel(&painter, hotkey_row);
+    painter.text(
+        hotkey_row.left_center() + Vec2::new(theme::SPACE_M, 0.0),
+        Align2::LEFT_CENTER,
+        "全局热键",
+        theme::text(theme::FONT_BODY),
+        theme::TEXT_2,
+    );
+    painter.text(
+        hotkey_row.right_center() - Vec2::new(theme::SPACE_M, 0.0),
+        Align2::RIGHT_CENTER,
+        view.hotkey,
+        theme::mono(theme::FONT_BODY),
+        theme::TEXT_1,
+    );
+
+    // OCR 兜底开关
+    let ocr_row = Rect::from_min_size(
+        Pos2::new(content.left(), hotkey_row.bottom() + theme::SPACE_S),
+        Vec2::new(content.width(), theme::TOGGLE_H),
+    );
+    if toggle_row(ui, ocr_row, "文字兜底", view.ocr_enabled, &painter) {
+        action = Some(SettingsAction::ToggleOcr);
+    }
+
+    // 配置路径（只读提示）
+    painter.text(
+        Pos2::new(content.left(), ocr_row.bottom() + theme::SPACE_M),
+        Align2::LEFT_TOP,
+        "配置文件",
+        theme::text(theme::FONT_LABEL),
+        theme::TEXT_3,
+    );
+    painter.text(
+        Pos2::new(content.left(), ocr_row.bottom() + theme::SPACE_XL),
+        Align2::LEFT_TOP,
+        view.config_path,
+        theme::mono(theme::FONT_LABEL),
+        theme::TEXT_3,
+    );
+
+    // 底部：检查游戏 / 返回
+    let footer = Rect::from_min_size(
+        Pos2::new(content.left(), content.bottom() - theme::PRIMARY_H),
+        Vec2::new(content.width(), theme::PRIMARY_H),
+    );
+    let probe = Rect::from_min_size(footer.min, Vec2::new(footer.width() * 0.48, footer.height()));
+    if secondary_button(ui, probe, "检查游戏") {
+        action = Some(SettingsAction::Probe);
+    }
+    let back = Rect::from_min_size(
+        Pos2::new(probe.right() + theme::SPACE_S, footer.top()),
+        Vec2::new(footer.width() - probe.width() - theme::SPACE_S, footer.height()),
+    );
+    if primary_button(ui, back, "返回", true, Phase::Idle) {
+        action = Some(SettingsAction::Close);
+    }
+    action
 }
 
 #[cfg(test)]
