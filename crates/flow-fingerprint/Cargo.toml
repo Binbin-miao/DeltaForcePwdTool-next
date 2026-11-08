@@ -6,4 +6,14 @@ license.workspace = true
 publish = false
 
 [dependencies]
+delta-capture.workspace = true
+delta-vision.workspace = true
+delta-config.workspace = true
+delta-geom.workspace = true
+delta-input.workspace = true
+delta-templates.workspace = true
+delta-ocr.workspace = true
+thiserror.workspace = true
+# 失败留证要写 png（spec D10 缺陷③）。复用工作区已有的 png 0.17，不新增依赖树节点。
+png.workspace = true
 
