@@ -62,16 +62,6 @@ impl Drag {
         Ok(())
     }
 
-    /// 在光标当前位置直接按下左键（旋钮流程里光标已由绝对定位摆好时用）。
-    pub fn begin_here(&mut self) -> Result<(), InputError> {
-        if self.pressed {
-            return Err(InputError::AlreadyPressed);
-        }
-        self.sink.emit(Injected::LeftDown)?;
-        self.pressed = true;
-        Ok(())
-    }
-
     /// 相对位移一步。内部拆成 ≤20px 的子步，子步之间等 2ms。
     pub fn step(&mut self, dx: i32, dy: i32) -> Result<(), InputError> {
         if !self.pressed {
@@ -227,17 +217,9 @@ mod tests {
     }
 
     #[test]
-    fn begin_here_skips_absolute_positioning() {
-        let (mut drag, log) = Drag::recording();
-        drag.begin_here().expect("begin_here");
-        drag.end().expect("end");
-        assert_eq!(log.events(), vec![Injected::LeftDown, Injected::LeftUp]);
-    }
-
-    #[test]
     fn zero_delta_step_emits_nothing_but_keeps_pressed() {
         let (mut drag, log) = Drag::recording();
-        drag.begin_here().expect("begin");
+        drag.begin(PxPoint::ZERO).expect("begin");
         let before = log.len();
         drag.step(0, 0).expect("空步");
         assert_eq!(log.len(), before, "零位移不得产生事件");

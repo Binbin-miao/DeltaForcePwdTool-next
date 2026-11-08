@@ -10,9 +10,8 @@
 
 use std::fmt;
 
-use delta_capture::{Capturer, Frame};
 use delta_config::{PxView, Timings};
-use delta_geom::{PxPoint, PxRect};
+use delta_geom::PxPoint;
 use delta_vision::{
     external_contours, GrayImage, Region, DASH_ASPECT_THRESHOLD, NOISE_AREA_GATE,
 };
@@ -114,33 +113,14 @@ pub fn decode_gray(gray: &GrayImage) -> Result<u8, MorseError> {
     digit_for_pattern(&pattern).ok_or(MorseError::Unmapped { pattern })
 }
 
-/// 截图来源（真机是 [`LiveScreen`]，测试是内存画面）。
-pub trait ScreenSource {
-    fn grab(&mut self, rect: PxRect) -> Result<Frame, String>;
-}
+/// 截图来源与真机适配统一由 `delta-capture` 提供（与 `flow-fingerprint` 共用同一实现）。
+pub use delta_capture::{LiveScreen, ScreenSource};
 
 /// 输入落地（真机是 [`LiveInput`]，测试是录音器）。
 pub trait InputSink {
     fn press_digit(&mut self, digit: u8) -> Result<(), String>;
     fn click(&mut self, at: PxPoint) -> Result<(), String>;
     fn sleep_ms(&mut self, ms: u64);
-}
-
-/// 真机截图适配（复用 t2 的常驻 DC）。
-pub struct LiveScreen<'a> {
-    capturer: &'a mut Capturer,
-}
-
-impl<'a> LiveScreen<'a> {
-    pub fn new(capturer: &'a mut Capturer) -> Self {
-        Self { capturer }
-    }
-}
-
-impl ScreenSource for LiveScreen<'_> {
-    fn grab(&mut self, rect: PxRect) -> Result<Frame, String> {
-        self.capturer.grab(rect).map_err(|error| error.to_string())
-    }
 }
 
 /// 真机输入适配（复用 t5 的 `SendInput`）。
@@ -301,8 +281,9 @@ impl fmt::Display for MorseOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use delta_capture::Frame;
     use delta_config::{PxConsole, PxFingerprint, PxRegion};
-    use delta_geom::MonitorInfo;
+    use delta_geom::{MonitorInfo, PxRect};
     use std::collections::HashMap;
     use std::time::Instant;
 

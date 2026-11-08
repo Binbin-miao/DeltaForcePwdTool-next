@@ -148,9 +148,18 @@ impl Config {
         })
     }
 
+    /// 当前主显示器分辨率是否已不同于校准记录的分辨率。
+    ///
+    /// 只提示、不阻断：坐标以百分比存储，换分辨率后**相对位置仍然有效**，
+    /// 但绝对像素会有偏移，UI 据此提示「建议重新校准」（spec D9）。
+    pub fn resolution_changed(&self, current: MonitorInfo) -> bool {
+        self.monitor.is_calibrated()
+            && current.is_calibrated()
+            && (self.monitor.w, self.monitor.h) != (current.w, current.h)
+    }
+
     /// 列出所有未校准的必填区域。空列表 == 全部就绪（spec D9 的 UI 灰置依据）。
-    pub fn validate(&self) -> Vec<MissingArea> {
-        let mut missing = Vec::new();
+    pub fn validate(&self) -> Vec<MissingArea> {        let mut missing = Vec::new();
         if !self.monitor.is_calibrated() {
             missing.push(MissingArea::Monitor);
         }
@@ -294,20 +303,19 @@ impl Default for ConsoleConfig {
 }
 
 /// 热键绑定（spec D6：单键 + `MOD_NOREPEAT`，默认 F8）。
+///
+/// 只保留**真正被读取**的绑定：`scene` 由 `delta-app` 注册并分发。摩斯 / 指纹流程共用同一个
+/// 场景热键，因此不存在独立的 `morse` / `fingerprint` 键位（spec §2.2 第 10 条：不得复活死配置）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Hotkeys {
     pub scene: String,
-    pub morse: String,
-    pub fingerprint: String,
 }
 
 impl Default for Hotkeys {
     fn default() -> Self {
         Self {
             scene: "F8".to_owned(),
-            morse: "F9".to_owned(),
-            fingerprint: "F10".to_owned(),
         }
     }
 }
@@ -560,5 +568,37 @@ mod tests {
             config.try_px_view(),
             Err(ConfigError::Geom(GeomError::InvalidMonitor { w: 0, h: 0 }))
         ));
+    }
+
+    #[test]
+    fn resolution_change_is_detected_but_keeps_relative_positions() {
+        let config = calibrated_config();
+        let same = MonitorInfo::new(1920, 1080).expect("固定分辨率");
+        let larger = MonitorInfo::new(2560, 1440).expect("固定分辨率");
+        assert!(!config.resolution_changed(same), "同一分辨率不得误报");
+        assert!(config.resolution_changed(larger), "换分辨率必须被检出");
+
+        // 百分比是唯一持久真相：换分辨率后相对位置不变，绝对像素按比例放大。
+        let knob_pct = config.console.knob_center;
+        let on_1080 = knob_pct.to_px(same).expect("换算");
+        let on_1440 = knob_pct.to_px(larger).expect("换算");
+        assert_eq!(on_1080.x, 960);
+        assert_eq!(on_1440.x, 1280);
+        let ratio = |value: i32, extent: i32| value as f32 / extent as f32;
+        assert!((ratio(on_1080.x, same.w) - ratio(on_1440.x, larger.w)).abs() < 1e-6);
+        assert!((ratio(on_1080.y, same.h) - ratio(on_1440.y, larger.h)).abs() < 1e-6);
+
+        // 未校准（0x0）时不算「变更」，避免首次启动就报警。
+        assert!(!Config::default().resolution_changed(larger));
+    }
+
+    #[test]
+    fn legacy_hotkey_fields_are_ignored_not_fatal() {
+        // 旧配置文件里的 `morse` / `fingerprint` 已删除：必须被静默忽略（前向兼容），
+        // 且剩下的 `scene` 仍正常读出。
+        let json = r#"{"hotkeys":{"scene":"F7","morse":"F9","fingerprint":"F10"}}"#;
+        let config: Config = serde_json::from_str(json).expect("旧配置必须仍能解析");
+        assert_eq!(config.hotkeys.scene, "F7");
+        assert_eq!(config.hotkeys, Hotkeys { scene: "F7".to_owned() });
     }
 }

@@ -406,13 +406,14 @@ mod tests {
     fn duplicate_registration_is_rejected_with_a_named_error() {
         let _serial = serial();
         let hotkeys = Hotkeys::new().expect("启动热键线程");
-        let first = hotkeys.register(Hotkey::default()).expect("首次注册 F8");
+        // 用备用键 F23：真实程序在跑时占着 F8（生产默认键），断言会撞成 RegisterFailed。
+        let first = hotkeys.register(Hotkey::plain(vk::F23)).expect("首次注册 F23");
         let error = hotkeys
-            .register(Hotkey::default())
+            .register(Hotkey::plain(vk::F23))
             .expect_err("重复注册必须报错");
         assert_eq!(
             error,
-            HotkeyError::AlreadyRegistered { vk: vk::F8 },
+            HotkeyError::AlreadyRegistered { vk: vk::F23 },
             "必须是具名错误，不得静默"
         );
         assert_eq!(hotkeys.registered().len(), 1, "失败的注册不得留下残留");

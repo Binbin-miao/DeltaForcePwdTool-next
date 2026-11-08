@@ -22,7 +22,7 @@ pub use led::{
     LED_TEMPLATE_MIN_SCORE, LED_ZERO_ASPECT,
 };
 pub use ncc::{match_template_ncc, NccMatch};
-pub use stripes::{detect_diagonal_stripe, DiagonalStripeParams};
+pub use stripes::{detect_diagonal_stripe, detect_yellow_hatch, DiagonalStripeParams};
 
 /// spec §2.2 不变量 7：噪点门（`w*h < 10` 的连通域直接丢弃）。
 pub const NOISE_AREA_GATE: u32 = 10;

@@ -19,7 +19,7 @@ mod evidence;
 use std::fmt;
 use std::path::PathBuf;
 
-use delta_capture::{Capturer, Frame};
+use delta_capture::Frame;
 use delta_config::{PxView, Timings};
 use delta_geom::{PxPoint, PxRect};
 use delta_ocr::OcrEngine;
@@ -35,10 +35,8 @@ pub use correction::{
 };
 pub use evidence::{save_failure, Evidence, EVIDENCE_DIR};
 
-/// 截图来源（真机是 [`LiveScreen`]）。
-pub trait ScreenSource {
-    fn grab(&mut self, rect: PxRect) -> Result<Frame, String>;
-}
+/// 截图来源与真机适配统一由 `delta-capture` 提供（与 `flow-morse` 共用同一实现）。
+pub use delta_capture::{LiveScreen, ScreenSource};
 
 /// 输入落地（真机是 [`LiveInput`]）。
 pub trait InputSink {
@@ -49,23 +47,6 @@ pub trait InputSink {
 /// 文本识别（真机是 [`OcrReader`]；测试是固定字符串）。
 pub trait TextReader {
     fn read_text(&mut self, frame: &Frame) -> Result<String, String>;
-}
-
-/// 真机截图适配（复用 t2 常驻 DC）。
-pub struct LiveScreen<'a> {
-    capturer: &'a mut Capturer,
-}
-
-impl<'a> LiveScreen<'a> {
-    pub fn new(capturer: &'a mut Capturer) -> Self {
-        Self { capturer }
-    }
-}
-
-impl ScreenSource for LiveScreen<'_> {
-    fn grab(&mut self, rect: PxRect) -> Result<Frame, String> {
-        self.capturer.grab(rect).map_err(|error| error.to_string())
-    }
 }
 
 /// 真机输入适配（复用 t5 `SendInput`）。

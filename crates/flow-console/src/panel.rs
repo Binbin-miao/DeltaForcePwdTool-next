@@ -3,14 +3,16 @@
 //! 一次扫描同时产出三项观测，避免多次遍历彩色帧：
 //! 1. **青色结构特征占比** —— 主完成判据（面板整体消失 → `< 8%`）；
 //! 2. **米黄色块质心** —— 旋钮当前位置，映射为 `(列, 行)`；
-//! 3. **黄黑斜纹浮层** —— 辅助判据（该列已被接受），先由亮黄像素包围盒定位候选，
-//!    再用 [`delta_vision::detect_diagonal_stripe`] 验证方向性，避免把纯黄色块误判为浮层。
+//! 3. **黄黑斜纹浮层** —— 辅助判据（该列已被接受）。整块交给
+//!    [`delta_vision::detect_yellow_hatch`]：先在彩色帧里按黄色边框找矩形候选，
+//!    再在候选内验证 45° 方向性。**没有黄色候选就不可能判为浮层**，因此面板里其它
+//!    高对比 45° 图案不会让状态机提前跳列（spec §7.3）。
 //!
 //! 色域阈值全部来自 [`ConsoleParams`]（spec 标定值），本文件不含业务常数。
 
 use delta_capture::Frame;
 use delta_geom::{PxPoint, PxRect};
-use delta_vision::{detect_diagonal_stripe, DiagonalStripeParams};
+use delta_vision::{detect_yellow_hatch, DiagonalStripeParams};
 
 use crate::params::{rgb_to_hsv, ConsoleParams};
 
@@ -48,8 +50,6 @@ pub fn analyze_panel(frame: &Frame, params: &ConsoleParams) -> PanelObservation 
     let mut cyan = 0u64;
     let mut knob_sum = (0.0f64, 0.0f64);
     let mut knob_pixels = 0u32;
-    // 亮黄像素的包围盒（先当作浮层候选，再由斜纹方向性验证）。
-    let mut overlay_box: Option<(i32, i32, i32, i32)> = None;
 
     for y in 0..height {
         for x in 0..width {
@@ -63,12 +63,6 @@ pub fn analyze_panel(frame: &Frame, params: &ConsoleParams) -> PanelObservation 
                 knob_sum.1 += f64::from(y);
                 knob_pixels += 1;
             }
-            if params.overlay_hsv.contains(color) {
-                overlay_box = Some(match overlay_box {
-                    None => (x, y, x, y),
-                    Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
-                });
-            }
         }
     }
 
@@ -81,7 +75,7 @@ pub fn analyze_panel(frame: &Frame, params: &ConsoleParams) -> PanelObservation 
     PanelObservation {
         cyan_pct: cyan as f32 * 100.0 / total as f32,
         knob,
-        overlay: detect_overlay(frame, params, overlay_box),
+        overlay: detect_overlay(frame, params),
     }
 }
 
@@ -122,33 +116,32 @@ fn nearest_axis(values: &[i32], target: f32, max_distance_px: i32) -> Option<usi
     (distance <= max_distance_px as f32).then_some(index)
 }
 
-/// 验证浮层候选包围盒内确实存在 45° 黄黑斜纹。
+/// 浮层判据：把原始**彩色帧**交给 [`detect_yellow_hatch`]（黄色门 + 45° 方向性）。
 ///
-/// 两道门：包围盒尺寸要够大（旋钮块只有 20×20，天然过不了），框内要真有斜纹方向性
-/// （纯黄色块过不了）。因此「旋钮色域与浮层色域重叠」不会造成误判。
-fn detect_overlay(
-    frame: &Frame,
-    params: &ConsoleParams,
-    overlay_box: Option<(i32, i32, i32, i32)>,
-) -> bool {
-    let Some((x0, y0, x1, y1)) = overlay_box else {
-        return false;
-    };
-    let box_w = (x1 - x0 + 1).max(0) as u32;
-    let box_h = (y1 - y0 + 1).max(0) as u32;
-    if box_w < params.overlay_min_w || box_h < params.overlay_min_h {
-        return false;
-    }
-    let region = delta_vision::Region {
-        x: x0.max(0) as u32,
-        y: y0.max(0) as u32,
-        w: box_w,
-        h: box_h,
-    };
-    match frame.luma().crop(region) {
-        Ok(cropped) => detect_diagonal_stripe(&cropped, &DiagonalStripeParams::default())
-            .unwrap_or(false),
-        Err(_) => false,
+/// 两道门都在 vision 内：找不到黄色矩形候选直接 `false`（旋钮块、纯黄块、面板里的黑白
+/// 高对比斜纹都过不了），有候选还要在候选内通过 45° 方向性与明暗交替性。
+fn detect_overlay(frame: &Frame, params: &ConsoleParams) -> bool {
+    detect_yellow_hatch(
+        &frame.data,
+        frame.w,
+        frame.h,
+        frame.stride,
+        &hatch_params(params),
+    )
+    .unwrap_or(false)
+}
+
+/// 黄色门与候选尺寸取 [`ConsoleParams`] 的标定值（唯一常数来源），
+/// 45° 方向性阈值沿用 `delta-vision` 的默认值。
+fn hatch_params(params: &ConsoleParams) -> DiagonalStripeParams {
+    DiagonalStripeParams {
+        box_hue_min: params.overlay_hsv.h_min,
+        box_hue_max: params.overlay_hsv.h_max,
+        box_sat_min: params.overlay_hsv.s_min,
+        box_val_min: params.overlay_hsv.v_min,
+        box_min_w: params.overlay_min_w,
+        box_min_h: params.overlay_min_h,
+        ..DiagonalStripeParams::default()
     }
 }
 
@@ -230,5 +223,23 @@ mod tests {
         let mut canvas = Canvas::filled(200, 120, [55, 95, 120]);
         canvas.rect(90, 40, 20, 20, [230, 200, 120]);
         assert!(!analyze_panel(&canvas.into_frame(), &params()).overlay);
+    }
+
+    #[test]
+    fn non_yellow_diagonal_pattern_is_not_an_overlay() {
+        // spec §7.3 的黄色门：面板内无黄色边框的高对比 45° 黑白斜纹不得判为浮层，
+        // 否则 Verify 会误以为「该列已被接受」而提前跳列，密码必错。
+        let mut canvas = Canvas::filled(200, 120, [55, 95, 120]);
+        for y in 10..80i32 {
+            for x in 20..180i32 {
+                let band = (x - y).div_euclid(8).rem_euclid(2);
+                let rgb = if band == 0 { [245, 245, 245] } else { [10, 10, 10] };
+                canvas.set(x, y, rgb);
+            }
+        }
+        assert!(
+            !analyze_panel(&canvas.into_frame(), &params()).overlay,
+            "没有黄色边框的 45° 黑白斜纹不得判为浮层"
+        );
     }
 }

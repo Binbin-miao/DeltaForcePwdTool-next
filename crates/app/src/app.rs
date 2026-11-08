@@ -77,8 +77,12 @@ impl DeltaApp {
     }
 
     /// 写回配置（原子写；失败不静默）。
+    ///
+    /// 落盘前把主显示器物理分辨率写成**当前实际读数**：百分比坐标需要一个锚点分辨率，
+    /// 否则配置里永远留着 `0x0`，`validate()` 会一直报「主显示器未校准」。
     fn persist(&mut self) -> Result<(), String> {
-        let config = self.snapshot();
+        let mut config = self.snapshot();
+        config.monitor = self.monitor;
         delta_config::save(&self.config_path, &config).map_err(|error| error.to_string())
     }
 

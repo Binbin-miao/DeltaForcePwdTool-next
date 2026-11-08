@@ -16,9 +16,11 @@ use thiserror::Error;
 
 mod dpi;
 mod gdi;
+mod screen_source;
 
 pub use dpi::{ensure_dpi_awareness, DpiAwareness};
 pub use gdi::{primary_monitor_size, Capturer};
+pub use screen_source::{LiveScreen, ScreenSource};
 
 /// 黑帧判据：luma 低于该值视为「黑像素」（t2 任务 5）。
 pub const BLACK_LUMA_CUTOFF: u8 = 8;

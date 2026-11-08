@@ -33,6 +33,13 @@ fn main() -> eframe::Result {
     let monitor = delta_capture::monitor_info().unwrap_or_else(|_| {
         MonitorInfo::new(FALLBACK_MONITOR.0, FALLBACK_MONITOR.1).expect("兜底分辨率合法")
     });
+    // 分辨率变了只提示不阻断：百分比坐标仍有效，但绝对像素会偏移，建议重跑校准。
+    if config.resolution_changed(monitor) {
+        eprintln!(
+            "检测到主显示器分辨率已变化（配置记录 {}x{}，当前 {}x{}）：百分比坐标仍有效，建议重新校准",
+            config.monitor.w, config.monitor.h, monitor.w, monitor.h
+        );
+    }
 
     // ── 4. 窗口：无边框、不透明、置顶、可缩放 ───────────────────────
     let options = eframe::NativeOptions {
