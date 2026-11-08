@@ -159,7 +159,8 @@ impl Config {
     }
 
     /// 列出所有未校准的必填区域。空列表 == 全部就绪（spec D9 的 UI 灰置依据）。
-    pub fn validate(&self) -> Vec<MissingArea> {        let mut missing = Vec::new();
+    pub fn validate(&self) -> Vec<MissingArea> {
+        let mut missing = Vec::new();
         if !self.monitor.is_calibrated() {
             missing.push(MissingArea::Monitor);
         }

@@ -78,9 +78,18 @@ impl DeltaApp {
 
     /// 写回配置（原子写；失败不静默）。
     ///
-    /// 落盘前把主显示器物理分辨率写成**当前实际读数**：百分比坐标需要一个锚点分辨率，
-    /// 否则配置里永远留着 `0x0`，`validate()` 会一直报「主显示器未校准」。
+    /// **不动 `monitor` 基线**：基线代表「最后一次校准时的分辨率」，是
+    /// `resolution_changed()` 的比较锚点。若普通保存（免责声明、开关变更）也覆盖它，
+    /// 换分辨率后的提醒就只会响一次，之后基线被悄悄改成新分辨率。
     fn persist(&mut self) -> Result<(), String> {
+        let config = self.snapshot();
+        delta_config::save(&self.config_path, &config).map_err(|error| error.to_string())
+    }
+
+    /// 校准保存：把主显示器物理分辨率写成**当前实际读数**，作为百分比坐标的锚点。
+    ///
+    /// 只有校准动作才更新基线，因此换分辨率而未重新校准时会持续提醒。
+    fn persist_calibrated(&mut self) -> Result<(), String> {
         let mut config = self.snapshot();
         config.monitor = self.monitor;
         delta_config::save(&self.config_path, &config).map_err(|error| error.to_string())
@@ -262,7 +271,7 @@ impl DeltaApp {
                 }
                 if was == Step::Save {
                     let recapture = wizard.scene == Some(WizardScene::Recapture);
-                    match self.persist() {
+                    match self.persist_calibrated() {
                         Ok(()) => {
                             if recapture {
                                 self.save_template_cells();
