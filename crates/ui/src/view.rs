@@ -1,4 +1,4 @@
-//! 绘制层：主窗口（五态 + 收起态）、免责声明、校准向导。
+//! 绘制层：主窗口（五态 + 收起态）、校准向导。
 //!
 //! 全部用 `Painter` 手绘（像素级对齐 token），不用 egui 默认控件皮肤 —— 这样状态色
 //! 只会出现在 2px 描边 / 状态点 / 数值文字上，不会铺成大面积色块。
@@ -13,14 +13,6 @@ use crate::state::{
 use crate::theme;
 use crate::wizard::{Step, Verdict, Wizard, WizardScene};
 
-/// 免责声明条款（spec D12）。逐行短句，避免长段中文挤压。
-pub const DISCLAIMER_LINES: [&str; 4] = [
-    "输入注入带系统标记",
-    "无法伪装真实按键",
-    "仅本机自动化使用",
-    "风险自担",
-];
-
 /// 主窗口一帧：返回用户动作（无动作为 `None`）。
 pub fn main_window(ui: &mut egui::Ui, state: &mut UiState) -> Option<Action> {
     let time = state.phase_elapsed;
@@ -29,8 +21,6 @@ pub fn main_window(ui: &mut egui::Ui, state: &mut UiState) -> Option<Action> {
     paint_shell(&painter, full, state.phase, time);
     if state.collapsed {
         collapsed_strip(ui, full, state)
-    } else if state.disclaimer_pending {
-        disclaimer(ui, full)
     } else {
         main_layout(ui, full, state, time)
     }
@@ -319,37 +309,6 @@ fn collapsed_strip(ui: &egui::Ui, full: Rect, state: &mut UiState) -> Option<Act
         action = Some(Action::Expand);
     }
     action
-}
-
-/// 免责声明（D12）：未确认时占满中央。
-fn disclaimer(ui: &egui::Ui, full: Rect) -> Option<Action> {
-    let painter = ui.painter().clone();
-    let body = full.shrink(theme::SPACE_XL);
-    paint_panel(&painter, body);
-    painter.text(
-        Pos2::new(body.center().x, body.top() + theme::SPACE_L),
-        Align2::CENTER_CENTER,
-        "使用前确认",
-        theme::text(theme::FONT_TITLE),
-        theme::TEXT_1,
-    );
-    for (index, line) in DISCLAIMER_LINES.iter().enumerate() {
-        painter.text(
-            Pos2::new(
-                body.center().x,
-                body.top() + theme::SPACE_XL + theme::SPACE_L * (index as f32 + 1.0),
-            ),
-            Align2::CENTER_CENTER,
-            *line,
-            theme::text(theme::FONT_BODY),
-            theme::TEXT_2,
-        );
-    }
-    let agree = Rect::from_min_size(
-        Pos2::new(body.left() + theme::SPACE_XL, body.bottom() - theme::SPACE_XXL - theme::PRIMARY_H),
-        Vec2::new(body.width() - theme::SPACE_XXL * 2.0, theme::PRIMARY_H),
-    );
-    primary_button(ui, agree, "对，继续", true, Phase::Idle).then_some(Action::AcceptDisclaimer)
 }
 
 /// 状态点：颜色即状态色，尺寸固定，不呼吸放大（只呼吸 alpha）。

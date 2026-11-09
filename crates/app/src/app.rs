@@ -289,15 +289,6 @@ impl DeltaApp {
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Action::OpenCalibration => self.enter_wizard(ctx),
             Action::OpenSettings => self.settings_open = true,
-            Action::AcceptDisclaimer => {
-                if let Ok(mut config) = self.config.lock() {
-                    config.accepted_disclaimer = true;
-                }
-                self.state.disclaimer_pending = false;
-                if let Err(reason) = self.persist() {
-                    self.finish(Phase::Unrecognized, reason);
-                }
-            }
             Action::ToggleFlow(scene) => self.state.toggles.toggle(scene),
             Action::DismissNotice => self.state.dismiss_notice(),
             Action::ToggleAlwaysOnTop => self.toggle_always_on_top(),
@@ -852,13 +843,12 @@ fn thumbnail_image(frame: &delta_capture::Frame) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba)
 }
 
-/// 启动时的界面状态：未确认免责声明 / 未校准项 / 换分辨率警示。
+/// 启动时的界面状态：未校准项 / 换分辨率警示。
 ///
 /// **分辨率判断放在这里而不是 `main`**：`config` 与 `monitor` 本就是入参，
 /// 装配根不必重复这条规则，也不会出现「算了一次又传一次」的双源。
 fn initial_state(config: &Config, monitor: MonitorInfo) -> UiState {
     let mut state = UiState {
-        disclaimer_pending: !config.accepted_disclaimer,
         // 显示**真实生效**的键：老配置里残留的 `sb250` 会被规范化成 F8（复审 S2-1）。
         hotkey: platform::format_hotkey(&platform::startup_hotkey(&config.hotkeys.scene)),
         capture_backend: config.capture_backend,

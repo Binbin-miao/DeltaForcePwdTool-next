@@ -9,6 +9,10 @@ publish = false
 name = "delta-pwd-tool"
 path = "src/main.rs"
 
+[build-dependencies]
+# 把 icon.rc 编进 exe 资源段（文件图标）。它自己会找 Windows Kits 里的 rc.exe。
+embed-resource = "3"
+
 [dependencies]
 thiserror = { workspace = true }
 delta-ui = { path = "../ui" }

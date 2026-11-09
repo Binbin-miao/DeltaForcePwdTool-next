@@ -316,7 +316,6 @@ pub enum Action {
     ToggleAlwaysOnTop,
     OpenCalibration,
     OpenSettings,
-    AcceptDisclaimer,
     ToggleFlow(SceneKind),
     /// 点掉一次性警示（如「屏幕变了 · 建议重校」）。
     DismissNotice,
@@ -406,8 +405,6 @@ pub struct UiState {
     /// 结果文案（如「已输入数字」）。
     pub message: String,
     pub collapsed: bool,
-    /// 免责声明未确认 → 界面中央显示条款。
-    pub disclaimer_pending: bool,
     /// 一次性警示文案（`None` = 不显示）；当前只用于「屏幕变了 · 建议重校」。
     pub notice: Option<String>,
     /// 用户已点掉过警示 → 本会话不再出现。
@@ -483,7 +480,6 @@ impl Default for UiState {
             progress: Progress::default(),
             message: String::new(),
             collapsed: false,
-            disclaimer_pending: true,
             notice: None,
             notice_dismissed: false,
             hotkey: "F8".to_owned(),
@@ -511,9 +507,9 @@ impl UiState {
         self.missing.is_empty()
     }
 
-    /// 主按钮是否可点：免责声明已确认 + 已校准 + 不在运行中。
+    /// 主按钮是否可点：已校准 + 不在运行中。
     pub fn start_enabled(&self) -> bool {
-        !self.disclaimer_pending && self.is_calibrated() && self.phase != Phase::Running
+        self.is_calibrated() && self.phase != Phase::Running
     }
 
     /// 序列显示串：非操作台场景显示 `──`（spec：非操作台场景没有目标序列）。
@@ -526,7 +522,7 @@ impl UiState {
 
     /// 功能入口是否可用（未校准时灰置）。
     pub fn flow_enabled(&self, scene: SceneKind) -> bool {
-        self.is_calibrated() && !self.disclaimer_pending && self.toggles.get(scene)
+        self.is_calibrated() && self.toggles.get(scene)
     }
 
     /// 状态条文案：`待机 · 操作台`。
@@ -676,10 +672,9 @@ mod tests {
     }
 
     #[test]
-    fn start_is_blocked_until_disclaimer_and_calibration() {
+    fn start_is_available_immediately_and_only_blocked_by_calibration() {
+        // 免责声明已移除：首启即可开始，没有任何前置确认页。
         let mut state = UiState::default();
-        assert!(!state.start_enabled(), "免责声明未确认时必须拒绝");
-        state.disclaimer_pending = false;
         assert!(state.start_enabled());
         state.missing = vec!["操作台 LED 目标序列区域".to_owned()];
         assert!(!state.start_enabled(), "未校准时必须灰置");
@@ -720,10 +715,7 @@ mod tests {
 
     #[test]
     fn flow_entries_are_greyed_when_uncalibrated() {
-        let mut state = UiState {
-            disclaimer_pending: false,
-            ..UiState::default()
-        };
+        let mut state = UiState::default();
         assert!(state.flow_enabled(SceneKind::Morse));
         state.missing = vec!["摩斯区域 #1".to_owned()];
         assert!(!state.flow_enabled(SceneKind::Morse), "未校准必须灰置");
@@ -757,10 +749,7 @@ mod tests {
 
     #[test]
     fn starting_a_run_clears_the_notice_but_keeps_progress_visible() {
-        let mut state = UiState {
-            disclaimer_pending: false,
-            ..UiState::default()
-        };
+        let mut state = UiState::default();
         state.warn_resolution_changed();
         state.begin_run();
         assert_eq!(state.notice_text(), None, "识别中要能看见进度");

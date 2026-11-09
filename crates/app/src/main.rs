@@ -4,6 +4,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod icon;
+
 use delta_app::{config_path, platform, DeltaApp};
 use delta_geom::MonitorInfo;
 
@@ -54,15 +56,20 @@ fn main() -> eframe::Result {
     } else {
         egui::WindowLevel::Normal
     };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(delta_ui::APP_TITLE)
+        .with_inner_size(delta_ui::theme::WINDOW_SIZE)
+        .with_min_inner_size(delta_ui::theme::WINDOW_MIN)
+        .with_decorations(false)
+        .with_transparent(false)
+        .with_window_level(window_level)
+        .with_resizable(true);
+    // 图标只是装饰：解码失败就跳过，不能让窗口因此起不来。
+    if let Some(window_icon) = icon::window_icon() {
+        viewport = viewport.with_icon(window_icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(delta_ui::APP_TITLE)
-            .with_inner_size(delta_ui::theme::WINDOW_SIZE)
-            .with_min_inner_size(delta_ui::theme::WINDOW_MIN)
-            .with_decorations(false)
-            .with_transparent(false)
-            .with_window_level(window_level)
-            .with_resizable(true),
+        viewport,
         ..Default::default()
     };
 

@@ -249,14 +249,35 @@ mod tests {
         fs::create_dir(&temp).expect("创建临时路径占位目录");
 
         let mut changed = sample_config();
-        changed.accepted_disclaimer = true;
+        changed.always_on_top = true;
         let error = save(&path, &changed).expect_err("写临时文件必须失败");
         assert!(error.to_string().contains("写入临时配置文件"), "{error}");
         assert_eq!(fs::read(&path).expect("读取原始内容"), original);
 
         fs::remove_dir(&temp).expect("清理占位目录");
         save(&path, &changed).expect("恢复后可正常保存");
-        assert!(load(&path).expect("加载").config.accepted_disclaimer);
+        assert!(load(&path).expect("加载").config.always_on_top);
+    }
+
+    #[test]
+    fn legacy_accepted_disclaimer_field_is_silently_ignored() {
+        // 免责声明已从产品中移除，但老用户的配置里还留着这个键。
+        // 它必须被静默忽略：不能报错、不能因未知字段让整份配置回退成默认值。
+        let dir = TempDir::new();
+        let path = dir.join(CONFIG_FILE_NAME);
+        let mut json = serde_json::to_value(sample_config()).expect("序列化");
+        json["accepted_disclaimer"] = serde_json::Value::Bool(true);
+        // 同时保留一个可观测的非默认值，证明整份配置真的被读进来了。
+        json["always_on_top"] = serde_json::Value::Bool(true);
+        fs::write(&path, serde_json::to_vec(&json).expect("编码")).expect("写入老配置");
+
+        let loaded = load(&path).expect("带 legacy 键的老配置必须能加载");
+        assert!(loaded.config.always_on_top, "其余字段照常生效");
+        assert!(
+            loaded.config.validate().is_empty(),
+            "老配置不该被降级成默认值：{:?}",
+            loaded.config.validate()
+        );
     }
 
     #[test]

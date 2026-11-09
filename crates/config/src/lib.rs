@@ -71,8 +71,6 @@ pub struct Config {
     pub hotkeys: Hotkeys,
     /// 时序常量（spec §2.2 不变量 6 + spec §2.3 超时）。
     pub timings: Timings,
-    /// 免责声明已接受（spec D12）。
-    pub accepted_disclaimer: bool,
     /// OCR 兜底引擎开关（spec D2）。
     pub ocr_enabled: bool,
     /// 是否自动点「确认」按钮（默认开）。
@@ -112,7 +110,6 @@ impl Default for Config {
             confirm_clicks: Vec::new(),
             hotkeys: Hotkeys::default(),
             timings: Timings::default(),
-            accepted_disclaimer: false,
             ocr_enabled: true,
             auto_confirm: true,
             fingerprint_auto_click: true,
