@@ -27,6 +27,12 @@ const IDLE_REPAINT: Duration = Duration::from_millis(100);
 const PREVIEW_STEP: u32 = 2;
 /// 测试截图缩略图上限（spec D5：≤160×90；留一行文案位后取 160×64）。
 const THUMB_MAX: [u32; 2] = [160, 64];
+/// 图钉切换失败提示（release 版 `windows_subsystem="windows"` 丢弃 stderr，只能靠界面提示）。
+const NOTICE_ON_TOP_FAILED: &str = "置顶切换失败";
+/// 图钉状态已生效但落盘失败的提示（此时三者已回滚成一致）。
+const NOTICE_ON_TOP_UNSAVED: &str = "设置未保存";
+/// 补录会话建不起来（无 D3D11 适配器等）的提示。
+const NOTICE_TEMPLATE_SESSION_FAILED: &str = "补录会话启动失败";
 
 /// 应用状态。
 pub struct DeltaApp {
@@ -298,20 +304,32 @@ impl DeltaApp {
     ///
     /// 顺序刻意是「先真正改窗口，再写配置」：`SetWindowPos` 失败就什么都不写，
     /// 配置里永远不会留下一个没生效的置顶状态 —— 与热键改键同一条纪律。
+    ///
+    /// **失败必须显形**：release 版没有 stderr，所以两种情况都走 `state.notice`；
+    /// 落盘失败时把窗口、内存配置、界面一并退回旧值，保证「窗口 = 界面 = 磁盘」三者一致，
+    /// 不留「窗口已置顶、磁盘说没置顶」的假保存。
     fn toggle_always_on_top(&mut self) {
-        let wanted = !self.state.always_on_top;
-        if let Err(reason) = platform::apply_always_on_top(wanted) {
-            // 显形但不改状态机：窗口级失败不该把界面切成「未识别」。
-            eprintln!("[window] 图钉未生效：{reason}");
+        let previous = self.state.always_on_top;
+        let wanted = !previous;
+        if platform::apply_always_on_top(wanted).is_err() {
+            // 窗口级失败不动状态机：不该把界面切成「未识别」。
+            self.state.notice = Some(NOTICE_ON_TOP_FAILED.to_owned());
             return;
         }
         if let Ok(mut config) = self.config.lock() {
             config.always_on_top = wanted;
         }
         self.state.always_on_top = wanted;
-        if let Err(reason) = self.persist() {
-            eprintln!("[window] 置顶已生效但落盘失败：{reason}");
+        if self.persist().is_ok() {
+            return;
         }
+        // 落盘失败：回滚窗口与内存，别让用户看到一个存不下来的开关。
+        let _ = platform::apply_always_on_top(previous);
+        if let Ok(mut config) = self.config.lock() {
+            config.always_on_top = previous;
+        }
+        self.state.always_on_top = previous;
+        self.state.notice = Some(NOTICE_ON_TOP_UNSAVED.to_owned());
     }
 
     /// 进入校准向导。
@@ -446,7 +464,11 @@ impl DeltaApp {
     /// **九格共用一个会话**：`CaptureSession::new` 在 Wgc 档要建一次 D3D11 设备
     /// （30~50ms + 帧池重建），逐格新建等于把这笔代价付九遍（实测累计 300~450ms 卡顿）。
     /// 抓取内容与顺序与逐格版本完全一致：同一个 `candidate_boxes` 顺序、同样逐格 `luma()`。
-    fn save_template_cells(&self) {
+    ///
+    /// **要么全存、要么不存**：WGC 在静态画面（暂停/加载/菜单）下可能只出第一帧，
+    /// 后面各格全抓不到；残缺模板会让后续识别一直失败且原因难查，所以格数不齐时
+    /// 直接中止并出提示，不落半份模板。
+    fn save_template_cells(&mut self) {
         let Some(wizard) = self.wizard.as_ref() else {
             return;
         };
@@ -454,19 +476,23 @@ impl DeltaApp {
         if role.is_empty() {
             return;
         }
-        let config = self.snapshot();
         let dir = crate::images_dir().join(role);
         let _ = std::fs::create_dir_all(&dir);
+        let config = self.snapshot();
         let Ok(mut session) = delta_capture::CaptureSession::new(config.capture_backend) else {
-            eprintln!("[templates] 补录会话创建失败，本次不补录");
+            self.state.notice = Some(NOTICE_TEMPLATE_SESSION_FAILED.to_owned());
             return;
         };
-        let cells = capture_cells(&config.fingerprint.candidate_boxes, self.monitor, |rect| {
+        let captured = capture_cells(&config.fingerprint.candidate_boxes, self.monitor, |rect| {
             session.grab(rect).map_err(|error| error.to_string())
         });
         // 九格抓完统一释放：设备与 20 张配额一次性还清。
         drop(session);
-        for (index, frame) in cells {
+        if let Some(notice) = incomplete_cells_notice(&captured) {
+            self.state.notice = Some(notice);
+            return;
+        }
+        for (index, frame) in captured.frames {
             let gray = frame.luma();
             let Ok(file) = std::fs::File::create(dir.join(format!("{}.png", index + 1))) else {
                 continue;
@@ -659,7 +685,28 @@ impl eframe::App for DeltaApp {
     }
 }
 
-/// 按百分比矩形逐格抓图，返回 `(候选格序号, 帧)`（顺序与入参一致，单格失败只跳过该格）。
+/// 九格抓取结果：抓到的帧 + 抓失败的候选格序号。
+///
+/// 分开记 `failed` 而不是只返回成功的帧：跳过一个「未校准的空格」是正常的，
+/// 抓帧报错（WGC 静态画面下拿不到新帧）不是 —— 后者必须能被调用方看见并中止保存。
+struct CellCapture {
+    frames: Vec<(usize, delta_capture::Frame)>,
+    failed: Vec<usize>,
+}
+
+/// 抓帧不足时的用户提示；`None` 表示九格齐备、可以落盘。
+fn incomplete_cells_notice(captured: &CellCapture) -> Option<String> {
+    if captured.failed.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "只存下 {}/{} 格",
+        captured.frames.len(),
+        delta_config::CANDIDATE_BOX_COUNT
+    ))
+}
+
+/// 按百分比矩形逐格抓图，返回序号与帧（顺序与入参一致；空格跳过，抓失败另记）。
 ///
 /// `grab` 由调用方提供**同一个会话**的抓帧闭包 —— 「九格只初始化一次后端」就落在这里。
 /// 抽成独立函数是为了能在测试里换掉 `grab`，把「一次会话 + 逐格顺序不变」钉死。
@@ -667,21 +714,25 @@ fn capture_cells(
     rects: &[delta_geom::PctRect],
     monitor: MonitorInfo,
     mut grab: impl FnMut(PxRect) -> Result<delta_capture::Frame, String>,
-) -> Vec<(usize, delta_capture::Frame)> {
-    let mut cells = Vec::new();
+) -> CellCapture {
+    let mut captured = CellCapture {
+        frames: Vec::new(),
+        failed: Vec::new(),
+    };
     for (index, rect) in rects.iter().enumerate() {
         let Ok(pixels) = rect.to_px(monitor) else {
+            captured.failed.push(index);
             continue;
         };
         if pixels.w <= 0 || pixels.h <= 0 {
             continue;
         }
-        let Ok(frame) = grab(pixels) else {
-            continue;
-        };
-        cells.push((index, frame));
+        match grab(pixels) {
+            Ok(frame) => captured.frames.push((index, frame)),
+            Err(_) => captured.failed.push(index),
+        }
     }
-    cells
+    captured
 }
 
 /// 一次性抓帧：独立临时会话（**不占任务配额**），抓一帧后立即 `drop`（spec D3 / D5）。
@@ -898,7 +949,7 @@ mod tests {
             h: 0.0,
         };
         let mut asked = Vec::new();
-        let cells = capture_cells(&boxes, monitor, |rect| {
+        let captured = capture_cells(&boxes, monitor, |rect| {
             asked.push(rect);
             Ok(delta_capture::Frame::new(
                 rect.w as u32,
@@ -908,6 +959,7 @@ mod tests {
             )
             .expect("测试帧长度正确"))
         });
+        let cells = captured.frames;
         assert_eq!(
             cells.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
             vec![0, 1, 2, 3, 5, 6, 7, 8],
@@ -916,29 +968,95 @@ mod tests {
         // 第一格是 2K 基准下内置坐标的实测像素值（独立已知量，不由被测代码推导）。
         assert_eq!(asked[0], PxRect { x: 1522, y: 560, w: 105, h: 105 });
         assert_eq!(asked.len(), cells.len(), "每次成功抓取都必须对应一格");
+        assert!(
+            captured.failed.is_empty(),
+            "未校准的空格不算抓失败：{:?}",
+            captured.failed
+        );
+    }
+
+    #[test]
+    fn capture_cells_reports_failed_grabs_so_a_half_template_is_never_saved() {
+        // WGC 在静态画面（暂停/加载/菜单）下的真实失败模式：共用会话拿到第一帧后再无新帧。
+        // 抓不到必须被数出来并拦住保存，否则会存下 1 格模板，后续识别一直失败且原因难查。
+        let monitor = monitor(2560, 1440);
+        let boxes = delta_config::builtin::candidate_boxes();
+        let mut attempts = 0;
+        let captured = capture_cells(&boxes, monitor, |rect| {
+            attempts += 1;
+            if attempts == 2 || attempts == 5 {
+                return Err("WGC 未取到新帧".to_owned());
+            }
+            delta_capture::Frame::new(
+                rect.w as u32,
+                rect.h as u32,
+                vec![0; (rect.w * rect.h * 4) as usize],
+                Instant::now(),
+            )
+            .map_err(|error| error.to_string())
+        });
+        assert_eq!(captured.failed, vec![1, 4], "失败格号必须如实上报");
+        assert_eq!(
+            captured.frames.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            vec![0, 2, 3, 5, 6, 7, 8],
+            "成功的格子仍按候选顺序排列"
+        );
+        assert_eq!(
+            incomplete_cells_notice(&captured),
+            Some("只存下 7/9 格".to_owned()),
+            "残缺时必须给出可见提示"
+        );
+    }
+
+    #[test]
+    fn complete_cells_raise_no_notice() {
+        let monitor = monitor(2560, 1440);
+        let boxes = delta_config::builtin::candidate_boxes();
+        let captured = capture_cells(&boxes, monitor, |rect| {
+            delta_capture::Frame::new(
+                rect.w as u32,
+                rect.h as u32,
+                vec![0; (rect.w * rect.h * 4) as usize],
+                Instant::now(),
+            )
+            .map_err(|error| error.to_string())
+        });
+        assert_eq!(captured.frames.len(), delta_config::CANDIDATE_BOX_COUNT);
+        assert_eq!(incomplete_cells_notice(&captured), None, "九格齐了就不要打扰用户");
     }
 
     #[test]
     fn template_cells_share_one_capture_session() {
-        // 真机会话：九格如果各建一次会话，`frames_taken()` 只会是 1；
-        // 一个会话抓满九格才等于九 —— 这就是「只初始化一次 D3D11」的可观测证据。
+        // 跑**产品默认后端**（Wgc），不是兼容档：真机上九格如果各建一次会话，
+        // `frames_taken()` 只会是 1；一个会话抓满九格才等于九 —— 这就是
+        // 「只初始化一次 D3D11」的可观测证据。
         let Ok(monitor) = delta_capture::monitor_info() else {
             return;
         };
-        let boxes = delta_config::builtin::candidate_boxes();
-        let Ok(mut session) = delta_capture::CaptureSession::new(CaptureBackend::BitBlt) else {
+        let backend = CaptureBackend::default();
+        let Ok(mut session) = delta_capture::CaptureSession::new(backend) else {
+            eprintln!("[test] {backend:?} 在测试环境不可用（无可用 D3D11 适配器），跳过本用例");
             return;
         };
-        let cells = capture_cells(&boxes, monitor, |rect| {
+        let boxes = delta_config::builtin::candidate_boxes();
+        let captured = capture_cells(&boxes, monitor, |rect| {
             session.grab(rect).map_err(|error| error.to_string())
         });
-        assert_eq!(cells.len(), delta_config::CANDIDATE_BOX_COUNT);
+        let frames = captured.frames.len() as u32;
+        assert!(frames > 0, "默认后端必须至少抓到第一格");
         assert_eq!(
             session.frames_taken(),
-            delta_config::CANDIDATE_BOX_COUNT as u32,
-            "九格必须来自同一个会话"
+            frames,
+            "抓到的每一格都必须出自同一个会话"
         );
-        for (_, frame) in &cells {
+        if captured.failed.is_empty() {
+            assert_eq!(frames, delta_config::CANDIDATE_BOX_COUNT as u32);
+        } else {
+            // 静态桌面下 WGC 只出首帧是已知行为：此时保存会被 `incomplete_cells_notice` 拦住，
+            // 这里只把实测格数打出来，供换机器复现时对照。
+            eprintln!("[test] {backend:?} 静态桌面只出了 {frames} 帧");
+        }
+        for (_, frame) in &captured.frames {
             assert_eq!(frame.luma().as_slice().len(), (frame.w * frame.h) as usize);
         }
     }

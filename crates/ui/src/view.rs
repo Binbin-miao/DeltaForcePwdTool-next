@@ -892,7 +892,7 @@ const SETTINGS_ROW_H: f32 = 40.0;
 const CAPTURE_RESULT_H: f32 = 90.0;
 /// 缩略图上限（spec D5 建议 ≤160×90；这里让出一行文字位，取 160×64）。
 const CAPTURE_THUMB_MAX: [f32; 2] = [160.0, 64.0];
-/// 右侧值槽宽度（要放下 `Windows Graphics Capture ▾`）。
+/// 右侧值槽宽度（要放下 `Windows Graphics Capture ▼`）。
 const BACKEND_VALUE_W: f32 = 168.0;
 /// 下拉面板宽度（要放下「兼容模式 · 可能截不到独占全屏」）。
 const BACKEND_MENU_W: f32 = 220.0;
@@ -1191,7 +1191,7 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
     let value_text = format!(
         "{}  {}",
         backend_label(view.capture_backend),
-        if menu_open { '▴' } else { '▾' }
+        if menu_open { '▲' } else { '▼' }
     );
     let value_clicked = if locked {
         painter.text(
