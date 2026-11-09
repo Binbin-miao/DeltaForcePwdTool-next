@@ -1492,12 +1492,12 @@ mod tests {
         // 不可捕获的键不提交也不取消；纯修饰键同理。
         assert_eq!(
             panel_action(
-                vec![key_event(egui::Key::Slash, egui::Modifiers::default())],
+                vec![key_event(egui::Key::Questionmark, egui::Modifiers::default())],
                 true,
                 None
             ),
             None,
-            "按 / 必须继续等待"
+            "按 ? 必须继续等待"
         );
         assert_eq!(
             panel_action(

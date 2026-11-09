@@ -207,7 +207,7 @@ pub const MOD_SHIFT: u32 = 0x4;
 ///
 /// `delta_ui::state::CAPTURABLE` 是同一套短名的 egui 侧映射，
 /// `capturable_vocabulary_matches_the_parser` 用例把两张表钉在一起。
-pub const KEY_TABLE: [(&str, u32); 71] = [
+pub const KEY_TABLE: [(&str, u32); 82] = [
     ("F1", 0x70),
     ("F2", 0x71),
     ("F3", 0x72),
@@ -279,6 +279,37 @@ pub const KEY_TABLE: [(&str, u32); 71] = [
     ("ArrowDown", 0x28),
     ("ArrowLeft", 0x25),
     ("ArrowRight", 0x27),
+    // spec D4：11 个 OEM 符号键。规范写法就是**符号本身** —— 与 `0`~`9` 一致，
+    // 用户在 `settings.json` 里写的正是 `/`、`` ` ``，界面上看到的也是它。
+    ("/", 0xBF),
+    ("\\", 0xDC),
+    (";", 0xBA),
+    ("'", 0xDE),
+    (",", 0xBC),
+    (".", 0xBE),
+    ("-", 0xBD),
+    ("=", 0xBB),
+    ("[", 0xDB),
+    ("]", 0xDD),
+    ("`", 0xC0),
+];
+
+/// 符号键的**英文别名**：只用于解析，绝不用于输出（输出一律走 [`KEY_TABLE`] 的字面量）。
+///
+/// 存在的理由：用户从旧配置/上游 Python 版抄过来的写法可能是 `Slash`；两条路都能解析，
+/// 但归一化结果唯一 —— 否则同一个键会有两种写法在配置里漂移。
+pub const KEY_ALIASES: [(&str, u32); 11] = [
+    ("Slash", 0xBF),
+    ("Backslash", 0xDC),
+    ("Semicolon", 0xBA),
+    ("Quote", 0xDE),
+    ("Comma", 0xBC),
+    ("Period", 0xBE),
+    ("Minus", 0xBD),
+    ("Equal", 0xBB),
+    ("BracketLeft", 0xDB),
+    ("BracketRight", 0xDD),
+    ("Backquote", 0xC0),
 ];
 
 /// 热键写法解析失败的原因。**每一种失败都必须显形**，不允许静默回落（spec D3）。
@@ -322,10 +353,11 @@ fn modifier_bit(token: &str) -> Option<u32> {
     None
 }
 
-/// 主键短名 → 虚拟键码（大小写不敏感）。
+/// 主键短名 → 虚拟键码（大小写不敏感）。符号键额外接受英文别名。
 fn key_code(token: &str) -> Option<u32> {
     KEY_TABLE
         .iter()
+        .chain(KEY_ALIASES.iter())
         .find(|(name, _)| name.eq_ignore_ascii_case(token))
         .map(|(_, code)| *code)
 }
@@ -419,6 +451,45 @@ mod tests {
         assert_eq!(parse_hotkey("Space"), Ok(Hotkey::plain(0x20)));
         assert_eq!(parse_hotkey("PageUp"), Ok(Hotkey::plain(0x21)));
         assert_eq!(parse_hotkey("ArrowLeft"), Ok(Hotkey::plain(0x25)));
+    }
+
+    #[test]
+    fn symbol_keys_parse_from_literals_and_english_names() {
+        // spec D4：11 个 OEM 符号键。用户在界面/配置里写的是符号字面量（`/`、`` ` ``），
+        // 英文标识符只是兼容写法 —— 两者必须解析到同一个虚拟键码，且归一化到字面量。
+        for (literal, english, vk) in [
+            ("/", "Slash", 0xBF),
+            ("\\", "Backslash", 0xDC),
+            (";", "Semicolon", 0xBA),
+            ("'", "Quote", 0xDE),
+            (",", "Comma", 0xBC),
+            (".", "Period", 0xBE),
+            ("-", "Minus", 0xBD),
+            ("=", "Equal", 0xBB),
+            ("[", "BracketLeft", 0xDB),
+            ("]", "BracketRight", 0xDD),
+            ("`", "Backquote", 0xC0),
+        ] {
+            assert_eq!(parse_hotkey(literal), Ok(Hotkey::plain(vk)), "{literal}");
+            assert_eq!(parse_hotkey(english), Ok(Hotkey::plain(vk)), "{english}");
+            assert_eq!(
+                format_hotkey(&Hotkey::plain(vk)),
+                literal,
+                "{literal} 的规范写法必须是符号本身"
+            );
+        }
+        assert_eq!(parse_hotkey("Ctrl+/"), Ok(Hotkey::new(0xBF, MOD_CONTROL)));
+        assert_eq!(
+            format_hotkey(&parse_hotkey("Ctrl+Slash").expect("英文名可解析")),
+            "Ctrl+/"
+        );
+    }
+
+    #[test]
+    fn vocabulary_grew_to_82_keys() {
+        // spec §4 第一条门禁：两张表各有 82 项。
+        assert_eq!(KEY_TABLE.len(), 82, "71 项 + 11 个符号键");
+        assert_eq!(delta_ui::state::CAPTURABLE.len(), 82);
     }
 
     #[test]

@@ -91,6 +91,16 @@ pub struct Config {
     /// 用户实测「只能挂后台不能置顶」的反面：常驻置顶会挡住游戏画面，所以默认不置顶，
     /// 需要时由标题条的图钉开关打开，并按开关状态立即落盘 —— 下次启动照旧生效。
     pub always_on_top: bool,
+    /// F 键低级键盘钩子总开关（spec D3 边界 3，默认 **开**）。
+    ///
+    /// 关掉 = 卸载钩子，F 键完全不受本程序影响。**绝不**在关闭后回退成
+    /// `RegisterHotKey("F")` —— 那是全局独占，会把游戏的 F 交互键吞掉（D3 边界 4）。
+    pub f_key_hook_enabled: bool,
+    /// 前台窗口标题命中这些关键词才响应 F 键（spec D3 边界 5）。
+    ///
+    /// 默认 `["三角洲", "Delta Force"]`；匹配规则是**大小写不敏感的子串包含**。
+    /// 空列表 = 永不响应（不是「全都响应」）—— 用户清空后必须自己填回来。
+    pub game_title_keywords: Vec<String>,
     /// 当前实际屏幕分辨率（**不持久化**）。
     ///
     /// 百分比才是唯一持久真相：换算像素必须按「当前屏幕」，而不是「上次校准时的屏幕」，
@@ -115,6 +125,8 @@ impl Default for Config {
             fingerprint_auto_click: true,
             capture_backend: CaptureBackend::Wgc,
             always_on_top: false,
+            f_key_hook_enabled: true,
+            game_title_keywords: default_game_title_keywords(),
             runtime_monitor: MonitorInfo::default(),
         }
     }
@@ -580,6 +592,11 @@ pub struct PxConsole {
     pub knob_center: PxPoint,
 }
 
+/// F 钩子的默认前台关键词：两个名字都是这款游戏自己标题里的词。
+fn default_game_title_keywords() -> Vec<String> {
+    vec!["三角洲".to_owned(), "Delta Force".to_owned()]
+}
+
 fn default_regions() -> Vec<RegionEntry> {
     (0..MORSE_REGION_COUNT)
         .map(|index| RegionEntry {
@@ -818,6 +835,53 @@ mod tests {
 
         // 未校准（0x0）时不算「变更」，避免首次启动就报警。
         assert!(!Config::default().resolution_changed(larger));
+    }
+
+    #[test]
+    fn game_title_keywords_default_to_the_game_and_survive_old_configs() {
+        let config = Config::default();
+        assert_eq!(
+            config.game_title_keywords,
+            vec!["三角洲".to_owned(), "Delta Force".to_owned()],
+            "spec D3 边界 5 的默认关键词"
+        );
+
+        // 老配置（没有这个字段）→ 落到默认关键词，而不是空列表（空列表 = 永不响应）。
+        let legacy: Config = serde_json::from_str(r#"{"ocr_enabled":true}"#).expect("老配置合法");
+        assert_eq!(legacy.game_title_keywords, config.game_title_keywords);
+
+        // 用户增删过的关键词必须原样往返（设置页改完要跨启动保持）。
+        let custom: Config =
+            serde_json::from_str(r#"{"game_title_keywords":["Arena"]}"#).expect("可读");
+        assert_eq!(custom.game_title_keywords, vec!["Arena".to_owned()]);
+        let dumped = serde_json::to_string(&custom).expect("序列化");
+        assert!(dumped.contains("Arena"), "{dumped}");
+        assert_eq!(
+            serde_json::from_str::<Config>(&dumped)
+                .expect("反序列化")
+                .game_title_keywords,
+            vec!["Arena".to_owned()]
+        );
+    }
+
+    #[test]
+    fn f_key_hook_defaults_to_on_and_survives_old_configs() {
+        assert!(Config::default().f_key_hook_enabled, "默认开");
+
+        let legacy: Config = serde_json::from_str(r#"{"ocr_enabled":true}"#).expect("老配置合法");
+        assert!(legacy.f_key_hook_enabled, "老配置缺字段必须回落 true");
+
+        let off: Config =
+            serde_json::from_str(r#"{"f_key_hook_enabled":false}"#).expect("可读");
+        assert!(!off.f_key_hook_enabled);
+        let dumped = serde_json::to_string(&off).expect("序列化");
+        assert!(dumped.contains("\"f_key_hook_enabled\":false"), "{dumped}");
+        assert!(
+            !serde_json::from_str::<Config>(&dumped)
+                .expect("反序列化")
+                .f_key_hook_enabled,
+            "关闭状态必须跨启动保持"
+        );
     }
 
     #[test]

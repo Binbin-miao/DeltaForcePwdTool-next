@@ -14,6 +14,7 @@ use delta_ui::{
     UiState, Verdict, Wizard, WizardAction, WizardFrame, WizardScene,
 };
 
+use crate::keyhook::KeyHook;
 use crate::platform;
 use crate::worker::{grab_full, grab_once, Cmd, UiEvent, Worker};
 
@@ -37,6 +38,10 @@ const NOTICE_ON_TOP_ROLLBACK_FAILED: &str = "置顶已变未保存";
 const NOTICE_TEMPLATE_SESSION_FAILED: &str = "补录会话启动失败";
 /// 补录 PNG 写盘失败的提示（已删掉本次写出的所有格，目录里不留残份）。
 const NOTICE_TEMPLATE_WRITE_FAILED: &str = "模板写入失败";
+/// 开关已生效但没存进配置文件的提示（重启后会回到旧状态）。
+const NOTICE_SETTINGS_UNSAVED: &str = "设置未保存";
+/// F 键钩子装不上的提示（已回滚成「关」，不谎称在监听）。
+const NOTICE_KEY_HOOK_FAILED: &str = "F 键监听装不上";
 
 /// 应用状态。
 pub struct DeltaApp {
@@ -53,6 +58,8 @@ pub struct DeltaApp {
     phase_started: Instant,
     /// 正在飞的「测试截图」后台任务（`None` = 空闲）。
     capture_probe: Option<Receiver<Result<CaptureProbe, String>>>,
+    /// F 键低级键盘钩子（`None` = 钩子已关 / 装不上）。
+    key_hook: Option<KeyHook>,
 }
 
 /// 「测试截图」从后台线程回传的东西（纹理上传只能留到 UI 线程做）。
@@ -69,7 +76,7 @@ impl DeltaApp {
         let state = initial_state(&config, monitor);
         let config = Arc::new(Mutex::new(config));
         let worker = Worker::spawn(config.clone(), monitor);
-        Self {
+        let mut app = Self {
             state,
             wizard: None,
             settings_open: false,
@@ -82,7 +89,11 @@ impl DeltaApp {
             save_finished_at: None,
             phase_started: Instant::now(),
             capture_probe: None,
-        }
+            key_hook: None,
+        };
+        // 配置说开着就当场装上（装不上只留痕，绝不因为钩子失败而不给启动）。
+        app.sync_key_hook();
+        app
     }
 
     /// 当前配置快照。
@@ -290,6 +301,9 @@ impl DeltaApp {
             Action::OpenCalibration => self.enter_wizard(ctx),
             Action::OpenSettings => self.settings_open = true,
             Action::ToggleFlow(scene) => self.state.toggles.toggle(scene),
+            Action::ToggleFingerprintAutoClick => self.toggle_fingerprint_auto_click(),
+            Action::ToggleMorseAutoDownload => self.toggle_morse_auto_download(),
+            Action::ToggleFKeyHook => self.toggle_f_key_hook(),
             Action::DismissNotice => self.state.dismiss_notice(),
             Action::ToggleAlwaysOnTop => self.toggle_always_on_top(),
         }
@@ -336,9 +350,111 @@ impl DeltaApp {
         self.state.notice = Some(NOTICE_ON_TOP_UNSAVED.to_owned());
     }
 
+    /// 指纹自动点击开关（spec D2 第 4 行）：写配置 → 更新界面 → 落盘。
+    ///
+    /// 下一轮识别在 `run_once` 开头重新取配置快照，因此**不必重启**就生效。
+    fn toggle_fingerprint_auto_click(&mut self) {
+        let wanted = !self.state.fingerprint_auto_click;
+        if let Ok(mut config) = self.config.lock() {
+            config.fingerprint_auto_click = wanted;
+        }
+        self.state.set_fingerprint_auto_click(wanted);
+        self.persist_settings();
+    }
+
+    /// 摩斯自动下载开关（spec D2 第 5 行 → `config.auto_confirm`）。
+    fn toggle_morse_auto_download(&mut self) {
+        let wanted = !self.state.morse_auto_download;
+        if let Ok(mut config) = self.config.lock() {
+            config.auto_confirm = wanted;
+        }
+        self.state.set_morse_auto_download(wanted);
+        self.persist_settings();
+    }
+
+    /// F 键监听开关（spec D3 边界 3）：先真装/真卸，再落盘。
+    ///
+    /// 想开却装不上（被安全软件拦、会话不允许）→ 回滚成关并显形，
+    /// 配置里绝不留一个「写着开、其实没监听」的假状态。
+    fn toggle_f_key_hook(&mut self) {
+        let previous = self.state.f_key_hook;
+        let wanted = !previous;
+        if let Ok(mut config) = self.config.lock() {
+            config.f_key_hook_enabled = wanted;
+        }
+        self.sync_key_hook();
+        if wanted && self.key_hook.is_none() {
+            if let Ok(mut config) = self.config.lock() {
+                config.f_key_hook_enabled = previous;
+            }
+            self.state.set_f_key_hook(previous);
+            self.state.notice = Some(NOTICE_KEY_HOOK_FAILED.to_owned());
+            return;
+        }
+        self.state.set_f_key_hook(wanted);
+        self.persist_settings();
+    }
+
+    /// 让钩子跟上配置：开 → 装上（关键词热更新），关 → 卸载。
+    ///
+    /// ⚠️ 关闭时**只是卸载**。**绝不**回退成 `RegisterHotKey("F")` —— 那是全局独占，
+    /// 会把游戏的 F 交互键吞掉，正是这个钩子存在的理由（D3 边界 4）。
+    fn sync_key_hook(&mut self) {
+        let (wanted, keywords) = {
+            let config = self.snapshot();
+            (config.f_key_hook_enabled, config.game_title_keywords)
+        };
+        match (wanted, self.key_hook.is_some()) {
+            (true, false) => self.install_key_hook(keywords),
+            (true, true) => {
+                if let Some(hook) = self.key_hook.as_ref() {
+                    hook.set_keywords(keywords);
+                }
+            }
+            // 句柄一丢就 `Drop` → 卸载钩子；F 键从此与本程序无关。
+            (false, true) => self.key_hook = None,
+            (false, false) => {}
+        }
+    }
+
+    /// 装钩子 + 起一个只做转发的线程：钩子事件 → 执行器（与热键**同一个** `Cmd::Trigger`）。
+    ///
+    /// 为什么不让 UI 线程 `try_recv`：egui 空闲时可能很久不跑一帧，
+    /// F 键要等到「下一次鼠标移动」才生效是不可接受的延迟。
+    fn install_key_hook(&mut self, keywords: Vec<String>) {
+        let (sink, events) = mpsc::sync_channel::<()>(8);
+        let commands = self.worker.commands.clone();
+        match KeyHook::install(keywords, sink) {
+            Ok(hook) => {
+                self.key_hook = Some(hook);
+                let forwarder = std::thread::Builder::new()
+                    .name("delta-keyhook-fwd".to_owned())
+                    .spawn(move || {
+                        // 发送端随钩子卸载一起消失 → `recv` 出错 → 本线程自然退出。
+                        while events.recv().is_ok() {
+                            if commands.send(Cmd::Trigger).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                if let Err(error) = forwarder {
+                    eprintln!("[keyhook] 事件转发线程启动失败：{error}");
+                }
+            }
+            Err(reason) => eprintln!("[keyhook] {reason}"),
+        }
+    }
+
+    /// 开关落盘：失败必须显形（内存里已生效，但重启后会丢）。
+    fn persist_settings(&mut self) {
+        if let Err(reason) = self.persist() {
+            eprintln!("[settings] 开关已生效但落盘失败：{reason}");
+            self.state.notice = Some(NOTICE_SETTINGS_UNSAVED.to_owned());
+        }
+    }
+
     /// 进入校准向导。
-    fn enter_wizard(&mut self, _ctx: &egui::Context) {
-        self.wizard = Some(Wizard::new());
+    fn enter_wizard(&mut self, _ctx: &egui::Context) {        self.wizard = Some(Wizard::new());
         self.settings_open = false;
         self.preview = None;
         self.existing.clear();
@@ -853,6 +969,12 @@ fn initial_state(config: &Config, monitor: MonitorInfo) -> UiState {
         hotkey: platform::format_hotkey(&platform::startup_hotkey(&config.hotkeys.scene)),
         capture_backend: config.capture_backend,
         always_on_top: config.always_on_top,
+        // 两个自动开关 + F 键监听：界面上显示的必须是配置里的真实值，
+        // 否则「界面说关、流程却在点」是最难查的一类错。
+        fingerprint_auto_click: config.fingerprint_auto_click,
+        morse_auto_download: config.auto_confirm,
+        f_key_hook: config.f_key_hook_enabled,
+        game_title_keywords: config.game_title_keywords.clone(),
         missing: config.validate().iter().map(ToString::to_string).collect(),
         ..UiState::default()
     };
@@ -940,9 +1062,47 @@ mod tests {
         assert_eq!(initial_state(&Config::default(), monitor(2560, 1440)).notice_text(), None);
     }
 
+    /// 只为本文件用例准备一个临时配置文件的 app（默认不装 F 键钩子：
+    /// 全局钩子会监听真实按键，与"开关落盘"这个用例无关）。
+    fn app_with_temp_config(tag: &str) -> DeltaApp {
+        let dir = std::env::temp_dir().join(format!("delta-app-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let config = Config {
+            monitor: monitor(1920, 1080),
+            f_key_hook_enabled: false,
+            ..Config::default()
+        };
+        DeltaApp::new(config.monitor, config, dir.join("settings.json"))
+    }
+
     #[test]
-    fn legacy_unparsable_hotkey_is_shown_as_the_key_that_actually_works() {
-        // 复审 S2-1：面板必须显示真实生效的键，而不是配置里的原文。
+    fn auto_switch_actions_reach_config_state_and_disk() {
+        // spec D2 边界：关掉必须**真的不点**，且立刻生效于下一次识别、跨启动保持。
+        let mut app = app_with_temp_config("auto-switches");
+        assert!(app.state.fingerprint_auto_click, "默认开");
+        assert!(app.state.morse_auto_download, "默认开");
+
+        let ctx = egui::Context::default();
+        app.handle(Action::ToggleFingerprintAutoClick, &ctx);
+        app.handle(Action::ToggleMorseAutoDownload, &ctx);
+
+        assert!(!app.state.fingerprint_auto_click, "界面必须跟着关");
+        assert!(!app.state.morse_auto_download);
+
+        let config = app.snapshot();
+        // 这两个字段就是 `worker::run_fingerprint` / `run_morse` 读的那两个。
+        assert!(!config.fingerprint_auto_click, "指纹流程读的是这个字段");
+        assert!(!config.auto_confirm, "摩斯流程读的是这个字段");
+
+        let saved = delta_config::load(&app.config_path)
+            .expect("开关必须已落盘")
+            .config;
+        assert!(!saved.fingerprint_auto_click);
+        assert!(!saved.auto_confirm);
+    }
+
+    #[test]
+    fn legacy_unparsable_hotkey_is_shown_as_the_key_that_actually_works() {        // 复审 S2-1：面板必须显示真实生效的键，而不是配置里的原文。
         let config = Config {
             hotkeys: delta_config::Hotkeys {
                 scene: "sb250".to_owned(),

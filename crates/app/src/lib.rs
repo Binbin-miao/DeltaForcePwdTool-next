@@ -1,6 +1,7 @@
 //! `delta-app`：装配层（单实例 → 配置 → 字体 → 界面 → 热键 → 后台识别）。
 
 pub mod app;
+pub mod keyhook;
 pub mod platform;
 pub mod worker;
 

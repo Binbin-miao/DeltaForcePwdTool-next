@@ -136,7 +136,7 @@ pub const CHORD_MOD_SHIFT: u32 = 0x4;
 /// **唯一词汇来源**：`delta-app::platform::parse_hotkey` 按同一套短名解析，
 /// 那边的 `capturable_vocabulary_matches_the_parser` 用例把两张表钉在一起，
 /// 任何一侧漂移都会立刻变红。新增可捕获键只需在这里加一行。
-pub const CAPTURABLE: [(&str, egui::Key); 71] = [
+pub const CAPTURABLE: [(&str, egui::Key); 82] = [
     ("F1", egui::Key::F1),
     ("F2", egui::Key::F2),
     ("F3", egui::Key::F3),
@@ -208,6 +208,18 @@ pub const CAPTURABLE: [(&str, egui::Key); 71] = [
     ("ArrowDown", egui::Key::ArrowDown),
     ("ArrowLeft", egui::Key::ArrowLeft),
     ("ArrowRight", egui::Key::ArrowRight),
+    // spec D4：11 个 OEM 符号键，短名与 `platform::KEY_TABLE` 逐字一致（就是符号本身）。
+    ("/", egui::Key::Slash),
+    ("\\", egui::Key::Backslash),
+    (";", egui::Key::Semicolon),
+    ("'", egui::Key::Quote),
+    (",", egui::Key::Comma),
+    (".", egui::Key::Period),
+    ("-", egui::Key::Minus),
+    ("=", egui::Key::Equals),
+    ("[", egui::Key::OpenBracket),
+    ("]", egui::Key::CloseBracket),
+    ("`", egui::Key::Backtick),
 ];
 
 /// 一次捕获到的快捷键：主键短名 + 修饰键位。
@@ -317,6 +329,12 @@ pub enum Action {
     OpenCalibration,
     OpenSettings,
     ToggleFlow(SceneKind),
+    /// 指纹自动点击（spec D2 第 4 行 → `config.fingerprint_auto_click`）。
+    ToggleFingerprintAutoClick,
+    /// 摩斯自动下载（spec D2 第 5 行 → `config.auto_confirm`）。
+    ToggleMorseAutoDownload,
+    /// F 键低级键盘钩子总开关（spec D3 边界 3；关 = 卸载钩子）。
+    ToggleFKeyHook,
     /// 点掉一次性警示（如「屏幕变了 · 建议重校」）。
     DismissNotice,
 }
@@ -431,6 +449,16 @@ pub struct UiState {
     pub capture_test_error: Option<String>,
     /// 窗口是否已钉在顶层（标题条图钉的当前状态；默认不置顶）。
     pub always_on_top: bool,
+    /// 指纹自动点击（spec D2 第 4 行）：关 = 只产出标注图，不点击。
+    pub fingerprint_auto_click: bool,
+    /// 摩斯自动下载（spec D2 第 5 行，上游 `morse_auto_click`）：关 = 输入完不点确认。
+    pub morse_auto_download: bool,
+    /// F 键监听总开关（spec D3 边界 3）：关 = 卸载钩子，F 键完全不受本程序影响。
+    pub f_key_hook: bool,
+    /// 游戏前台窗口标题关键词（spec D3 边界 5；设置页可增删）。
+    ///
+    /// 默认值直接取自 `delta_config`，两份默认值不允许各写一遍（否则一改就漂）。
+    pub game_title_keywords: Vec<String>,
 }
 
 /// 三个功能入口开关。
@@ -497,6 +525,10 @@ impl Default for UiState {
             capture_test: None,
             capture_test_error: None,
             always_on_top: false,
+            fingerprint_auto_click: true,
+            morse_auto_download: true,
+            f_key_hook: true,
+            game_title_keywords: delta_config::Config::default().game_title_keywords,
         }
     }
 }
@@ -598,6 +630,26 @@ impl UiState {
     pub fn finish(&mut self, phase: Phase, message: impl Into<String>) {
         self.phase = phase;
         self.message = message.into();
+    }
+
+    /// 指纹自动点击开关（spec D2 第 4 行）。
+    pub fn set_fingerprint_auto_click(&mut self, enabled: bool) {
+        self.fingerprint_auto_click = enabled;
+    }
+
+    /// 摩斯自动下载开关（spec D2 第 5 行）。
+    pub fn set_morse_auto_download(&mut self, enabled: bool) {
+        self.morse_auto_download = enabled;
+    }
+
+    /// F 键监听开关（spec D3 边界 3）。
+    pub fn set_f_key_hook(&mut self, enabled: bool) {
+        self.f_key_hook = enabled;
+    }
+
+    /// 游戏前台关键词（spec D3 边界 5）。
+    pub fn set_game_title_keywords(&mut self, keywords: Vec<String>) {
+        self.game_title_keywords = keywords;
     }
 }
 
@@ -775,7 +827,7 @@ mod tests {
         assert_eq!(chord.modifiers(), 0);
 
         // 不支持的键必须返回 None（调用方继续等待），不能被当成和弦提交。
-        assert_eq!(KeyChord::capture(egui::Key::Slash, plain), None);
+        assert_eq!(KeyChord::capture(egui::Key::Questionmark, plain), None);
         assert_eq!(KeyChord::capture(egui::Key::Escape, plain), None);
         assert_eq!(KeyChord::capture(egui::Key::Enter, plain), None);
         assert_eq!(KeyChord::capture(egui::Key::F25, plain), None);
@@ -848,7 +900,7 @@ mod tests {
         let plain = egui::Modifiers::default();
         // 不可捕获的键：忽略并继续等，绝不取消（否则按错一下就掉出捕获态）。
         assert_eq!(
-            read_capture(&[key_event(egui::Key::Slash, plain)]),
+            read_capture(&[key_event(egui::Key::Questionmark, plain)]),
             CaptureOutcome::Pending
         );
         // 纯修饰键只产生 `ModifiersChanged`，不构成热键（D1 显式边界）。
