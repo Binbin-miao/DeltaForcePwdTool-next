@@ -98,3 +98,28 @@
 - 不支持鼠标侧键、多媒体键（本轮只解决键盘热键）。
 - 不改动 F5/F6/F7 三个专用键的绑定流程（仍在配置文件里改）。
 - 不引入新的第三方依赖（egui 已能提供键事件与 Key 枚举）。
+
+---
+
+## 6. 复审批次追加（2026-11-09 第二轮，必须修完才算闭环）
+
+第一轮复审 `55da112` 判 PASS，但提出两条会残留原症状的 S2，追加为本轮必做项：
+
+- **[S2-1] 旧配置仍显示假值（必须修）**：`app.rs:547` 的 `initial_state` 把 `config.hotkeys.scene` **原文**塞给界面，而 `worker.rs:240` 启动时把不可解析的名字回落成 F8。老配置若留着 `"sb250"`，面板继续显示 `sb250` 而实际是 F8 —— 原缺陷对该用户原样保留。
+  - 修法：`initial_state` 用**启动解析结果经 `format_hotkey` 规范化后**的字符串显示；解析失败时显示 `F8` 并保留 eprintln 记录。仍属 D3「唯一允许兜底在启动读配置」这一处。
+
+- **[S2-2] 改键可能完全无声（必须修）**：`app.rs:161-163` 先 `persist()` 再 `worker.set_hotkey(name)` 且丢弃 send 结果。若热键线程已因 `Hotkeys::new()` 失败而退出（`worker.rs:120-122` 直接 return），则零回执：界面不换键、无提示，但配置已落盘、下次启动静默生效。违反 D2「不允许静默失败」。
+  - 修法：判断 send 结果，失败即 `show_hotkey_conflict(conflict_copy(None), now)`。
+
+- **[S2-3] 两表单向绑定（必须修）**：`platform.rs:431` 的用例只遍历 `CAPTURABLE`，`KEY_TABLE` 多一项不会变红。
+  - 修法：补 `assert_eq!(KEY_TABLE.len(), CAPTURABLE.len())` 双向钉死。
+
+- **[精简，同轮做掉]**：
+  1. 删 `app.rs:154-157` 的重复解析（结果只判 `is_err()` 就丢，worker 里会再解析一次；且失败时会把主界面切成「未识别」，热键错误不该动主状态机）。
+  2. `state.rs:246-259` 的 `KeyChord::label()` 与 `platform.rs:325-340` 的 `format_hotkey` 重复拼接修饰键 → 提交路径改用 `Hotkey::new(vk, chord.modifiers())`，同时去掉 format→parse 往返。
+  3. `app.rs:126` 与 `app.rs:161` 各 persist 一次 → 成功路径只落盘一次。
+  4. 冲突文案用 `FONT_BODY(13)` 右对齐，长组合键在 340 最小宽度下会压到左侧标题 → 降 `FONT_LABEL(11)`。
+
+> 本轮 S2 修复与工单 t11-d（设置面板截图方式 + 测试截图按钮）**合并为同一轮施工**，因为二者共用 `app.rs` / `view.rs` / `state.rs` / `worker.rs`，分两轮会重复改动同一批文件并重复跑门禁。
+
+> 本轮已完成：S2-1 / S2-2 / S2-3 三条必修 + 四条精简（提交路径改用 `hotkey_from_chord` 直出虚拟键码，去掉 format→parse 往返；成功路径只在 `HotkeyApplied` 回执处落盘一次）。

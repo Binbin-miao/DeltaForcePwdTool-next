@@ -5,29 +5,27 @@
 
 use std::time::{Duration, Instant};
 
-use delta_capture::{ensure_dpi_awareness, Capturer, Frame};
+use delta_capture::{CaptureSession, Frame};
 use delta_geom::{PxPoint, PxRect};
 use delta_input::{event_count, Drag};
 
 use crate::{Clock, Pointer, Screen};
 
-/// 真实屏幕抓取（复用 `delta-capture` 的常驻 GDI 资源）。
-pub struct SystemScreen {
-    capturer: Capturer,
+/// 真实屏幕抓取（**借用任务会话**：后端与配额由会话统一管辖，spec D3 / D4）。
+pub struct SystemScreen<'a> {
+    session: &'a mut CaptureSession,
 }
 
-impl SystemScreen {
-    /// 先完成 Per-Monitor V2 DPI 感知，再建常驻 DC（spec D9）。
-    pub fn new(monitor_width: i32, monitor_height: i32) -> Result<Self, String> {
-        ensure_dpi_awareness();
-        let capturer = Capturer::new(monitor_width, monitor_height).map_err(|error| error.to_string())?;
-        Ok(Self { capturer })
+impl<'a> SystemScreen<'a> {
+    /// 借用一次识别任务的采集会话（DPI 感知已在主入口完成）。
+    pub fn new(session: &'a mut CaptureSession) -> Self {
+        Self { session }
     }
 }
 
-impl Screen for SystemScreen {
+impl Screen for SystemScreen<'_> {
     fn grab(&mut self, rect: PxRect) -> Result<Frame, String> {
-        self.capturer.grab(rect).map_err(|error| error.to_string())
+        self.session.grab(rect).map_err(|error| error.to_string())
     }
 }
 

@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 
 use delta_hotkey::Hotkey;
+use delta_ui::KeyChord;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{GetLastError, BOOL, ERROR_ALREADY_EXISTS, HWND, LPARAM};
 use windows::Win32::System::Threading::CreateMutexW;
@@ -319,6 +320,25 @@ pub fn parse_hotkey(name: &str) -> Result<Hotkey, HotkeyParseError> {
     Ok(Hotkey::new(code, bits))
 }
 
+/// 启动读配置：spec D3 **唯一**允许回落 F8 的地方，且必须 `eprintln` 留痕。
+///
+/// 返回**实际生效**的 `Hotkey`：热键线程注册它，`initial_state` 用 [`format_hotkey`]
+/// 显示它 —— 因此面板永远不会显示一个没生效的名字（复审 S2-1）。
+pub fn startup_hotkey(name: &str) -> Hotkey {
+    parse_hotkey(name).unwrap_or_else(|error| {
+        eprintln!("[hotkey] 配置里的热键 {name:?} 无法解析（{error}），本会话回落 F8");
+        Hotkey::default()
+    })
+}
+
+/// 捕获结果 → `Hotkey`：直接用捕获到的虚拟键码与修饰位，**不走字符串往返**。
+///
+/// 词汇表两张表由 `capturable_vocabulary_matches_the_parser` 钉死，因此这里的 `None`
+/// 只可能出现在不变量被破坏时；调用方按「注册失败」显形，绝不设默认值糊过去。
+pub fn hotkey_from_chord(chord: KeyChord) -> Option<Hotkey> {
+    key_code(chord.main_name()).map(|vk| Hotkey::new(vk, chord.modifiers()))
+}
+
 /// `Hotkey` → 规范写法：固定 `Ctrl+Alt+Shift+主键` 顺序（spec D1）。
 ///
 /// 词汇表外的虚拟键码显形为 `0x6A`，**不得**假装成某个已知键。
@@ -430,15 +450,35 @@ mod tests {
     #[test]
     fn capturable_vocabulary_matches_the_parser() {
         // ui 侧负责 egui::Key → 短名，本文件负责短名 → 虚拟键码。
-        // 这条用例把两张表钉在一起：任何一张漂移都会红。
+        // 这条用例把两张表**双向**钉死：任何一张多一项/少一项都会红（复审 S2-3）。
+        assert_eq!(
+            KEY_TABLE.len(),
+            delta_ui::state::CAPTURABLE.len(),
+            "两张表条数必须一致：多出来的键要么解析不了、要么捕获不到"
+        );
         for (name, key) in delta_ui::state::CAPTURABLE {
             let chord = delta_ui::state::KeyChord::capture(key, egui::Modifiers::default())
                 .unwrap_or_else(|| panic!("{name} 必须可捕获"));
-            assert_eq!(chord.label(), name, "捕获结果必须用同一套短名");
+            assert_eq!(chord.main_name(), name, "捕获结果必须用同一套短名");
             let hotkey =
-                parse_hotkey(&chord.label()).unwrap_or_else(|error| panic!("{name}: {error}"));
-            assert_eq!(format_hotkey(&hotkey), chord.label(), "{name} 归一化必须唯一");
+                hotkey_from_chord(chord).unwrap_or_else(|| panic!("{name} 必须可解析"));
+            assert_eq!(format_hotkey(&hotkey), name, "{name} 归一化必须唯一");
+            assert_eq!(parse_hotkey(name), Ok(hotkey), "{name} 必须回得去");
         }
+    }
+
+    #[test]
+    fn only_the_startup_reader_falls_back_to_f8() {
+        // spec D3：启动读配置是唯一允许回落的地方，其他调用点一律 Err 且必须显形。
+        assert_eq!(startup_hotkey("sb250"), Hotkey::default());
+        assert_eq!(format_hotkey(&startup_hotkey("sb250")), "F8", "面板显示生效值");
+        assert_eq!(startup_hotkey("F9"), Hotkey::plain(0x78));
+        assert_eq!(
+            startup_hotkey("Ctrl+Shift+A"),
+            Hotkey::new(0x41, MOD_CONTROL | MOD_SHIFT)
+        );
+        // 规范化：老配置写成小写也能显示成唯一写法（复审 S2-1）。
+        assert_eq!(format_hotkey(&startup_hotkey("ctrl+f8")), "Ctrl+F8");
     }
 
     #[test]

@@ -7,6 +7,8 @@ use egui::Color32;
 
 use crate::theme;
 
+pub use delta_config::CaptureBackend;
+
 /// 场景（与 `delta-scene::Scene` 一一对应，UI 侧不反向依赖业务 crate）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SceneKind {
@@ -241,23 +243,6 @@ impl KeyChord {
     pub fn modifiers(self) -> u32 {
         self.modifiers
     }
-
-    /// 规范串：固定 `Ctrl+Alt+Shift+主键` 顺序，保证同一组合只有一种写法（D1）。
-    pub fn label(self) -> String {
-        let mut text = String::new();
-        for (bit, label) in [
-            (CHORD_MOD_CONTROL, "Ctrl"),
-            (CHORD_MOD_ALT, "Alt"),
-            (CHORD_MOD_SHIFT, "Shift"),
-        ] {
-            if self.modifiers & bit != 0 {
-                text.push_str(label);
-                text.push('+');
-            }
-        }
-        text.push_str(self.name);
-        text
-    }
 }
 
 fn modifier_bits(modifiers: egui::Modifiers) -> u32 {
@@ -372,6 +357,42 @@ impl Progress {
     }
 }
 
+/// 「测试截图」的结果（spec D5）：抓到的尺寸、耗时与已上传的缩略图纹理。
+///
+/// 纹理在 UI 线程上传（`Context::load_texture`），这里只持有句柄 —— 逐像素画图会
+/// 让一帧多出上万条绘制指令，缩略图必须是纹理。
+#[derive(Clone)]
+pub struct CaptureTestResult {
+    /// 实际抓到的像素宽（整屏）。
+    pub width: u32,
+    /// 实际抓到的像素高。
+    pub height: u32,
+    /// 抓这一帧耗时（毫秒，含后端初始化）。
+    pub elapsed_ms: u64,
+    /// 缩略图纹理（≤160×64）。
+    pub thumbnail: egui::TextureHandle,
+}
+
+impl CaptureTestResult {
+    /// 结果行文案：`1920×1080 · 18ms`（spec D5 的显示要求）。
+    pub fn summary(&self) -> String {
+        format!("{}×{} · {}ms", self.width, self.height, self.elapsed_ms)
+    }
+}
+
+/// 手写 `Debug`：`egui::TextureHandle` 没有实现 `Debug`，这里只暴露纹理 id。
+impl std::fmt::Debug for CaptureTestResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptureTestResult")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("elapsed_ms", &self.elapsed_ms)
+            .field("thumbnail", &self.thumbnail.id())
+            .finish()
+    }
+}
+
 /// 界面全量状态。
 #[derive(Debug, Clone)]
 pub struct UiState {
@@ -403,6 +424,12 @@ pub struct UiState {
     pub hotkey_conflict: Option<String>,
     /// 冲突提示的自动消失时刻（秒，与 `egui` 的 `input.time` 同一时间源）。
     pub hotkey_conflict_until: f64,
+    /// 当前截图后端（spec D1：切换立即生效，运行中禁止切换）。
+    pub capture_backend: CaptureBackend,
+    /// 最近一次「测试截图」的结果（`None` = 还没点过 / 已被清空）。
+    pub capture_test: Option<CaptureTestResult>,
+    /// 最近一次「测试截图」的失败原因（与 `capture_test` 互斥）。
+    pub capture_test_error: Option<String>,
 }
 
 /// 三个功能入口开关。
@@ -466,6 +493,9 @@ impl Default for UiState {
             hotkey_editing: false,
             hotkey_conflict: None,
             hotkey_conflict_until: 0.0,
+            capture_backend: CaptureBackend::Wgc,
+            capture_test: None,
+            capture_test_error: None,
         }
     }
 }
@@ -544,6 +574,23 @@ impl UiState {
     /// 点掉冲突提示。
     pub fn dismiss_hotkey_conflict(&mut self) {
         self.hotkey_conflict = None;
+    }
+
+    /// 是否允许切换截图后端（spec D1：必须等当前识别任务结束）。
+    pub fn capture_switchable(&self) -> bool {
+        self.phase != Phase::Running
+    }
+
+    /// 装上一次测试截图的结果（成功即清掉旧错误，两者互斥）。
+    pub fn set_capture_test(&mut self, result: CaptureTestResult) {
+        self.capture_test = Some(result);
+        self.capture_test_error = None;
+    }
+
+    /// 装上一次测试截图的失败原因（失败即清掉旧结果，不显示过期证据）。
+    pub fn set_capture_test_error(&mut self, reason: String) {
+        self.capture_test = None;
+        self.capture_test_error = Some(reason);
     }
 
     /// 收尾成某一态。
@@ -730,7 +777,6 @@ mod tests {
     fn capture_accepts_supported_keys_and_ignores_the_rest() {
         let plain = egui::Modifiers::default();
         let chord = KeyChord::capture(egui::Key::F9, plain).expect("F9 可捕获");
-        assert_eq!(chord.label(), "F9");
         assert_eq!(chord.main_name(), "F9");
         assert_eq!(chord.modifiers(), 0);
 
@@ -742,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn chord_label_uses_the_fixed_modifier_order() {
+    fn chord_carries_the_win32_modifier_bits() {
         let modifiers = egui::Modifiers {
             ctrl: true,
             alt: true,
@@ -750,10 +796,11 @@ mod tests {
             ..egui::Modifiers::default()
         };
         let chord = KeyChord::capture(egui::Key::F8, modifiers).expect("F8 可捕获");
-        assert_eq!(chord.label(), "Ctrl+Alt+Shift+F8");
+        assert_eq!(chord.main_name(), "F8");
         assert_eq!(
             chord.modifiers(),
-            CHORD_MOD_CONTROL | CHORD_MOD_ALT | CHORD_MOD_SHIFT
+            CHORD_MOD_CONTROL | CHORD_MOD_ALT | CHORD_MOD_SHIFT,
+            "修饰键位必须与 Win32 MOD_* 同值，注册时才能直接按位或"
         );
     }
 
@@ -841,7 +888,7 @@ mod tests {
         };
         match read_capture(&[key_event(egui::Key::J, ctrl_shift)]) {
             CaptureOutcome::Commit(chord) => {
-                assert_eq!(chord.label(), "Ctrl+Shift+J");
+                assert_eq!(chord.main_name(), "J");
                 assert_eq!(
                     chord.modifiers(),
                     CHORD_MOD_CONTROL | CHORD_MOD_SHIFT,
@@ -874,5 +921,55 @@ mod tests {
         assert_eq!(state.hotkey_conflict_text(20.0), Some("热键不可用 · 用按钮"));
         state.dismiss_hotkey_conflict();
         assert_eq!(state.hotkey_conflict_text(20.0), None, "也能点掉");
+    }
+
+    fn test_capture_result() -> CaptureTestResult {
+        let ctx = egui::Context::default();
+        let thumbnail = ctx.load_texture(
+            "capture-test",
+            egui::ColorImage::example(),
+            egui::TextureOptions::NEAREST,
+        );
+        CaptureTestResult {
+            width: 1920,
+            height: 1080,
+            elapsed_ms: 18,
+            thumbnail,
+        }
+    }
+
+    #[test]
+    fn capture_test_result_summary_matches_spec_copy() {
+        assert_eq!(test_capture_result().summary(), "1920×1080 · 18ms");
+    }
+
+    #[test]
+    fn capture_test_result_and_error_never_show_up_together() {
+        let mut state = UiState::default();
+        assert_eq!(state.capture_backend, CaptureBackend::Wgc, "默认 WGC");
+        assert!(state.capture_test.is_none() && state.capture_test_error.is_none());
+
+        state.set_capture_test(test_capture_result());
+        assert_eq!(state.capture_test.as_ref().map(CaptureTestResult::summary), Some("1920×1080 · 18ms".to_owned()));
+
+        state.set_capture_test_error("WGC 初始化失败：0x80070005".to_owned());
+        assert!(state.capture_test.is_none(), "失败不得继续显示上一次的证据");
+        assert_eq!(
+            state.capture_test_error.as_deref(),
+            Some("WGC 初始化失败：0x80070005")
+        );
+
+        state.set_capture_test(test_capture_result());
+        assert!(state.capture_test_error.is_none(), "成功即清掉旧错误");
+    }
+
+    #[test]
+    fn capture_backend_is_locked_while_a_task_runs() {
+        let mut state = UiState::default();
+        assert!(state.capture_switchable());
+        state.begin_run();
+        assert!(!state.capture_switchable(), "运行中禁止切换后端（D1）");
+        state.finish(Phase::Success, "已完成");
+        assert!(state.capture_switchable(), "任务结束即可切换");
     }
 }

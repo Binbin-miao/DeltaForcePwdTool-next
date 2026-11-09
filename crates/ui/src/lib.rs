@@ -9,8 +9,8 @@ pub mod view;
 pub mod wizard;
 
 pub use state::{
-    conflict_copy, format_sequence, read_capture, Action, CaptureOutcome, KeyChord, Phase, Progress,
-    SceneKind, UiState, CAPTURABLE,
+    conflict_copy, format_sequence, read_capture, Action, CaptureBackend, CaptureOutcome,
+    CaptureTestResult, KeyChord, Phase, Progress, SceneKind, UiState, CAPTURABLE,
 };
 pub use view::{main_window, wizard_window, WizardAction, WizardFrame};
 pub use wizard::{apply_drawn, Step, TargetKind, TargetSpec, Verdict, Wizard, WizardScene};

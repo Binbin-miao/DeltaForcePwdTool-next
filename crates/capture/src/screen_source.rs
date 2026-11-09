@@ -5,7 +5,7 @@
 
 use delta_geom::PxRect;
 
-use crate::{Capturer, Frame};
+use crate::{CaptureSession, Frame};
 
 /// 截图来源。
 pub trait ScreenSource {
@@ -13,20 +13,22 @@ pub trait ScreenSource {
     fn grab(&mut self, rect: PxRect) -> Result<Frame, String>;
 }
 
-/// 真机截图适配（每次 `grab` 独立申请/释放后端资源，无常驻句柄）。
+/// 真机截图适配：**借用任务会话**，后端与配额都由会话统一管辖（spec D3 / D4）。
+///
+/// 适配层不再自建抓屏器：一次识别任务只有一条采集链路，配额才可能真的封顶。
 pub struct LiveScreen<'a> {
-    capturer: &'a mut Capturer,
+    session: &'a mut CaptureSession,
 }
 
 impl<'a> LiveScreen<'a> {
-    /// 包装一个抓屏器。
-    pub fn new(capturer: &'a mut Capturer) -> Self {
-        Self { capturer }
+    /// 借用任务会话（会话的生命周期由调用方持有）。
+    pub fn new(session: &'a mut CaptureSession) -> Self {
+        Self { session }
     }
 }
 
 impl ScreenSource for LiveScreen<'_> {
     fn grab(&mut self, rect: PxRect) -> Result<Frame, String> {
-        self.capturer.grab(rect).map_err(|error| error.to_string())
+        self.session.grab(rect).map_err(|error| error.to_string())
     }
 }

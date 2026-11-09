@@ -332,6 +332,7 @@ dependencies = [
 name = "delta-config"
 version = "0.1.0"
 dependencies = [
+ "delta-capture",
  "delta-geom",
  "serde",
  "serde_json",

@@ -3,14 +3,15 @@
 //! 线程纪律：`ui` 里只 `try_recv` 事件与绘制；识别一律在后台线程跑。
 
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use delta_config::Config;
 use delta_geom::{MonitorInfo, PxRect};
 use delta_ui::{
-    conflict_copy, Action, KeyChord, Phase, Progress, Step, UiState, Verdict, Wizard, WizardAction,
-    WizardFrame, WizardScene,
+    conflict_copy, Action, CaptureBackend, CaptureTestResult, KeyChord, Phase, Progress, Step,
+    UiState, Verdict, Wizard, WizardAction, WizardFrame, WizardScene,
 };
 
 use crate::platform;
@@ -24,6 +25,8 @@ const RUNNING_REPAINT: Duration = Duration::from_millis(16);
 const IDLE_REPAINT: Duration = Duration::from_millis(100);
 /// 预览图降采样倍数（全屏纹理不必 1:1）。
 const PREVIEW_STEP: u32 = 2;
+/// 测试截图缩略图上限（spec D5：≤160×90；留一行文案位后取 160×64）。
+const THUMB_MAX: [u32; 2] = [160, 64];
 
 /// 应用状态。
 pub struct DeltaApp {
@@ -39,6 +42,16 @@ pub struct DeltaApp {
     save_finished_at: Option<Instant>,
     phase_started: Instant,
     keep_topmost: bool,
+    /// 正在飞的「测试截图」后台任务（`None` = 空闲）。
+    capture_probe: Option<Receiver<Result<CaptureProbe, String>>>,
+}
+
+/// 「测试截图」从后台线程回传的东西（纹理上传只能留到 UI 线程做）。
+struct CaptureProbe {
+    width: u32,
+    height: u32,
+    elapsed_ms: u64,
+    image: egui::ColorImage,
 }
 
 impl DeltaApp {
@@ -60,6 +73,7 @@ impl DeltaApp {
             save_finished_at: None,
             phase_started: Instant::now(),
             keep_topmost: true,
+            capture_probe: None,
         }
     }
 
@@ -120,10 +134,16 @@ impl DeltaApp {
                 UiEvent::Rejected(message) => self.finish(Phase::Unrecognized, message),
                 UiEvent::TimedOut(message) => self.finish(Phase::TimedOut, message),
                 UiEvent::HotkeyApplied(name) => {
-                    // 只有拿到成功回执才换显示（D2：不允许静默失败）。
+                    // 只有拿到成功回执才换显示 + 落盘（D2；成功路径只写一次盘）。
+                    // 反过来，注册失败就什么都不写 —— 配置里永远不会留下一个没生效的键。
+                    if let Ok(mut config) = self.config.lock() {
+                        config.hotkeys.scene = name.clone();
+                    }
                     self.state.hotkey = name;
                     self.state.dismiss_hotkey_conflict();
-                    let _ = self.persist();
+                    if let Err(reason) = self.persist() {
+                        eprintln!("[hotkey] 热键已生效但落盘失败：{reason}");
+                    }
                 }
                 UiEvent::HotkeyConflict { wanted, kept } => {
                     let now = ctx.input(|input| input.time);
@@ -145,22 +165,97 @@ impl DeltaApp {
 
     /// 提交一次捕获到的热键（spec D3 / D5）。
     ///
-    /// 只写配置 + 交给热键线程；**这里不动 `state.hotkey`** —— 界面要等 worker 回执
-    /// （`HotkeyApplied` / `HotkeyConflict`）才换显示，否则又会变成「看起来保存成功」。
-    fn commit_hotkey(&mut self, chord: KeyChord) {
-        let name = chord.label();
-        // 捕获结果必然可解析（`capturable_vocabulary_matches_the_parser` 把两张表钉死）。
-        // 解析失败说明不变量被破坏：说出来，绝不设默认值糊过去。
-        if platform::parse_hotkey(&name).is_err() {
-            self.finish(Phase::Unrecognized, "热键写法不识别".to_owned());
+    /// 只把**规范写法**交给热键线程；这里既不换显示、也不落盘 —— 二者都等
+    /// `HotkeyApplied` 回执。这样一次注册失败绝不会变成「配置已改但没生效」的假保存。
+    ///
+    /// 捕获结果直接用虚拟键码 + 修饰位生成 `Hotkey`，不再走「拼字符串→再解析」的往返。
+    fn commit_hotkey(&mut self, chord: KeyChord, now: f64) {
+        let Some(hotkey) = platform::hotkey_from_chord(chord) else {
+            // 捕获表与解析表漂移才会走到这里：说出来，绝不设默认值糊过去。
+            eprintln!("[hotkey] 捕获结果 {chord:?} 无法映射到虚拟键码");
+            self.state.show_hotkey_conflict(conflict_copy(None), now);
+            return;
+        };
+        if !self.worker.set_hotkey(platform::format_hotkey(&hotkey)) {
+            // 热键线程已退出（例如注册接口建不起来）：当场显形，不留「无回执」的死角。
+            eprintln!("[hotkey] 热键线程不可用，本次改键未生效");
+            self.state.show_hotkey_conflict(conflict_copy(None), now);
+        }
+    }
+
+    /// 切换截图后端：写配置 → 落盘 → 下一次抓帧立即生效（spec D1，无需重启）。
+    fn set_capture_backend(&mut self, backend: CaptureBackend) {
+        if let Ok(mut config) = self.config.lock() {
+            config.capture_backend = backend;
+        }
+        self.state.capture_backend = backend;
+        // 换了后端，上一次的测试结果就不再代表当前档位：清空，别显示过期证据。
+        self.state.capture_test = None;
+        self.state.capture_test_error = None;
+        if let Err(reason) = self.persist() {
+            // 落盘失败要看得见，但不动主状态机（热键/配置错误不该把界面切成「未识别」）。
+            self.state
+                .set_capture_test_error(format!("配置落盘失败：{reason}"));
+        }
+    }
+
+    /// 点「抓一帧」：**后台线程**建临时会话抓一帧后立即释放（spec D3 / D5）。
+    ///
+    /// 绝不在 UI 线程做 D3D11 初始化 —— 那会卡住整帧；结果靠 `request_repaint` 回填。
+    fn start_capture_test(&mut self, ctx: &egui::Context) {
+        if self.capture_probe.is_some() {
+            // 上一次还在飞：不叠线程、不重复抓帧（D5「不点不抓」）。
             return;
         }
-        if let Ok(mut config) = self.config.lock() {
-            config.hotkeys.scene = name.clone();
+        let backend = self.snapshot().capture_backend;
+        let monitor = self.monitor;
+        let (tx, rx) = mpsc::channel();
+        let wake = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("delta-capture-test".to_owned())
+            .spawn(move || {
+                let _ = tx.send(capture_probe_once(backend, monitor));
+                wake.request_repaint();
+            });
+        match spawned {
+            Ok(_) => self.capture_probe = Some(rx),
+            Err(error) => self
+                .state
+                .set_capture_test_error(format!("截图线程创建失败：{error}")),
         }
-        // 先落盘再热更新：即使本次注册被占用，下次启动仍按用户意图重试。
-        let _ = self.persist();
-        self.worker.set_hotkey(name);
+    }
+
+    /// 收后台的测试截图结果；纹理上传在这里（UI 线程）完成。
+    fn drain_capture_probe(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.capture_probe.as_ref() else {
+            return;
+        };
+        let received = receiver.try_recv();
+        if matches!(received, Err(TryRecvError::Empty)) {
+            return;
+        }
+        self.capture_probe = None;
+        match received {
+            Ok(Ok(probe)) => {
+                let thumbnail = ctx.load_texture(
+                    "delta-capture-test",
+                    probe.image,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.state.set_capture_test(CaptureTestResult {
+                    width: probe.width,
+                    height: probe.height,
+                    elapsed_ms: probe.elapsed_ms,
+                    thumbnail,
+                });
+            }
+            Ok(Err(reason)) => self.state.set_capture_test_error(reason),
+            Err(TryRecvError::Disconnected) => self
+                .state
+                .set_capture_test_error("测试截图线程意外退出".to_owned()),
+            Err(TryRecvError::Empty) => {}
+        }
+        ctx.request_repaint();
     }
 
     /// 处理主界面动作。
@@ -480,11 +575,15 @@ impl eframe::App for DeltaApp {
             return;
         }
         if self.settings_open {
+            self.drain_capture_probe(&ctx);
             let now = ctx.input(|input| input.time);
             // 冲突提示到期即消失：每帧结算一次，视图只拿到结果。
             let conflict = self.state.hotkey_conflict_text(now).map(str::to_owned);
             let hotkey_text = self.state.hotkey.clone();
             let hotkey_editing = self.state.hotkey_editing;
+            let capture_locked = !self.state.capture_switchable();
+            let capture_test = self.state.capture_test.clone();
+            let capture_test_error = self.state.capture_test_error.clone();
             let action = delta_ui::view::settings_panel(
                 ui,
                 delta_ui::view::SettingsView {
@@ -493,6 +592,10 @@ impl eframe::App for DeltaApp {
                     hotkey_conflict: conflict.as_deref(),
                     ocr_enabled: self.snapshot().ocr_enabled,
                     config_path: &self.config_path.display().to_string(),
+                    capture_backend: self.state.capture_backend,
+                    capture_locked,
+                    capture_test: capture_test.as_ref(),
+                    capture_test_error: capture_test_error.as_deref(),
                 },
             );
             match action {
@@ -515,8 +618,12 @@ impl eframe::App for DeltaApp {
                 }
                 Some(delta_ui::view::SettingsAction::CommitHotkey(chord)) => {
                     self.state.hotkey_editing = false;
-                    self.commit_hotkey(chord);
+                    self.commit_hotkey(chord, now);
                 }
+                Some(delta_ui::view::SettingsAction::SetCaptureBackend(backend)) => {
+                    self.set_capture_backend(backend);
+                }
+                Some(delta_ui::view::SettingsAction::TestCapture) => self.start_capture_test(&ctx),
                 Some(delta_ui::view::SettingsAction::Close) => self.settings_open = false,
                 None => {}
             }
@@ -537,6 +644,46 @@ impl eframe::App for DeltaApp {
     }
 }
 
+/// 一次性抓帧：独立临时会话（**不占任务配额**），抓一帧后立即 `drop`（spec D3 / D5）。
+fn capture_probe_once(
+    backend: CaptureBackend,
+    monitor: MonitorInfo,
+) -> Result<CaptureProbe, String> {
+    let started = Instant::now();
+    let rect = PxRect {
+        x: 0,
+        y: 0,
+        w: monitor.w,
+        h: monitor.h,
+    };
+    let mut session =
+        delta_capture::CaptureSession::new(backend).map_err(|error| error.to_string())?;
+    let frame = session.grab(rect).map_err(|error| error.to_string())?;
+    drop(session);
+    Ok(CaptureProbe {
+        width: frame.w,
+        height: frame.h,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        image: thumbnail_image(&frame),
+    })
+}
+
+/// 整屏帧 → ≤160×64 缩略图（RGBA）；按整数步长抽样，不做逐像素缩放。
+fn thumbnail_image(frame: &delta_capture::Frame) -> egui::ColorImage {
+    let step_x = (frame.w as usize).div_ceil(THUMB_MAX[0] as usize).max(1) as u32;
+    let step_y = (frame.h as usize).div_ceil(THUMB_MAX[1] as usize).max(1) as u32;
+    let width = (frame.w as usize).div_ceil(step_x as usize).max(1);
+    let height = (frame.h as usize).div_ceil(step_y as usize).max(1);
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let [b, g, r] = frame.pixel((x as u32 * step_x).min(frame.w - 1), (y as u32 * step_y).min(frame.h - 1));
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba)
+}
+
 /// 启动时的界面状态：未确认免责声明 / 未校准项 / 换分辨率警示。
 ///
 /// **分辨率判断放在这里而不是 `main`**：`config` 与 `monitor` 本就是入参，
@@ -544,7 +691,9 @@ impl eframe::App for DeltaApp {
 fn initial_state(config: &Config, monitor: MonitorInfo) -> UiState {
     let mut state = UiState {
         disclaimer_pending: !config.accepted_disclaimer,
-        hotkey: config.hotkeys.scene.clone(),
+        // 显示**真实生效**的键：老配置里残留的 `sb250` 会被规范化成 F8（复审 S2-1）。
+        hotkey: platform::format_hotkey(&platform::startup_hotkey(&config.hotkeys.scene)),
+        capture_backend: config.capture_backend,
         missing: config.validate().iter().map(ToString::to_string).collect(),
         ..UiState::default()
     };
@@ -630,6 +779,88 @@ mod tests {
         assert_eq!(initial_state(&config, monitor(1920, 1080)).notice_text(), None);
         // 首次启动（基线 0x0）不算变更，不打扰。
         assert_eq!(initial_state(&Config::default(), monitor(2560, 1440)).notice_text(), None);
+    }
+
+    #[test]
+    fn legacy_unparsable_hotkey_is_shown_as_the_key_that_actually_works() {
+        // 复审 S2-1：面板必须显示真实生效的键，而不是配置里的原文。
+        let config = Config {
+            hotkeys: delta_config::Hotkeys {
+                scene: "sb250".to_owned(),
+                ..delta_config::Hotkeys::default()
+            },
+            ..Config::default()
+        };
+        assert_eq!(
+            initial_state(&config, monitor(1920, 1080)).hotkey,
+            "F8",
+            "不可解析的旧值必须显示成实际生效的 F8"
+        );
+
+        // 可解析但写法不规范的旧值也要规范化成唯一写法。
+        let config = Config {
+            hotkeys: delta_config::Hotkeys {
+                scene: "ctrl+f8".to_owned(),
+                ..delta_config::Hotkeys::default()
+            },
+            ..Config::default()
+        };
+        assert_eq!(initial_state(&config, monitor(1920, 1080)).hotkey, "Ctrl+F8");
+    }
+
+    #[test]
+    fn initial_state_carries_the_configured_capture_backend() {
+        let config = Config {
+            capture_backend: CaptureBackend::BitBlt,
+            ..Config::default()
+        };
+        assert_eq!(
+            initial_state(&config, monitor(1920, 1080)).capture_backend,
+            CaptureBackend::BitBlt,
+            "面板必须显示配置里的后端，而不是写死 WGC"
+        );
+    }
+
+    #[test]
+    fn capture_probe_grabs_one_frame_or_reports_a_readable_error() {
+        // 真机探针（spec D5 验收：点一次 → 一帧 → 宽×高 + 缩略图）。
+        // 没有可用 D3D11 适配器时只要求错误可读，绝不静默回退。
+        let Ok(monitor) = delta_capture::monitor_info() else {
+            return;
+        };
+        match capture_probe_once(CaptureBackend::Wgc, monitor) {
+            Ok(probe) => {
+                assert_eq!((probe.width, probe.height), (monitor.w as u32, monitor.h as u32));
+                assert!(probe.image.size[0] <= THUMB_MAX[0] as usize);
+                assert!(probe.image.size[1] <= THUMB_MAX[1] as usize);
+            }
+            Err(reason) => {
+                assert!(reason.contains("WGC"), "{reason}");
+                assert!(reason.contains("0x"), "错误必须带 HRESULT：{reason}");
+            }
+        }
+        // 兼容档不依赖 D3D11，必须能出图（spec D5：切到 BitBlt 仍可测试截图）。
+        let compat = capture_probe_once(CaptureBackend::BitBlt, monitor)
+            .expect("BitBlt 兼容档必须能抓一帧");
+        assert_eq!((compat.width, compat.height), (monitor.w as u32, monitor.h as u32));
+    }
+
+    #[test]
+    fn thumbnail_stays_within_the_size_budget_and_keeps_every_pixel() {
+        let frame = delta_capture::Frame::new(
+            640,
+            360,
+            vec![0; 640 * 360 * 4],
+            Instant::now(),
+        )
+        .expect("测试帧长度正确");
+        let image = thumbnail_image(&frame);
+        assert!(
+            image.size[0] <= THUMB_MAX[0] as usize && image.size[1] <= THUMB_MAX[1] as usize,
+            "缩略图超限：{:?}",
+            image.size
+        );
+        assert_eq!(image.pixels.len(), image.size[0] * image.size[1]);
     }
 }
 

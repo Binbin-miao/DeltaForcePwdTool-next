@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use delta_capture::{Capturer, Frame};
+use delta_capture::{CaptureSession, Capturer, Frame, FRAME_BUDGET};
 use delta_config::{Config, PxView, Timings};
 use delta_geom::{MonitorInfo, PxPoint, PxRect};
 use delta_hotkey::{Hotkey, Hotkeys as HotkeyRegistry};
@@ -75,10 +75,10 @@ pub struct Worker {
 impl Worker {
     /// 热更新全局热键：改完立即生效，无需重启。
     ///
-    /// 新键注册失败（被别的程序占用）时只是暂时没有全局热键，主按钮仍可用，
-    /// 不会让程序崩掉。
-    pub fn set_hotkey(&self, name: String) {
-        let _ = self.hotkey_tx.send(name);
+    /// 返回 `false` 表示热键线程已经退出（例如 `Hotkeys::new()` 失败），本次改键不可能生效。
+    /// 调用方必须据此当场提示 —— 否则用户会等一个永远不会来的回执（spec D2「不允许静默失败」）。
+    pub fn set_hotkey(&self, name: String) -> bool {
+        self.hotkey_tx.send(name).is_ok()
     }
 }
 
@@ -124,7 +124,7 @@ impl Worker {
                     // 启动读配置是 spec D3 唯一允许回落 F8 的地方，且必须留痕。
                     let resolved: Vec<(String, Hotkey, Cmd)> = bindings
                         .iter()
-                        .map(|(name, cmd)| (name.clone(), startup_hotkey(name), *cmd))
+                        .map(|(name, cmd)| (name.clone(), platform::startup_hotkey(name), *cmd))
                         .collect();
                     let mut routes: Vec<(u32, Cmd)> = Vec::new();
                     let mut scene_id: Option<u32> = None;
@@ -234,16 +234,6 @@ impl Worker {
     }
 }
 
-/// 启动读配置：这是 spec D3 **唯一**允许回落 F8 的地方，且必须 `eprintln` 留痕。
-///
-/// 其余调用点（改键、回滚）一律不得回落 —— 那样会把「写错的键」伪装成「生效的 F8」。
-fn startup_hotkey(name: &str) -> Hotkey {
-    platform::parse_hotkey(name).unwrap_or_else(|error| {
-        eprintln!("[hotkey] 配置里的热键 {name:?} 无法解析（{error}），本会话回落 F8");
-        Hotkey::default()
-    })
-}
-
 /// 改键失败后的回滚（spec D2）：把旧键重新注册回去。
 ///
 /// 返回界面该显示的「仍为 X」；`None` = 连旧键都占不到（接口被别的程序抢走了）。
@@ -271,16 +261,35 @@ fn snapshot(config: &Arc<Mutex<Config>>) -> Config {
         .unwrap_or_default()
 }
 
-/// 截一张全屏（物理像素）。
-pub fn grab_full(monitor: MonitorInfo) -> Result<Frame, String> {
-    let mut capturer = Capturer::new(monitor.w, monitor.h).map_err(|error| error.to_string())?;
-    let rect = PxRect {
+/// 整屏像素矩形。
+fn full_rect(monitor: MonitorInfo) -> PxRect {
+    PxRect {
         x: 0,
         y: 0,
         w: monitor.w,
         h: monitor.h,
-    };
-    capturer.grab(rect).map_err(|error| error.to_string())
+    }
+}
+
+/// 截一张全屏（物理像素）。供校准向导等**非任务**路径使用（任务路径一律走会话）。
+pub fn grab_full(monitor: MonitorInfo) -> Result<Frame, String> {
+    let mut capturer = Capturer::new(monitor.w, monitor.h).map_err(|error| error.to_string())?;
+    capturer
+        .grab(full_rect(monitor))
+        .map_err(|error| error.to_string())
+}
+
+/// 建一次识别任务的采集会话（spec D3：任务开始建、结束 `Drop`）。
+///
+/// 失败即报错，**不回退到 BitBlt**（spec D5 显式边界：自动降级会掩盖问题）。
+fn open_session(config: &Config, tx: &mpsc::Sender<UiEvent>) -> Option<CaptureSession> {
+    match CaptureSession::new(config.capture_backend) {
+        Ok(session) => Some(session),
+        Err(error) => {
+            let _ = tx.send(UiEvent::Failed(error.to_string()));
+            None
+        }
+    }
 }
 
 /// 只读检查：找窗 + 场景判别，**零输入**。
@@ -295,12 +304,17 @@ fn probe(config: &Arc<Mutex<Config>>, monitor: MonitorInfo, tx: &mpsc::Sender<Ui
         let _ = tx.send(UiEvent::Rejected("请先校准".to_owned()));
         return;
     };
-    match grab_full(monitor) {
+    let Some(mut session) = open_session(&snapshot, tx) else {
+        return;
+    };
+    match session.grab(full_rect(monitor)) {
         Ok(frame) => {
             let verdict = delta_scene::detect(&frame, &view);
             let scene = map_scene(verdict.scene);
             let sequence = if scene == SceneKind::Console {
-                read_sequence(&view).ok().map(|raw| delta_ui::format_sequence(&raw))
+                read_sequence(&mut session, &view)
+                    .ok()
+                    .map(|raw| delta_ui::format_sequence(&raw))
             } else {
                 None
             };
@@ -315,8 +329,8 @@ fn probe(config: &Arc<Mutex<Config>>, monitor: MonitorInfo, tx: &mpsc::Sender<Ui
                 let _ = tx.send(UiEvent::Rejected("检查游戏".to_owned()));
             }
         }
-        Err(reason) => {
-            let _ = tx.send(UiEvent::Failed(reason));
+        Err(error) => {
+            let _ = tx.send(UiEvent::Failed(error.to_string()));
         }
     }
 }
@@ -347,11 +361,16 @@ fn run_once(
         let _ = tx.send(UiEvent::Rejected("请先校准".to_owned()));
         return;
     };
+    // spec D3：任务开始建会话；函数任何出口（成功 / 失败 / 取消 / 超时）都会 `drop` 它，
+    // 因此程序空闲时不可能持有 D3D11 设备或采集会话。
+    let Some(mut session) = open_session(&snapshot, tx) else {
+        return;
+    };
 
-    let frame = match grab_full(monitor) {
+    let frame = match session.grab(full_rect(monitor)) {
         Ok(frame) => frame,
-        Err(reason) => {
-            let _ = tx.send(UiEvent::Failed(reason));
+        Err(error) => {
+            let _ = tx.send(UiEvent::Failed(error.to_string()));
             return;
         }
     };
@@ -369,7 +388,9 @@ fn run_once(
         }
     };
     let sequence = if scene == SceneKind::Console {
-        read_sequence(&view).ok().map(|raw| delta_ui::format_sequence(&raw))
+        read_sequence(&mut session, &view)
+            .ok()
+            .map(|raw| delta_ui::format_sequence(&raw))
     } else {
         None
     };
@@ -386,9 +407,9 @@ fn run_once(
     }
 
     match scene {
-        SceneKind::Morse => run_morse(&snapshot, &view, tx),
-        SceneKind::Fingerprint => run_fingerprint(&snapshot, &view, tx),
-        SceneKind::Console => run_console(&snapshot, &view, monitor, tx),
+        SceneKind::Morse => run_morse(&snapshot, &view, &mut session, tx),
+        SceneKind::Fingerprint => run_fingerprint(&snapshot, &view, &mut session, tx),
+        SceneKind::Console => run_console(&snapshot, &view, &mut session, monitor, tx),
         SceneKind::Unknown => {
             let _ = tx.send(UiEvent::Rejected("检查游戏".to_owned()));
         }
@@ -405,25 +426,16 @@ fn map_scene(scene: delta_scene::Scene) -> SceneKind {
     }
 }
 
-/// 读操作台 LED 目标序列（只读，不发输入）。
-fn read_sequence(view: &PxView) -> Result<String, String> {
-    let mut capturer = Capturer::new(view.monitor.w, view.monitor.h).map_err(|e| e.to_string())?;
-    let frame = capturer
+/// 读操作台 LED 目标序列（只读，不发输入）；走任务会话，因此计入配额。
+fn read_sequence(session: &mut CaptureSession, view: &PxView) -> Result<String, String> {
+    let frame = session
         .grab(view.console.led_region)
         .map_err(|error| error.to_string())?;
     delta_vision::read_glyph_string(&frame.luma()).map_err(|error| error.to_string())
 }
 
 /// 摩斯流程（薄适配：`LiveScreen` / `LiveInput` 由 flow crate 提供）。
-fn run_morse(config: &Config, view: &PxView, tx: &mpsc::Sender<UiEvent>) {
-    let mut capturer = match Capturer::new(view.monitor.w, view.monitor.h) {
-        Ok(capturer) => capturer,
-        Err(error) => {
-            let _ = tx.send(UiEvent::Failed(error.to_string()));
-            return;
-        }
-    };
-    let mut screen = delta_flow_morse::LiveScreen::new(&mut capturer);
+fn run_morse(config: &Config, view: &PxView, session: &mut CaptureSession, tx: &mpsc::Sender<UiEvent>) {
     let mut input = delta_flow_morse::LiveInput;
     let job = delta_flow_morse::MorseRun {
         view,
@@ -431,7 +443,14 @@ fn run_morse(config: &Config, view: &PxView, tx: &mpsc::Sender<UiEvent>) {
         // 上游 morse_auto_click 的等价物：控制输入完成后是否自动点确认。
         auto_click: config.auto_confirm,
     };
-    let outcome = delta_flow_morse::run(&mut screen, &mut input, &job);
+    // 适配层只借用会话：跑完即释放借用，才能读 `frames_taken` 判配额。
+    let outcome = {
+        let mut screen = delta_flow_morse::LiveScreen::new(session);
+        delta_flow_morse::run(&mut screen, &mut input, &job)
+    };
+    if over_budget(session, tx, view.monitor) {
+        return;
+    }
     let total = outcome.cells.len();
     let _ = tx.send(UiEvent::Progress {
         done: outcome.cells.iter().filter(|cell| cell.digit.is_some()).count(),
@@ -446,7 +465,12 @@ fn run_morse(config: &Config, view: &PxView, tx: &mpsc::Sender<UiEvent>) {
 }
 
 /// 指纹流程（模板库按 exe 目录解析；OCR 兜底按配置开关）。
-fn run_fingerprint(config: &Config, view: &PxView, tx: &mpsc::Sender<UiEvent>) {
+fn run_fingerprint(
+    config: &Config,
+    view: &PxView,
+    session: &mut CaptureSession,
+    tx: &mpsc::Sender<UiEvent>,
+) {
     let images = crate::images_dir();
     let library = match delta_templates::RoleLibrary::load_from_dir(&images) {
         Ok(library) => library,
@@ -455,14 +479,6 @@ fn run_fingerprint(config: &Config, view: &PxView, tx: &mpsc::Sender<UiEvent>) {
             return;
         }
     };
-    let mut capturer = match Capturer::new(view.monitor.w, view.monitor.h) {
-        Ok(capturer) => capturer,
-        Err(error) => {
-            let _ = tx.send(UiEvent::Failed(error.to_string()));
-            return;
-        }
-    };
-    let mut screen = delta_flow_fingerprint::LiveScreen::new(&mut capturer);
     let mut input = delta_flow_fingerprint::LiveInput;
     let mut reader = if config.ocr_enabled {
         delta_ocr::OcrEngine::new(delta_ocr::DEFAULT_LANGUAGE)
@@ -480,12 +496,19 @@ fn run_fingerprint(config: &Config, view: &PxView, tx: &mpsc::Sender<UiEvent>) {
         ocr_enabled: config.ocr_enabled,
         evidence_dir: crate::evidence_dir(),
     };
-    match delta_flow_fingerprint::run(
-        &mut screen,
-        &mut input,
-        reader.as_mut().map(|reader| reader as &mut dyn delta_flow_fingerprint::TextReader),
-        &job,
-    ) {
+    let outcome = {
+        let mut screen = delta_flow_fingerprint::LiveScreen::new(session);
+        delta_flow_fingerprint::run(
+            &mut screen,
+            &mut input,
+            reader.as_mut().map(|reader| reader as &mut dyn delta_flow_fingerprint::TextReader),
+            &job,
+        )
+    };
+    if over_budget(session, tx, view.monitor) {
+        return;
+    }
+    match outcome {
         Ok(outcome) => {
             let _ = tx.send(UiEvent::Progress {
                 done: outcome.clicks.len(),
@@ -504,30 +527,25 @@ fn run_fingerprint(config: &Config, view: &PxView, tx: &mpsc::Sender<UiEvent>) {
     }
 }
 
-/// 操作台流程（`flow-console` 自带 `SystemScreen` / `SystemPointer` / `SystemClock`）。
+/// 操作台流程（`flow-console` 自带 `SystemPointer` / `SystemClock`；截图走任务会话）。
 fn run_console(
     config: &Config,
     view: &PxView,
+    session: &mut CaptureSession,
     monitor: MonitorInfo,
     tx: &mpsc::Sender<UiEvent>,
 ) {
-    let mut screen = match delta_flow_console::SystemScreen::new(monitor.w, monitor.h) {
-        Ok(screen) => screen,
-        Err(reason) => {
-            let _ = tx.send(UiEvent::Failed(reason));
-            return;
-        }
-    };
     let mut pointer = delta_flow_console::SystemPointer::new();
     let mut clock = delta_flow_console::SystemClock::new();
     let params = delta_flow_console::ConsoleParams::default().with_timings(&config.timings);
-    match delta_flow_console::run(
-        &mut screen,
-        &mut pointer,
-        &mut clock,
-        &view.console,
-        &params,
-    ) {
+    let outcome = {
+        let mut screen = delta_flow_console::SystemScreen::new(session);
+        delta_flow_console::run(&mut screen, &mut pointer, &mut clock, &view.console, &params)
+    };
+    if over_budget(session, tx, monitor) {
+        return;
+    }
+    match outcome {
         Ok(outcome) => {
             if outcome.is_done() {
                 let _ = tx.send(UiEvent::Progress {
@@ -541,24 +559,45 @@ fn run_console(
                     .abort_reason()
                     .map_or_else(|| "已取消".to_owned(), |reason| reason.to_string());
                 // 操作台处于 BETA：失败必留证（截图 + 文本日志），供用户自测定位。
-                save_console_evidence(&reason, monitor, outcome.events());
+                save_failure_evidence(
+                    &reason,
+                    monitor,
+                    &format!("已发输入事件: {}", outcome.events()),
+                );
                 let _ = tx.send(UiEvent::Failed(reason));
             }
         }
         Err(error) => {
             let reason = error.to_string();
-            save_console_evidence(&reason, monitor, 0);
+            save_failure_evidence(&reason, monitor, "已发输入事件: 0");
             let _ = tx.send(UiEvent::Failed(reason));
         }
     }
 }
 
-/// 操作台失败留证：全屏截图 + 文本日志，落到 `logs/`。
+/// 配额用尽（spec D4）：转成固定文案 + 留证，且**只报一次**。
+///
+/// 返回 `true` 表示本次任务已经按「超限」收尾，调用方必须立即返回。
+fn over_budget(session: &CaptureSession, tx: &mpsc::Sender<UiEvent>, monitor: MonitorInfo) -> bool {
+    if session.frames_taken() < FRAME_BUDGET {
+        return false;
+    }
+    let detail = format!(
+        "已抓帧数: {}（上限 {FRAME_BUDGET}）",
+        session.frames_taken()
+    );
+    save_failure_evidence("截图次数超限", monitor, &detail);
+    let _ = tx.send(UiEvent::Failed("截图次数超限".to_owned()));
+    true
+}
+
+/// 任务失败留证：全屏截图 + 文本日志，落到 `logs/`。
 ///
 /// 操作台是 BETA 功能，用户自测时靠这两份证据定位：截屏能看出当时卡在哪一列、
-/// 目标序列读成了什么、面板有没有消失；日志记录时间、原因、分辨率与已发事件数。
-/// 任何一步失败都只打 stderr，**不允许把主流程带崩**。
-fn save_console_evidence(reason: &str, monitor: MonitorInfo, events: u64) {
+/// 目标序列读成了什么、面板有没有消失；日志记录时间、原因、分辨率与 `detail`
+/// （操作台是已发事件数，配额超限是已抓帧数）。任何一步失败都只打 stderr，
+/// **不允许把主流程带崩**。
+fn save_failure_evidence(reason: &str, monitor: MonitorInfo, detail: &str) {
     let dir = std::path::Path::new("logs");
     if let Err(error) = std::fs::create_dir_all(dir) {
         eprintln!("[console] 日志目录创建失败：{error}");
@@ -571,13 +610,7 @@ fn save_console_evidence(reason: &str, monitor: MonitorInfo, events: u64) {
     let base = dir.join(format!("console_fail_{stamp}"));
 
     if let Ok(mut capturer) = Capturer::new(monitor.w, monitor.h) {
-        let full = PxRect {
-            x: 0,
-            y: 0,
-            w: monitor.w,
-            h: monitor.h,
-        };
-        match capturer.grab(full) {
+        match capturer.grab(full_rect(monitor)) {
             Ok(frame) => {
                 if let Err(error) = write_frame_png(&base.with_extension("png"), &frame) {
                     eprintln!("[console] 失败截图保存失败：{error}");
@@ -588,7 +621,7 @@ fn save_console_evidence(reason: &str, monitor: MonitorInfo, events: u64) {
     }
 
     let text = format!(
-        "时间(unix): {stamp}\n原因: {reason}\n分辨率: {}x{}\n已发输入事件: {events}\n",
+        "时间(unix): {stamp}\n原因: {reason}\n分辨率: {}x{}\n{detail}\n",
         monitor.w, monitor.h
     );
     if let Err(error) = std::fs::write(base.with_extension("txt"), text) {
@@ -649,14 +682,6 @@ mod tests {
         let config = Config::default();
         assert!(!config.validate().is_empty());
         assert!(config.try_px_view().is_err());
-    }
-
-    #[test]
-    fn only_the_startup_reader_falls_back_to_f8() {
-        // spec D3：启动读配置是唯一允许回落的地方，其他调用点一律 Err。
-        assert_eq!(startup_hotkey("sb250"), Hotkey::default());
-        assert_eq!(startup_hotkey("F9"), Hotkey::plain(0x78));
-        assert_eq!(startup_hotkey("Ctrl+Shift+A"), Hotkey::new(0x41, 0x2 | 0x4));
     }
 
     #[test]

@@ -15,6 +15,7 @@ use thiserror::Error;
 
 mod store;
 
+pub use delta_capture::CaptureBackend;
 pub use store::{load, save, Loaded, CONFIG_FILE_NAME};
 
 /// 摩斯数字区数量（spec §2.1 `core/morse.py:24-55`：三块点划区）。
@@ -84,6 +85,9 @@ pub struct Config {
     ///
     /// `false` → 只产出标注图、不点击，用于核对识别结果（上游手动模式）。
     pub fingerprint_auto_click: bool,
+    /// 截图后端（spec D1：默认 WGC；未知值读入回落 WGC 并 `eprintln` 留痕）。
+    #[serde(default, with = "capture_backend_serde")]
+    pub capture_backend: CaptureBackend,
     /// 当前实际屏幕分辨率（**不持久化**）。
     ///
     /// 百分比才是唯一持久真相：换算像素必须按「当前屏幕」，而不是「上次校准时的屏幕」，
@@ -107,6 +111,7 @@ impl Default for Config {
             ocr_enabled: true,
             auto_confirm: true,
             fingerprint_auto_click: true,
+            capture_backend: CaptureBackend::Wgc,
             runtime_monitor: MonitorInfo::default(),
         }
     }
@@ -603,6 +608,46 @@ fn is_calibrated_axis(value: Option<f32>) -> bool {
     value.is_some_and(|v| v.is_finite() && v > UNCALIBRATED_PCT && v <= 1.0)
 }
 
+/// `CaptureBackend` 的 serde 桥接：配置里只出现稳定 token（`wgc` / `bitblt`）。
+///
+/// 枚举定义在 `delta-capture`（那边不依赖本 crate），因此这里用 `with` 提供读写，
+/// 而不是把枚举复制一份 —— 单一来源，UI 与流程拿到的永远是同一个类型。
+mod capture_backend_serde {
+    use delta_capture::CaptureBackend;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::parse_backend_token;
+
+    pub fn serialize<S: Serializer>(
+        backend: &CaptureBackend,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(backend.token())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<CaptureBackend, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(parse_backend_token(&raw))
+    }
+}
+
+/// 配置里的后端字符串 → 枚举。
+///
+/// 显式边界（spec D1）：**未知值回落 `Wgc` 并留痕**，绝不 panic、也不把整份配置读废 ——
+/// 一份写错后端名的配置不该让用户的校准坐标一起丢掉。
+fn parse_backend_token(raw: &str) -> CaptureBackend {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "wgc" => CaptureBackend::Wgc,
+        "bitblt" => CaptureBackend::BitBlt,
+        _ => {
+            eprintln!("[config] 未知截图后端 {raw:?}，回落 wgc");
+            CaptureBackend::Wgc
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,5 +826,42 @@ mod tests {
         assert_eq!(config.hotkeys.morse, "F9");
         assert_eq!(config.hotkeys.fingerprint, "F10");
         assert_eq!(config.hotkeys.console, "F11");
+    }
+
+    #[test]
+    fn capture_backend_defaults_to_wgc_and_round_trips() {
+        let config = Config::default();
+        assert_eq!(config.capture_backend, CaptureBackend::Wgc, "spec D1：默认 WGC");
+
+        let json = serde_json::to_string(&config).expect("序列化");
+        assert!(json.contains("\"capture_backend\":\"wgc\""), "{json}");
+        let parsed: Config = serde_json::from_str(&json).expect("反序列化");
+        assert_eq!(parsed.capture_backend, CaptureBackend::Wgc);
+
+        let bitblt: Config =
+            serde_json::from_str(r#"{"capture_backend":"bitblt"}"#).expect("兼容档必须可读");
+        assert_eq!(bitblt.capture_backend, CaptureBackend::BitBlt);
+        assert!(serde_json::to_string(&bitblt)
+            .expect("序列化")
+            .contains("\"capture_backend\":\"bitblt\""));
+    }
+
+    #[test]
+    fn unknown_capture_backend_falls_back_to_wgc_instead_of_losing_the_config() {
+        // 写错后端名不该让用户的校准坐标一起丢掉（spec D1 显式边界）。
+        let config: Config =
+            serde_json::from_str(r#"{"capture_backend":"dwm","ocr_enabled":false}"#)
+                .expect("未知后端不得让整份配置读不出来");
+        assert_eq!(config.capture_backend, CaptureBackend::Wgc);
+        assert!(!config.ocr_enabled, "同份配置的其它字段必须照常生效");
+
+        // 大小写不敏感（与 `token()` 的规范写法等价）。
+        let config: Config =
+            serde_json::from_str(r#"{"capture_backend":" BitBlt "}"#).expect("大小写不敏感");
+        assert_eq!(config.capture_backend, CaptureBackend::BitBlt);
+
+        // 缺字段（老配置）同样回落 WGC。
+        let config: Config = serde_json::from_str("{}").expect("空配置合法");
+        assert_eq!(config.capture_backend, CaptureBackend::Wgc);
     }
 }

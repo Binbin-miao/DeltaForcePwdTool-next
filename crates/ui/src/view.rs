@@ -6,7 +6,10 @@
 use delta_geom::PctRect;
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
-use crate::state::{read_capture, Action, CaptureOutcome, KeyChord, Phase, UiState};
+use crate::state::{
+    read_capture, Action, CaptureBackend, CaptureOutcome, CaptureTestResult, KeyChord, Phase,
+    UiState,
+};
 use crate::theme;
 use crate::wizard::{Step, Verdict, Wizard, WizardScene};
 
@@ -868,7 +871,143 @@ fn dashed_pct_rect(painter: &egui::Painter, stage: Rect, rect: PctRect, color: C
 }
 
 
-/// 设置浮层素材（v1 只暴露三项：热键、OCR 兜底、配置路径）。
+/// 截图后端的两个选项（spec D1：只两档，默认 WGC；顺序即下拉顺序）。
+const CAPTURE_BACKENDS: [CaptureBackend; 2] = [CaptureBackend::Wgc, CaptureBackend::BitBlt];
+/// 带副标题的设置行高度（标题 + 灰色小字说明，spec D6）。
+const SETTINGS_ROW_H: f32 = 40.0;
+/// 测试结果区高度（缩略图 + 一行「宽×高 · 耗时ms」）。
+const CAPTURE_RESULT_H: f32 = 90.0;
+/// 缩略图上限（spec D5 建议 ≤160×90；这里让出一行文字位，取 160×64）。
+const CAPTURE_THUMB_MAX: [f32; 2] = [160.0, 64.0];
+/// 右侧值槽宽度（要放下 `Windows Graphics Capture ▾`）。
+const BACKEND_VALUE_W: f32 = 168.0;
+/// 下拉面板宽度（要放下「兼容模式 · 可能截不到独占全屏」）。
+const BACKEND_MENU_W: f32 = 220.0;
+/// 行内小按钮宽度（`抓一帧`）。
+const ROW_BUTTON_W: f32 = 72.0;
+
+/// 下拉里每一项的文案。
+///
+/// 兼容档必须自曝风险（spec D1 显式边界：UI 上标注「可能截不到独占全屏」），
+/// 因此它不叫「BitBlt」而叫「兼容模式」。
+fn backend_label(backend: CaptureBackend) -> &'static str {
+    match backend {
+        CaptureBackend::Wgc => "Windows Graphics Capture",
+        CaptureBackend::BitBlt => "兼容模式 · 可能截不到独占全屏",
+    }
+}
+
+/// 设置面板的行骨架（坐标相对窗口，已扣除面板外边距）。
+///
+/// 高度预算（默认窗口 400×420 → 内容区 376×404）：
+/// 标题 32 + 热键 28 + 8 + 兜底 28 + 8 + 截图方式 40 + 8 + 测试截图 40 + 8 + 结果区 90。
+/// 结果区与配置路径**互斥**（spec D6 允许测试结果临时替换配置文件路径区域），
+/// 因此最小窗口 340×360 下两者也不会同时出现、更不会挤压底部按钮。
+#[derive(Debug, Clone, Copy)]
+struct SettingsRows {
+    hotkey: Rect,
+    ocr: Rect,
+    backend: Rect,
+    test: Rect,
+    /// 结果区（缩略图 / 失败原因）。
+    result: Rect,
+    /// 配置路径区；有测试结果时为 `None`（与结果区二选一）。
+    config: Option<Rect>,
+    footer: Rect,
+}
+
+fn settings_rows(content: Rect, has_result: bool) -> SettingsRows {
+    let row = |top: f32, height: f32| {
+        Rect::from_min_size(Pos2::new(content.left(), top), Vec2::new(content.width(), height))
+    };
+    let top = content.top();
+    let hotkey = row(top + theme::SPACE_XXL, theme::TOGGLE_H);
+    let ocr = row(hotkey.bottom() + theme::SPACE_S, theme::TOGGLE_H);
+    let backend = row(ocr.bottom() + theme::SPACE_S, SETTINGS_ROW_H);
+    let test = row(backend.bottom() + theme::SPACE_S, SETTINGS_ROW_H);
+    let extra_top = test.bottom() + theme::SPACE_S;
+    SettingsRows {
+        hotkey,
+        ocr,
+        backend,
+        test,
+        result: row(extra_top, CAPTURE_RESULT_H),
+        config: (!has_result).then(|| row(extra_top, SETTINGS_ROW_H)),
+        footer: Rect::from_min_size(
+            Pos2::new(content.left(), content.bottom() - theme::PRIMARY_H),
+            Vec2::new(content.width(), theme::PRIMARY_H),
+        ),
+    }
+}
+
+/// 行内右侧控件槽：固定高度、右对齐，与左侧标题一个水平带。
+fn row_slot(rect: Rect, width: f32) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            rect.right() - theme::SPACE_M - width,
+            rect.center().y - theme::TOGGLE_H / 2.0,
+        ),
+        Vec2::new(width, theme::TOGGLE_H),
+    )
+}
+
+/// 一行设置：左侧标题 + 下方灰色小字说明 + 行底 1px 分隔（spec D6 的行式结构）。
+fn paint_settings_row(painter: &egui::Painter, rect: Rect, title: &str, hint: &str, dim: bool) {
+    let title_color = if dim { theme::TEXT_3 } else { theme::TEXT_1 };
+    painter.text(
+        Pos2::new(rect.left() + theme::SPACE_M, rect.top() + theme::SPACE_XS),
+        Align2::LEFT_TOP,
+        title,
+        theme::text(theme::FONT_BODY),
+        title_color,
+    );
+    painter.text(
+        Pos2::new(
+            rect.left() + theme::SPACE_M,
+            rect.top() + theme::SPACE_XS + theme::FONT_TITLE,
+        ),
+        Align2::LEFT_TOP,
+        hint,
+        theme::text(theme::FONT_LABEL),
+        theme::TEXT_3,
+    );
+    painter.line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        Stroke::new(1.0, theme::LINE_SUBTLE),
+    );
+}
+
+/// 行内小按钮：`enabled == false` 时置灰且不响应点击（运行中禁止切换 / 抓帧）。
+fn row_button(ui: &egui::Ui, rect: Rect, label: &str, enabled: bool) -> bool {
+    if enabled {
+        return secondary_button(ui, rect, label);
+    }
+    let painter = ui.painter();
+    painter.rect_filled(rect, theme::RADIUS_BUTTON, theme::BG_PANEL);
+    painter.rect_stroke(
+        rect,
+        theme::RADIUS_BUTTON,
+        Stroke::new(1.0, theme::LINE_SUBTLE),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        theme::text(theme::FONT_LABEL),
+        theme::TEXT_3,
+    );
+    false
+}
+
+/// 按源图长宽比把图塞进给定框内（居中，不拉伸）。
+fn fit_inside(area: Rect, width: u32, height: u32) -> Rect {
+    let source = Vec2::new(width.max(1) as f32, height.max(1) as f32);
+    let scale = (area.width() / source.x).min(area.height() / source.y);
+    Rect::from_center_size(area.center(), source * scale)
+}
+
+/// 设置浮层素材（热键 / 文字兜底 / 截图方式 / 测试截图 / 配置路径）。
 pub struct SettingsView<'a> {
     pub hotkey: &'a str,
     /// 是否正在捕获新热键（捕获态只显示提示，没有任何文本输入框）。
@@ -877,6 +1016,14 @@ pub struct SettingsView<'a> {
     pub hotkey_conflict: Option<&'a str>,
     pub ocr_enabled: bool,
     pub config_path: &'a str,
+    /// 当前截图后端（spec D1）。
+    pub capture_backend: CaptureBackend,
+    /// 运行中 → 截图方式与测试截图都置灰（spec D1 显式边界）。
+    pub capture_locked: bool,
+    /// 最近一次测试截图的结果（spec D5：缩略图 + 宽×高 · 耗时）。
+    pub capture_test: Option<&'a CaptureTestResult>,
+    /// 最近一次测试截图的失败原因（与结果互斥，失败显示红色文案）。
+    pub capture_test_error: Option<&'a str>,
 }
 
 /// 设置浮层动作。
@@ -891,6 +1038,10 @@ pub enum SettingsAction {
     CommitHotkey(KeyChord),
     /// 捕获态下 Esc / 点热键行外 → 只退出捕获，不关面板（D4）。
     CancelHotkey,
+    /// 切换截图后端（写配置 + 下一次抓帧立即生效，spec D1）。
+    SetCaptureBackend(CaptureBackend),
+    /// 点「抓一帧」：调用方在后台线程建临时会话抓一帧（spec D5）。
+    TestCapture,
     Close,
 }
 
@@ -936,14 +1087,13 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
         theme::TEXT_1,
     );
 
-    // 热键（点一下即可编辑，回车生效）
-    let hotkey_row = Rect::from_min_size(
-        Pos2::new(content.left(), content.top() + theme::SPACE_XXL),
-        Vec2::new(content.width(), theme::TOGGLE_H),
-    );
-    paint_panel(&painter, hotkey_row);
+    let has_result = view.capture_test.is_some() || view.capture_test_error.is_some();
+    let rows = settings_rows(content, has_result);
+
+    // ── 全局热键（点一下即可捕获，捕获态没有任何文本输入框）──────────
+    paint_panel(&painter, rows.hotkey);
     painter.text(
-        hotkey_row.left_center() + Vec2::new(theme::SPACE_M, 0.0),
+        rows.hotkey.left_center() + Vec2::new(theme::SPACE_M, 0.0),
         Align2::LEFT_CENTER,
         "全局热键",
         theme::text(theme::FONT_BODY),
@@ -951,19 +1101,19 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
     );
     // 捕获结算先于既有控件：这一帧的按键/取消不会被按钮点击覆盖掉。
     if action.is_none() {
-        action = resolve_capture(ui, view.hotkey_editing, hotkey_row);
+        action = resolve_capture(ui, view.hotkey_editing, rows.hotkey);
     }
     if view.hotkey_editing {
         // 捕获态：只提示按键，绝不提供文本输入（spec D3 删自由输入）。
         painter.text(
-            hotkey_row.left_center() + Vec2::new(content.width() * 0.45, 0.0),
+            rows.hotkey.left_center() + Vec2::new(content.width() * 0.45, 0.0),
             Align2::LEFT_CENTER,
             "请按下新热键…",
             theme::text(theme::FONT_BODY),
             theme::ACCENT,
         );
         painter.text(
-            hotkey_row.right_center() - Vec2::new(theme::SPACE_M, 0.0),
+            rows.hotkey.right_center() - Vec2::new(theme::SPACE_M, 0.0),
             Align2::RIGHT_CENTER,
             "Esc 取消",
             theme::text(theme::FONT_LABEL),
@@ -971,15 +1121,15 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
         );
     } else {
         let response = ui.interact(
-            hotkey_row,
+            rows.hotkey,
             ui.scope_id().with("hotkey-row"),
             egui::Sense::click(),
         );
-        // 冲突态：右侧这一格换成红色冲突文案（文案里已含「仍为 F8」，旧键信息不丢），
-        // 行内本来就只有一个右槽位，改文案不新增元素、不挤压下方开关行。
+        // 冲突态：右侧这一格换成红色冲突文案（文案里已含「仍为 F8」，旧键信息不丢）。
+        // 字号用 `FONT_LABEL`：最小宽度 340 下长组合键不会压到左侧「全局热键」。
         let conflict = view.hotkey_conflict;
         let (label, font, color) = match (conflict, response.hovered()) {
-            (Some(text), _) => (text.to_owned(), theme::text(theme::FONT_BODY), theme::ERR),
+            (Some(text), _) => (text.to_owned(), theme::text(theme::FONT_LABEL), theme::ERR),
             (None, true) => (
                 format!("{} · 点这里改", view.hotkey),
                 theme::mono(theme::FONT_BODY),
@@ -992,7 +1142,7 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
             ),
         };
         painter.text(
-            hotkey_row.right_center() - Vec2::new(theme::SPACE_M, 0.0),
+            rows.hotkey.right_center() - Vec2::new(theme::SPACE_M, 0.0),
             Align2::RIGHT_CENTER,
             label,
             font,
@@ -1003,36 +1153,136 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
         }
     }
 
-    // OCR 兜底开关
-    let ocr_row = Rect::from_min_size(
-        Pos2::new(content.left(), hotkey_row.bottom() + theme::SPACE_S),
-        Vec2::new(content.width(), theme::TOGGLE_H),
-    );
-    if toggle_row(ui, ocr_row, "文字兜底", view.ocr_enabled, &painter) {
+    // ── 文字兜底开关 ──────────────────────────────────────────
+    if toggle_row(ui, rows.ocr, "文字兜底", view.ocr_enabled, &painter) {
         action = Some(SettingsAction::ToggleOcr);
     }
 
-    // 配置路径（只读提示）
-    painter.text(
-        Pos2::new(content.left(), ocr_row.bottom() + theme::SPACE_M),
-        Align2::LEFT_TOP,
-        "配置文件",
-        theme::text(theme::FONT_LABEL),
-        theme::TEXT_3,
+    // ── 截图方式（spec D1 / D6：点开自绘下拉，不引入 ComboBox 的浅色默认外观）──
+    let locked = view.capture_locked;
+    paint_settings_row(
+        &painter,
+        rows.backend,
+        "截图方式",
+        if locked {
+            "识别中不可切换"
+        } else {
+            "切换后下一次抓帧立即生效"
+        },
+        locked,
     );
-    painter.text(
-        Pos2::new(content.left(), ocr_row.bottom() + theme::SPACE_XL),
-        Align2::LEFT_TOP,
-        view.config_path,
-        theme::mono(theme::FONT_LABEL),
-        theme::TEXT_3,
+    let value_slot = row_slot(rows.backend, BACKEND_VALUE_W);
+    let menu_id = ui.make_persistent_id("capture-backend-menu");
+    let mut menu_open =
+        !locked && ui.ctx().data(|data| data.get_temp::<bool>(menu_id).unwrap_or(false));
+    let value_text = format!(
+        "{}  {}",
+        backend_label(view.capture_backend),
+        if menu_open { '▴' } else { '▾' }
     );
+    let value_clicked = if locked {
+        painter.text(
+            value_slot.right_center(),
+            Align2::RIGHT_CENTER,
+            value_text,
+            theme::text(theme::FONT_BODY),
+            theme::TEXT_3,
+        );
+        false
+    } else {
+        let response = clickable(ui, value_slot, "capture-backend-value", Sense::click());
+        painter.text(
+            value_slot.right_center(),
+            Align2::RIGHT_CENTER,
+            value_text,
+            theme::text(theme::FONT_BODY),
+            if response.hovered() {
+                theme::ACCENT
+            } else {
+                theme::TEXT_1
+            },
+        );
+        response.clicked()
+    };
+    if value_clicked {
+        menu_open = !menu_open;
+    }
 
-    // 底部：检查游戏 / 返回
-    let footer = Rect::from_min_size(
-        Pos2::new(content.left(), content.bottom() - theme::PRIMARY_H),
-        Vec2::new(content.width(), theme::PRIMARY_H),
+    // ── 测试截图（spec D5：只在点击时抓一帧，不点不抓）──────────────
+    paint_settings_row(
+        &painter,
+        rows.test,
+        "测试截图",
+        "抓一帧验证当前后端能出图",
+        locked,
     );
+    let test_button = row_slot(rows.test, ROW_BUTTON_W);
+    if row_button(ui, test_button, "抓一帧", !locked) {
+        action = Some(SettingsAction::TestCapture);
+    }
+
+    // ── 结果区：缩略图 + `宽×高 · 耗时ms`，或红色失败原因 ────────────
+    if let Some(result) = view.capture_test {
+        let thumb = fit_inside(
+            Rect::from_center_size(
+                Pos2::new(rows.result.center().x, rows.result.center().y - theme::SPACE_S),
+                Vec2::new(CAPTURE_THUMB_MAX[0], CAPTURE_THUMB_MAX[1]),
+            ),
+            result.width,
+            result.height,
+        );
+        painter.image(
+            result.thumbnail.id(),
+            thumb,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        painter.rect_stroke(
+            thumb,
+            theme::RADIUS_BUTTON,
+            Stroke::new(1.0, theme::LINE_SUBTLE),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            Pos2::new(rows.result.center().x, rows.result.bottom() - theme::SPACE_XS),
+            Align2::CENTER_BOTTOM,
+            result.summary(),
+            theme::mono(theme::FONT_LABEL),
+            theme::TEXT_2,
+        );
+    } else if let Some(reason) = view.capture_test_error {
+        // 错误码在被截断时最容易被丢掉，所以交给 egui 自动换行，绝不手写单行文本。
+        let mut error_ui = ui.new_child(egui::UiBuilder::new().max_rect(rows.result));
+        error_ui.add(
+            egui::Label::new(
+                egui::RichText::new(reason)
+                    .size(theme::FONT_LABEL)
+                    .color(theme::ERR),
+            )
+            .wrap(),
+        );
+    }
+
+    // ── 配置路径（有测试结果时让位，spec D6 允许的替换）──────────────
+    if let Some(config) = rows.config {
+        painter.text(
+            config.left_top(),
+            Align2::LEFT_TOP,
+            "配置文件",
+            theme::text(theme::FONT_LABEL),
+            theme::TEXT_3,
+        );
+        painter.text(
+            Pos2::new(config.left(), config.top() + theme::SPACE_L),
+            Align2::LEFT_TOP,
+            view.config_path,
+            theme::mono(theme::FONT_LABEL),
+            theme::TEXT_3,
+        );
+    }
+
+    // ── 底部：检查游戏 / 返回 ─────────────────────────────────
+    let footer = rows.footer;
     let probe = Rect::from_min_size(footer.min, Vec2::new(footer.width() * 0.48, footer.height()));
     if secondary_button(ui, probe, "检查游戏") {
         action = Some(SettingsAction::Probe);
@@ -1044,6 +1294,59 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
     if primary_button(ui, back, "返回", true, Phase::Idle) {
         action = Some(SettingsAction::Close);
     }
+
+    // ── 下拉最后画：压在其它行之上，点击优先级也高于下面的按钮 ──────────
+    let mut option_clicked = false;
+    if menu_open {
+        let item_height = theme::TOGGLE_H;
+        let menu = Rect::from_min_size(
+            Pos2::new(
+                value_slot.right() - BACKEND_MENU_W,
+                rows.backend.bottom() - theme::SPACE_XS,
+            ),
+            Vec2::new(
+                BACKEND_MENU_W,
+                item_height * CAPTURE_BACKENDS.len() as f32 + theme::SPACE_S,
+            ),
+        );
+        paint_panel(&painter, menu);
+        for (index, backend) in CAPTURE_BACKENDS.into_iter().enumerate() {
+            let item = Rect::from_min_size(
+                Pos2::new(
+                    menu.left() + 1.0,
+                    menu.top() + theme::SPACE_XS / 2.0 + item_height * index as f32,
+                ),
+                Vec2::new(menu.width() - 2.0, item_height),
+            );
+            let key = format!("capture-backend-option-{index}");
+            let response = clickable(ui, item, &key, Sense::click());
+            let selected = backend == view.capture_backend;
+            let color = match (selected, response.hovered()) {
+                (true, _) => theme::ACCENT,
+                (false, true) => theme::TEXT_1,
+                (false, false) => theme::TEXT_2,
+            };
+            painter.text(
+                item.left_center() + Vec2::new(theme::SPACE_S, 0.0),
+                Align2::LEFT_CENTER,
+                backend_label(backend),
+                theme::text(theme::FONT_LABEL),
+                color,
+            );
+            if response.clicked() {
+                option_clicked = true;
+                menu_open = false;
+                if !selected {
+                    action = Some(SettingsAction::SetCaptureBackend(backend));
+                }
+            }
+        }
+    }
+    if menu_open && !value_clicked && !option_clicked && ui.input(|input| input.pointer.any_click())
+    {
+        menu_open = false;
+    }
+    ui.ctx().data_mut(|data| data.insert_temp(menu_id, menu_open));
     action
 }
 
@@ -1093,6 +1396,10 @@ mod tests {
                         hotkey_conflict,
                         ocr_enabled: true,
                         config_path: "C:/cfg.toml",
+                        capture_backend: CaptureBackend::Wgc,
+                        capture_locked: false,
+                        capture_test: None,
+                        capture_test_error: None,
                     },
                 );
             });
@@ -1101,6 +1408,69 @@ mod tests {
         .textures_delta
         .clear();
         action
+    }
+
+    /// 在 400×420 画布上跑三帧并在 `pos` 完成一次点击。
+    ///
+    /// 三帧是 egui 的点击语义决定的：第一帧登记控件矩形，第二帧按下、第三帧松开才成点击。
+    /// 用无内边距的 `Frame::NONE`：行骨架按 `ui.max_rect()` 计算，画面区必须与
+    /// `settings_rows` 的入参完全一致，测试的计算位置才和真实点击位置对齐。
+    fn click_action(pos: Pos2, capture_locked: bool) -> Option<SettingsAction> {
+        let ctx = egui::Context::default();
+        let full = Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(theme::WINDOW_SIZE[0], theme::WINDOW_SIZE[1]),
+        );
+        let press = |pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut action = None;
+        let frame = |events: Vec<egui::Event>, action: &mut Option<SettingsAction>| {
+            let input = egui::RawInput {
+                screen_rect: Some(full),
+                events,
+                ..egui::RawInput::default()
+            };
+            ctx.run_ui(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let produced = settings_panel(
+                            ui,
+                            SettingsView {
+                                hotkey: "F8",
+                                hotkey_editing: false,
+                                hotkey_conflict: None,
+                                ocr_enabled: true,
+                                config_path: "C:/cfg.toml",
+                                capture_backend: CaptureBackend::Wgc,
+                                capture_locked,
+                                capture_test: None,
+                                capture_test_error: None,
+                            },
+                        );
+                        if produced.is_some() {
+                            *action = produced;
+                        }
+                    });
+            })
+            .textures_delta
+            .clear();
+        };
+        frame(Vec::new(), &mut action);
+        frame(vec![egui::Event::PointerMoved(pos), press(true)], &mut action);
+        frame(vec![press(false)], &mut action);
+        action
+    }
+
+    /// 面板行骨架（与 `settings_panel` 同一个函数算出来，测试位置才可信）。
+    fn rows_for(size: [f32; 2], has_result: bool) -> SettingsRows {
+        let full = Rect::from_min_size(Pos2::ZERO, Vec2::new(size[0], size[1]));
+        let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
+        settings_rows(content, has_result)
     }
 
     fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
@@ -1140,7 +1510,10 @@ mod tests {
             None,
         );
         match action {
-            Some(SettingsAction::CommitHotkey(chord)) => assert_eq!(chord.label(), "F9"),
+            Some(SettingsAction::CommitHotkey(chord)) => {
+                assert_eq!(chord.main_name(), "F9");
+                assert_eq!(chord.modifiers(), 0);
+            }
             other => panic!("按 F9 必须提交 F9，实际 {other:?}"),
         }
 
@@ -1197,6 +1570,92 @@ mod tests {
             text_room >= 9.0 * theme::FONT_BODY,
             "文案位被按钮侵占：只剩 {text_room}px"
         );
+    }
+
+    #[test]
+    fn settings_rows_fit_the_window_with_and_without_a_test_result() {
+        for size in [theme::WINDOW_SIZE, theme::WINDOW_MIN] {
+            for has_result in [false, true] {
+                let full = Rect::from_min_size(Pos2::ZERO, Vec2::new(size[0], size[1]));
+                let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
+                let rows = rows_for(size, has_result);
+                for (name, rect) in [
+                    ("热键", rows.hotkey),
+                    ("兜底", rows.ocr),
+                    ("截图方式", rows.backend),
+                    ("测试截图", rows.test),
+                    ("结果区", rows.result),
+                    ("底部按钮", rows.footer),
+                ] {
+                    assert!(
+                        content.contains_rect(rect),
+                        "{size:?} 下「{name}」溢出内容区：{rect:?}"
+                    );
+                }
+                assert!(
+                    !rows.result.intersects(rows.footer),
+                    "{size:?} 下结果区挤压底部按钮"
+                );
+                // 结果区与配置路径互斥：两者不能同时消失，也绝不能重叠。
+                assert_eq!(rows.config.is_some(), !has_result);
+                if let Some(config) = rows.config {
+                    assert!(content.contains_rect(config), "{size:?} 下配置路径溢出");
+                    assert!(
+                        !config.intersects(rows.footer),
+                        "{size:?} 下配置路径挤压底部按钮"
+                    );
+                }
+                // 两行新控件（截图方式 / 测试截图）必须放得下标题 + 副标题。
+                for rect in [rows.backend, rows.test] {
+                    assert!(rect.height() >= theme::FONT_TITLE + theme::FONT_BODY + theme::SPACE_XS);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_the_test_row_asks_for_one_capture() {
+        let rows = rows_for(theme::WINDOW_SIZE, false);
+        let button = row_slot(rows.test, ROW_BUTTON_W);
+        assert_eq!(
+            click_action(button.center(), false),
+            Some(SettingsAction::TestCapture),
+            "点「抓一帧」必须只发一个抓帧请求"
+        );
+    }
+
+    #[test]
+    fn capture_rows_are_dead_while_a_task_runs() {
+        // 运行中（D1）：截图方式与测试截图都不可点 —— 点击不该产生任何动作。
+        let rows = rows_for(theme::WINDOW_SIZE, false);
+        let button = row_slot(rows.test, ROW_BUTTON_W);
+        assert_eq!(click_action(button.center(), true), None, "运行中禁止抓帧");
+        let value = row_slot(rows.backend, BACKEND_VALUE_W);
+        assert_eq!(click_action(value.center(), true), None, "运行中禁止切换后端");
+    }
+
+    #[test]
+    fn backend_labels_cover_both_options_and_flag_the_compat_risk() {
+        for backend in CAPTURE_BACKENDS {
+            assert!(!backend_label(backend).is_empty());
+        }
+        assert_eq!(CAPTURE_BACKENDS, [CaptureBackend::Wgc, CaptureBackend::BitBlt]);
+        // 兼容档必须在 UI 上自曝「可能截不到独占全屏」（spec D1 显式边界）。
+        assert!(backend_label(CaptureBackend::BitBlt).contains("截不到独占全屏"));
+        assert_eq!(
+            CAPTURE_BACKENDS.len(),
+            2,
+            "只有两档；新增档位必须同时补文案与配置解析"
+        );
+    }
+
+    #[test]
+    fn thumbnail_fits_inside_its_box_without_stretching() {
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(CAPTURE_THUMB_MAX[0], CAPTURE_THUMB_MAX[1]));
+        let fitted = fit_inside(area, 1920, 1080);
+        assert!(area.contains_rect(fitted), "缩略图不得越出结果区");
+        let ratio = fitted.width() / fitted.height();
+        assert!((ratio - 16.0 / 9.0).abs() < 0.05, "长宽比被拉伸：{ratio}");
     }
 
     #[test]
