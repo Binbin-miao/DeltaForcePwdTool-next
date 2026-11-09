@@ -41,7 +41,6 @@ pub struct DeltaApp {
     existing: Vec<(String, delta_geom::PctRect)>,
     save_finished_at: Option<Instant>,
     phase_started: Instant,
-    keep_topmost: bool,
     /// 正在飞的「测试截图」后台任务（`None` = 空闲）。
     capture_probe: Option<Receiver<Result<CaptureProbe, String>>>,
 }
@@ -72,7 +71,6 @@ impl DeltaApp {
             existing: Vec::new(),
             save_finished_at: None,
             phase_started: Instant::now(),
-            keep_topmost: true,
             capture_probe: None,
         }
     }
@@ -292,11 +290,27 @@ impl DeltaApp {
             }
             Action::ToggleFlow(scene) => self.state.toggles.toggle(scene),
             Action::DismissNotice => self.state.dismiss_notice(),
+            Action::ToggleAlwaysOnTop => self.toggle_always_on_top(),
         }
-        if self.keep_topmost {
-            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                egui::WindowLevel::AlwaysOnTop,
-            ));
+    }
+
+    /// 切换窗口置顶（标题条图钉）。
+    ///
+    /// 顺序刻意是「先真正改窗口，再写配置」：`SetWindowPos` 失败就什么都不写，
+    /// 配置里永远不会留下一个没生效的置顶状态 —— 与热键改键同一条纪律。
+    fn toggle_always_on_top(&mut self) {
+        let wanted = !self.state.always_on_top;
+        if let Err(reason) = platform::apply_always_on_top(wanted) {
+            // 显形但不改状态机：窗口级失败不该把界面切成「未识别」。
+            eprintln!("[window] 图钉未生效：{reason}");
+            return;
+        }
+        if let Ok(mut config) = self.config.lock() {
+            config.always_on_top = wanted;
+        }
+        self.state.always_on_top = wanted;
+        if let Err(reason) = self.persist() {
+            eprintln!("[window] 置顶已生效但落盘失败：{reason}");
         }
     }
 
@@ -428,6 +442,10 @@ impl DeltaApp {
     }
 
     /// 补录模板：把 9 个候选格截下来，按 `images/<角色名>/<序号>.png` 入库（spec 风险缓解）。
+    ///
+    /// **九格共用一个会话**：`CaptureSession::new` 在 Wgc 档要建一次 D3D11 设备
+    /// （30~50ms + 帧池重建），逐格新建等于把这笔代价付九遍（实测累计 300~450ms 卡顿）。
+    /// 抓取内容与顺序与逐格版本完全一致：同一个 `candidate_boxes` 顺序、同样逐格 `luma()`。
     fn save_template_cells(&self) {
         let Some(wizard) = self.wizard.as_ref() else {
             return;
@@ -439,17 +457,16 @@ impl DeltaApp {
         let config = self.snapshot();
         let dir = crate::images_dir().join(role);
         let _ = std::fs::create_dir_all(&dir);
-        for (index, rect) in config.fingerprint.candidate_boxes.iter().enumerate() {
-            let Ok(pixels) = rect.to_px(self.monitor) else {
-                continue;
-            };
-            if pixels.w <= 0 || pixels.h <= 0 {
-                continue;
-            }
-            // 九格各抓一次（UI 线程、各自独立会话；不占任务配额）。
-            let Ok(frame) = grab_once(pixels, config.capture_backend) else {
-                continue;
-            };
+        let Ok(mut session) = delta_capture::CaptureSession::new(config.capture_backend) else {
+            eprintln!("[templates] 补录会话创建失败，本次不补录");
+            return;
+        };
+        let cells = capture_cells(&config.fingerprint.candidate_boxes, self.monitor, |rect| {
+            session.grab(rect).map_err(|error| error.to_string())
+        });
+        // 九格抓完统一释放：设备与 20 张配额一次性还清。
+        drop(session);
+        for (index, frame) in cells {
             let gray = frame.luma();
             let Ok(file) = std::fs::File::create(dir.join(format!("{}.png", index + 1))) else {
                 continue;
@@ -642,6 +659,31 @@ impl eframe::App for DeltaApp {
     }
 }
 
+/// 按百分比矩形逐格抓图，返回 `(候选格序号, 帧)`（顺序与入参一致，单格失败只跳过该格）。
+///
+/// `grab` 由调用方提供**同一个会话**的抓帧闭包 —— 「九格只初始化一次后端」就落在这里。
+/// 抽成独立函数是为了能在测试里换掉 `grab`，把「一次会话 + 逐格顺序不变」钉死。
+fn capture_cells(
+    rects: &[delta_geom::PctRect],
+    monitor: MonitorInfo,
+    mut grab: impl FnMut(PxRect) -> Result<delta_capture::Frame, String>,
+) -> Vec<(usize, delta_capture::Frame)> {
+    let mut cells = Vec::new();
+    for (index, rect) in rects.iter().enumerate() {
+        let Ok(pixels) = rect.to_px(monitor) else {
+            continue;
+        };
+        if pixels.w <= 0 || pixels.h <= 0 {
+            continue;
+        }
+        let Ok(frame) = grab(pixels) else {
+            continue;
+        };
+        cells.push((index, frame));
+    }
+    cells
+}
+
 /// 一次性抓帧：独立临时会话（**不占任务配额**），抓一帧后立即 `drop`（spec D3 / D5）。
 fn capture_probe_once(
     backend: CaptureBackend,
@@ -692,6 +734,7 @@ fn initial_state(config: &Config, monitor: MonitorInfo) -> UiState {
         // 显示**真实生效**的键：老配置里残留的 `sb250` 会被规范化成 F8（复审 S2-1）。
         hotkey: platform::format_hotkey(&platform::startup_hotkey(&config.hotkeys.scene)),
         capture_backend: config.capture_backend,
+        always_on_top: config.always_on_top,
         missing: config.validate().iter().map(ToString::to_string).collect(),
         ..UiState::default()
     };
@@ -841,6 +884,63 @@ mod tests {
         let compat = capture_probe_once(CaptureBackend::BitBlt, monitor)
             .expect("BitBlt 兼容档必须能抓一帧");
         assert_eq!((compat.width, compat.height), (monitor.w as u32, monitor.h as u32));
+    }
+
+    #[test]
+    fn template_cells_keep_candidate_order_and_skip_empty_boxes() {
+        let monitor = monitor(2560, 1440);
+        // 第 5 格清空（未校准的候选格）→ 必须被跳过，但不许打乱其余各格的身份。
+        let mut boxes = delta_config::builtin::candidate_boxes();
+        boxes[4] = delta_geom::PctRect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        };
+        let mut asked = Vec::new();
+        let cells = capture_cells(&boxes, monitor, |rect| {
+            asked.push(rect);
+            Ok(delta_capture::Frame::new(
+                rect.w as u32,
+                rect.h as u32,
+                vec![0; (rect.w * rect.h * 4) as usize],
+                Instant::now(),
+            )
+            .expect("测试帧长度正确"))
+        });
+        assert_eq!(
+            cells.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 5, 6, 7, 8],
+            "补录顺序必须是候选格顺序，空掉的格子只跳过不顶位"
+        );
+        // 第一格是 2K 基准下内置坐标的实测像素值（独立已知量，不由被测代码推导）。
+        assert_eq!(asked[0], PxRect { x: 1522, y: 560, w: 105, h: 105 });
+        assert_eq!(asked.len(), cells.len(), "每次成功抓取都必须对应一格");
+    }
+
+    #[test]
+    fn template_cells_share_one_capture_session() {
+        // 真机会话：九格如果各建一次会话，`frames_taken()` 只会是 1；
+        // 一个会话抓满九格才等于九 —— 这就是「只初始化一次 D3D11」的可观测证据。
+        let Ok(monitor) = delta_capture::monitor_info() else {
+            return;
+        };
+        let boxes = delta_config::builtin::candidate_boxes();
+        let Ok(mut session) = delta_capture::CaptureSession::new(CaptureBackend::BitBlt) else {
+            return;
+        };
+        let cells = capture_cells(&boxes, monitor, |rect| {
+            session.grab(rect).map_err(|error| error.to_string())
+        });
+        assert_eq!(cells.len(), delta_config::CANDIDATE_BOX_COUNT);
+        assert_eq!(
+            session.frames_taken(),
+            delta_config::CANDIDATE_BOX_COUNT as u32,
+            "九格必须来自同一个会话"
+        );
+        for (_, frame) in &cells {
+            assert_eq!(frame.luma().as_slice().len(), (frame.w * frame.h) as usize);
+        }
     }
 
     #[test]

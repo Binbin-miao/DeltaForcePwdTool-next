@@ -101,6 +101,19 @@ fn main_layout(ui: &egui::Ui, full: Rect, state: &mut UiState, time: f64) -> Opt
         theme::text(theme::FONT_TITLE),
         theme::TEXT_1,
     );
+    // 图钉（置顶开关）排在 `△` 左边：实心 ■ = 已钉住，空心 □ = 未钉住，
+    // 两种状态一眼可分。三个按钮的矩形互不相交，`△`/`×` 的点击区域不被覆盖。
+    let pin = Rect::from_min_size(
+        Pos2::new(
+            title.right() - theme::SPACE_XXL - theme::SPACE_L * 2.0 - theme::SPACE_XS,
+            title.top() + theme::SPACE_XS,
+        ),
+        Vec2::new(theme::SPACE_L, theme::SPACE_L),
+    );
+    let pin_glyph = if state.always_on_top { "■" } else { "□" };
+    if icon_button(ui, pin, "pin", pin_glyph) {
+        action = Some(Action::ToggleAlwaysOnTop);
+    }
     let collapse = Rect::from_min_size(
         Pos2::new(title.right() - theme::SPACE_XXL - theme::SPACE_L, title.top() + theme::SPACE_XS),
         Vec2::new(theme::SPACE_L, theme::SPACE_L),

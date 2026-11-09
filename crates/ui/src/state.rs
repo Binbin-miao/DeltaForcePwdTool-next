@@ -312,6 +312,8 @@ pub enum Action {
     Collapse,
     Expand,
     Quit,
+    /// 标题条图钉：切换窗口置顶（默认关）。
+    ToggleAlwaysOnTop,
     OpenCalibration,
     OpenSettings,
     AcceptDisclaimer,
@@ -430,6 +432,8 @@ pub struct UiState {
     pub capture_test: Option<CaptureTestResult>,
     /// 最近一次「测试截图」的失败原因（与 `capture_test` 互斥）。
     pub capture_test_error: Option<String>,
+    /// 窗口是否已钉在顶层（标题条图钉的当前状态；默认不置顶）。
+    pub always_on_top: bool,
 }
 
 /// 三个功能入口开关。
@@ -496,6 +500,7 @@ impl Default for UiState {
             capture_backend: CaptureBackend::Wgc,
             capture_test: None,
             capture_test_error: None,
+            always_on_top: false,
         }
     }
 }

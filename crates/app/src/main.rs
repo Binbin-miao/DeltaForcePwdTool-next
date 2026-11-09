@@ -48,7 +48,12 @@ fn main() -> eframe::Result {
     // 分辨率变了只提示不阻断：`DeltaApp::new` 会把它变成界面上的一次性警示条
     // （release 版 `windows_subsystem = "windows"` 丢弃 stderr，提醒必须走 UI）。
 
-    // ── 4. 窗口：无边框、不透明、置顶、可缩放 ───────────────────────
+    // ── 4. 窗口：无边框、不透明、可缩放；置顶按配置（默认不置顶，能被游戏盖住）──
+    let window_level = if config.always_on_top {
+        egui::WindowLevel::AlwaysOnTop
+    } else {
+        egui::WindowLevel::Normal
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(delta_ui::APP_TITLE)
@@ -56,7 +61,7 @@ fn main() -> eframe::Result {
             .with_min_inner_size(delta_ui::theme::WINDOW_MIN)
             .with_decorations(false)
             .with_transparent(false)
-            .with_window_level(egui::WindowLevel::AlwaysOnTop)
+            .with_window_level(window_level)
             .with_resizable(true),
         ..Default::default()
     };

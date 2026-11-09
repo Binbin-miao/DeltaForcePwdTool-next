@@ -11,8 +11,9 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{GetLastError, BOOL, ERROR_ALREADY_EXISTS, HWND, LPARAM};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    SetForegroundWindow, ShowWindow, SW_RESTORE,
+    EnumWindows, FindWindowW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    SetForegroundWindow, SetWindowPos, ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE,
 };
 
 /// 单实例互斥量名（`Local\` 前缀 = 仅本会话，不跨用户）。
@@ -154,6 +155,47 @@ pub fn activate_existing_app(title: &str) -> bool {
         }
         std::thread::sleep(std::time::Duration::from_millis(80));
     }
+}
+
+/// 本程序主窗口句柄。
+///
+/// eframe 0.37 的 `egui::ViewportInfo` 不暴露原生句柄（拿它要再引入
+/// `raw-window-handle` 依赖，体积预算不允许），因此退回按标题精确定位。
+/// 注意不能用 [`find_window`]：那个函数按设计跳过本进程窗口（它服务于「激活已有实例」），
+/// 这里要找的恰恰是本进程自己的窗口，所以直接 `FindWindowW` 精确匹配标题。
+pub fn app_window() -> Option<HWND> {
+    let title = wide(delta_ui::APP_TITLE);
+    unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) }.ok()
+}
+
+/// `SetWindowPos` 的锚点：置顶 → `HWND_TOPMOST`，取消 → `HWND_NOTOPMOST`。
+fn topmost_anchor(always_on_top: bool) -> HWND {
+    if always_on_top {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    }
+}
+
+/// 立即改窗口置顶：不动位置、不改大小、不抢焦点（`SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE`）。
+///
+/// 与 `ViewportCommand::WindowLevel` 等价，但同步生效 —— 图钉点下去这一帧就能看到结果，
+/// 不必等 winit 的下一轮事件。
+pub fn apply_always_on_top(always_on_top: bool) -> Result<(), String> {
+    let window = app_window()
+        .ok_or_else(|| format!("找不到窗口「{}」，置顶未生效", delta_ui::APP_TITLE))?;
+    unsafe {
+        SetWindowPos(
+            window,
+            topmost_anchor(always_on_top),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    }
+    .map_err(|error| format!("置顶切换失败：{error}"))
 }
 
 /// 修饰键位（与 Win32 `MOD_ALT` / `MOD_CONTROL` / `MOD_SHIFT` 同值，注册时直接按位或）。
@@ -486,5 +528,13 @@ mod tests {
         let encoded = wide(INSTANCE_MUTEX);
         assert_eq!(encoded.last().copied(), Some(0));
         assert!(encoded.len() > 1);
+    }
+
+    #[test]
+    fn topmost_toggle_anchors_to_the_two_insert_after_handles() {
+        // 置顶与取消必须是两个**不同**的锚点：写反了图钉就变成「点一下还是置顶」。
+        assert_eq!(topmost_anchor(true), HWND_TOPMOST);
+        assert_eq!(topmost_anchor(false), HWND_NOTOPMOST);
+        assert_ne!(topmost_anchor(true), topmost_anchor(false));
     }
 }

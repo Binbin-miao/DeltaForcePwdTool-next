@@ -156,10 +156,7 @@ impl Worker {
                             let registered = platform::parse_hotkey(&wanted)
                                 .map_err(|_| ())
                                 .and_then(|hotkey| {
-                                    hotkeys
-                                        .register(hotkey)
-                                        .map(|id| (id, hotkey))
-                                        .map_err(|_| ())
+                                    hotkeys.register(hotkey).map(|id| (id, hotkey)).map_err(|_| ())
                                 });
                             match registered {
                                 Ok((id, hotkey)) => {
@@ -448,12 +445,7 @@ fn read_sequence(session: &mut CaptureSession, view: &PxView) -> Result<String, 
 }
 
 /// 摩斯流程（薄适配：`LiveScreen` / `LiveInput` 由 flow crate 提供）。
-fn run_morse(
-    config: &Config,
-    view: &PxView,
-    session: &mut CaptureSession,
-    tx: &mpsc::Sender<UiEvent>,
-) {
+fn run_morse(config: &Config, view: &PxView, session: &mut CaptureSession, tx: &mpsc::Sender<UiEvent>) {
     let mut input = delta_flow_morse::LiveInput;
     let job = delta_flow_morse::MorseRun {
         view,
@@ -471,19 +463,12 @@ fn run_morse(
     }
     let total = outcome.cells.len();
     let _ = tx.send(UiEvent::Progress {
-        done: outcome
-            .cells
-            .iter()
-            .filter(|cell| cell.digit.is_some())
-            .count(),
+        done: outcome.cells.iter().filter(|cell| cell.digit.is_some()).count(),
         total,
         note: "已输入数字".to_owned(),
     });
     if outcome.digits_complete() {
-        let _ = tx.send(UiEvent::Succeeded(format!(
-            "已输入数字 {}",
-            outcome.password
-        )));
+        let _ = tx.send(UiEvent::Succeeded(format!("已输入数字 {}", outcome.password)));
     } else {
         let _ = tx.send(UiEvent::Failed(format!("未识别 {}", outcome.password)));
     }
@@ -526,9 +511,7 @@ fn run_fingerprint(
         delta_flow_fingerprint::run(
             &mut screen,
             &mut input,
-            reader
-                .as_mut()
-                .map(|reader| reader as &mut dyn delta_flow_fingerprint::TextReader),
+            reader.as_mut().map(|reader| reader as &mut dyn delta_flow_fingerprint::TextReader),
             &job,
         )
     };
@@ -567,13 +550,7 @@ fn run_console(
     let params = delta_flow_console::ConsoleParams::default().with_timings(&config.timings);
     let outcome = {
         let mut screen = delta_flow_console::SystemScreen::new(session);
-        delta_flow_console::run(
-            &mut screen,
-            &mut pointer,
-            &mut clock,
-            &view.console,
-            &params,
-        )
+        delta_flow_console::run(&mut screen, &mut pointer, &mut clock, &view.console, &params)
     };
     if over_budget(session, tx, monitor, config.capture_backend) {
         return;
@@ -705,10 +682,7 @@ fn save_failure_evidence(
 }
 
 /// 把 BGRA 帧编码成 PNG（RGBA）。失败只回错误，不 panic。
-fn write_frame_png(
-    path: &std::path::Path,
-    frame: &Frame,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn write_frame_png(path: &std::path::Path, frame: &Frame) -> Result<(), Box<dyn std::error::Error>> {
     let file = std::fs::File::create(path)?;
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), frame.w, frame.h);
     encoder.set_color(png::ColorType::Rgba);

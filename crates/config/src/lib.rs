@@ -88,6 +88,11 @@ pub struct Config {
     /// 截图后端（spec D1：默认 WGC；未知值读入回落 WGC 并 `eprintln` 留痕）。
     #[serde(default, with = "capture_backend_serde")]
     pub capture_backend: CaptureBackend,
+    /// 窗口是否置顶（默认 **关**）。
+    ///
+    /// 用户实测「只能挂后台不能置顶」的反面：常驻置顶会挡住游戏画面，所以默认不置顶，
+    /// 需要时由标题条的图钉开关打开，并按开关状态立即落盘 —— 下次启动照旧生效。
+    pub always_on_top: bool,
     /// 当前实际屏幕分辨率（**不持久化**）。
     ///
     /// 百分比才是唯一持久真相：换算像素必须按「当前屏幕」，而不是「上次校准时的屏幕」，
@@ -112,6 +117,7 @@ impl Default for Config {
             auto_confirm: true,
             fingerprint_auto_click: true,
             capture_backend: CaptureBackend::Wgc,
+            always_on_top: false,
             runtime_monitor: MonitorInfo::default(),
         }
     }
@@ -844,6 +850,30 @@ mod tests {
         assert!(serde_json::to_string(&bitblt)
             .expect("序列化")
             .contains("\"capture_backend\":\"bitblt\""));
+    }
+
+    #[test]
+    fn always_on_top_defaults_to_off_and_round_trips() {
+        // 默认**不置顶**：窗口要被游戏盖住、挂在后台，需要时才由标题条图钉浮起来。
+        assert!(!Config::default().always_on_top, "默认必须不置顶");
+        let json = serde_json::to_string(&Config::default()).expect("序列化");
+        assert!(json.contains("\"always_on_top\":false"), "{json}");
+
+        // 老配置（没有这个字段）读进来也是不置顶，不会被默认值改成置顶。
+        let legacy: Config = serde_json::from_str(r#"{"ocr_enabled":true}"#).expect("老配置合法");
+        assert!(!legacy.always_on_top);
+
+        // 打开后必须原样回得来（开关状态要跨启动保持）。
+        let pinned: Config =
+            serde_json::from_str(r#"{"always_on_top":true}"#).expect("可读");
+        assert!(pinned.always_on_top);
+        let dumped = serde_json::to_string(&pinned).expect("序列化");
+        assert!(dumped.contains("\"always_on_top\":true"), "{dumped}");
+        assert!(
+            serde_json::from_str::<Config>(&dumped)
+                .expect("反序列化")
+                .always_on_top
+        );
     }
 
     #[test]
