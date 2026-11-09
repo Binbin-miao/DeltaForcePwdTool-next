@@ -13,13 +13,13 @@ pub trait ScreenSource {
     fn grab(&mut self, rect: PxRect) -> Result<Frame, String>;
 }
 
-/// 真机截图适配（复用 t2 的常驻 DC）。
+/// 真机截图适配（每次 `grab` 独立申请/释放后端资源，无常驻句柄）。
 pub struct LiveScreen<'a> {
     capturer: &'a mut Capturer,
 }
 
 impl<'a> LiveScreen<'a> {
-    /// 包装一个常驻捕获器。
+    /// 包装一个抓屏器。
     pub fn new(capturer: &'a mut Capturer) -> Self {
         Self { capturer }
     }

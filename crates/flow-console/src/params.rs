@@ -174,6 +174,9 @@ pub struct ConsoleParams {
     pub panel_gone_cyan_pct: f32,
     /// 旋钮块最少像素数（滤掉单像素噪点）。
     pub knob_min_pixels: u32,
+    /// 旋钮块最多像素数：超过这个量级说明帧里混进了斜纹浮层/黄框等大面积黄色元素，
+    /// 质心会被拉偏。上下限成对存在，缺了上限就无法判断「这块到底是不是一个旋钮」。
+    pub knob_max_pixels: u32,
     /// 旋钮质心与 `col_x/row_y` 的就近匹配最大偏差。
     pub grid_snap_max_px: i32,
     /// 斜纹浮层包围盒的最小宽/高（浮层约 250×70，见 spec §7.3）。
@@ -197,7 +200,7 @@ pub struct ConsoleParams {
     pub horizontal_step_px: i32,
     /// 横拖多少次列索引不变 → 判定「不支持横拖切列」。
     pub horizontal_attempts: u32,
-    /// 「等自动跳列」分支的轮询次数与间隔（spec §2.3：200ms / 最多 3 次）。
+    /// 「等自动跳列」分支的轮询次数与间隔（spec D7：500ms / 最多 2 次 —— 直接把截图压进配额）。
     pub auto_advance_polls: u32,
     pub auto_advance_poll_ms: u64,
     /// 停留时长与其递增（spec §2.3：默认 900ms，未见推进 +300ms，上限 2400ms）。
@@ -235,6 +238,7 @@ impl Default for ConsoleParams {
             overlay_hsv: HsvRange::at_least(20.0, 35.0, 120.0, 180.0),
             panel_gone_cyan_pct: 8.0,
             knob_min_pixels: 20,
+            knob_max_pixels: 2_000,
             grid_snap_max_px: 160,
             overlay_min_w: 80,
             overlay_min_h: 24,
@@ -248,8 +252,8 @@ impl Default for ConsoleParams {
             stall_limit: 3,
             horizontal_step_px: 12,
             horizontal_attempts: 3,
-            auto_advance_polls: 3,
-            auto_advance_poll_ms: 200,
+            auto_advance_polls: 2,
+            auto_advance_poll_ms: 500,
             dwell_ms: 900,
             dwell_step_ms: 300,
             dwell_max_ms: 2_400,

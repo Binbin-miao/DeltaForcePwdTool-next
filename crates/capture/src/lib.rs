@@ -1,12 +1,12 @@
-//! GDI 小区域高速截屏（spec §2.1 `core/capture.py:29`，§6 黑帧风险）。
+//! 截图后端（spec `docs/spec/spec-capture-backend.md`）：默认 WGC，BitBlt 为兼容档。
 //!
 //! 设计要点：
 //! - Per-Monitor V2 DPI 感知在**任何** `GetDC` 之前完成（见 [`ensure_dpi_awareness`]）；
-//! - 屏幕 DC / 内存 DC / DIB Section 位图**常驻复用**，同一区域重复抓取不再分配 GDI 对象；
-//! - 逐像素走 `BitBlt` + `GetDIBits`（32bpp top-down BGRA），单线程独占 DC；
-//! - 失败一律留证：Win32 错误码原样保留；全黑画面返回 [`CaptureError::BlackFrame`] 并附处理建议。
-//!
-//! Non-Goal（spec D11）：独占全屏专用捕获（WGC / Desktop Duplication）不属于 v1，本模块不实现。
+//! - **禁止常驻图形资源**：BitBlt 每次 `grab` 新建并释放 GDI 句柄，WGC 按任务建
+//!   [`CaptureSession`]、任务结束 `Drop` 释放；
+//! - 对外只暴露**同步单次** `grab(rect)`，不存在任何流式/回调/定时截图接口（spec D4）；
+//! - 单次识别任务截图硬上限 [`FRAME_BUDGET`] 张，超限返回 [`CaptureError::BudgetExceeded`]；
+//! - 失败一律留证：Win32 错误码与 WGC 的 HRESULT 都原样保留十六进制。
 
 use std::time::Instant;
 
@@ -17,10 +17,13 @@ use thiserror::Error;
 mod dpi;
 mod gdi;
 mod screen_source;
+mod session;
+mod wgc;
 
 pub use dpi::{ensure_dpi_awareness, DpiAwareness};
 pub use gdi::{primary_monitor_size, Capturer};
 pub use screen_source::{LiveScreen, ScreenSource};
+pub use session::{CaptureBackend, CaptureSession, FRAME_BUDGET};
 
 /// 黑帧判据：luma 低于该值视为「黑像素」（t2 任务 5）。
 pub const BLACK_LUMA_CUTOFF: u8 = 8;
@@ -44,6 +47,27 @@ pub enum CaptureError {
     NoScreenDc { code: u32 },
     #[error("捕获区域与显示器不一致")]
     Geom(#[from] GeomError),
+    #[error("本次识别任务的截图配额已用尽（上限 {limit} 张），拒绝继续抓屏")]
+    BudgetExceeded { limit: u32 },
+    #[error(
+        "WGC 初始化失败：{step} 返回 HRESULT 0x{code:08X}（本机可能没有可用的 D3D11 适配器）"
+    )]
+    WgcInit { step: &'static str, code: i32 },
+    #[error("WGC 抓帧失败：{step} 返回 HRESULT 0x{code:08X}")]
+    WgcGrab { step: &'static str, code: i32 },
+    #[error("WGC 连续 {attempts} 次没有取到新帧（共等待 {wait_ms}ms）")]
+    WgcNoFrame { attempts: u32, wait_ms: u64 },
+    #[error("WGC 后端不支持当前环境：{detail}")]
+    WgcUnsupported { detail: &'static str },
+    #[error("捕获区域 {x},{y} {w}x{h} 超出帧范围 {frame_w}x{frame_h}")]
+    RectOutOfBounds {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        frame_w: u32,
+        frame_h: u32,
+    },
     #[error("{w}x{h} 的 BGRA 缓冲需要 {expected} 字节，实际 {actual} 字节")]
     BufferSizeMismatch {
         w: u32,
@@ -131,7 +155,7 @@ impl Frame {
 
 /// 抓取区域并做黑帧检查的便捷入口（供上层流程直接使用）。
 ///
-/// 复用 [`Capturer`] 常驻资源，抓完即判定；黑帧返回错误而不是把全黑帧交给下游。
+/// 每次调用独立申请并释放后端资源；黑帧返回错误而不是把全黑帧交给下游。
 pub fn grab_checked(capturer: &mut Capturer, rect: PxRect) -> Result<Frame, CaptureError> {
     let frame = capturer.grab(rect)?;
     let black_pct = frame.black_ratio_pct();

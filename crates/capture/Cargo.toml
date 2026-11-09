@@ -8,5 +8,17 @@ publish = false
 [dependencies]
 delta-geom = { workspace = true }
 delta-vision = { workspace = true }
-windows = { workspace = true }
+# spec §2：WGC 后端所需的 windows features 全部加在已有依赖上，不新增第三方 crate。
+windows = { workspace = true, features = [
+  "Graphics_Capture",
+  "Graphics_DirectX_Direct3D11",
+  "Win32_System_WinRT_Graphics_Capture",
+  "Win32_System_WinRT_Direct3D11",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Dwm",
+] }
 thiserror = { workspace = true }

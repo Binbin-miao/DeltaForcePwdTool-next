@@ -181,6 +181,9 @@ enum Step {
     Abort(AbortReason),
 }
 
+/// 开环对齐的最大轮数（spec D7：拖完截一张验证，误差超容差才补下一轮，最多 3 轮）。
+const ALIGN_ROUNDS: u32 = 3;
+
 struct Session<'a> {
     screen: &'a mut dyn Screen,
     pointer: &'a mut dyn Pointer,
@@ -334,7 +337,7 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// `RowAlign`：纵向小步拖动，每步后重捕获黄块 Y。
+    /// `RowAlign`：开环纵拖（一次到位 → 一张验证 → 超容差才补轮）。
     fn step_row_align(&mut self) -> Step {
         let Some(target) = self.pending.first().copied() else {
             return Step::Next(ConsoleState::Verify);
@@ -381,7 +384,12 @@ impl<'a> Session<'a> {
         }
         let fix = self.fix_from(&observation);
         if let Some(fix) = fix {
-            self.knob = Some(fix);
+            // 斜纹浮层/亮黄边框与旋钮同属黄色域，会把旋钮质心的像素数撑大、坐标拉偏。
+            // 列进度照用（接受判据只看列索引），但**纵向几何基准只在可信帧上更新**：开环估拖距
+            // 完全依赖这个基准，一旦被污染就会算出离谱的拖距（闭环时代每步重观测掩盖了这点）。
+            if self.knob_trusted(&observation) {
+                self.knob = Some(fix);
+            }
             self.cursor = fix.column;
         }
         let Some(target) = self.pending.first().copied() else {
@@ -474,9 +482,11 @@ impl<'a> Session<'a> {
         result
     }
 
+    /// 开环纵拖：用已学到的增益一次算出整段位移 → 切子步全部注入（子步间**不截图**）→
+    /// 拖完截**一张**验证；误差超容差才补下一轮，最多 [`ALIGN_ROUNDS`] 轮（spec D7）。
     fn drive_row_pressed(&mut self, target_y: i32) -> AlignResult {
         let mut stalled = 0u32;
-        loop {
+        for _ in 0..ALIGN_ROUNDS {
             let Some(before) = self.knob else {
                 return AlignResult::Failed(AbortReason::NotDetected);
             };
@@ -484,21 +494,16 @@ impl<'a> Session<'a> {
             if remaining.abs() <= self.params.row_tolerance_px {
                 return AlignResult::Reached;
             }
-            if self.steps >= self.params.max_steps {
-                return AlignResult::Failed(AbortReason::StepOverflow);
+            let total = self.calibration.total_step(remaining, &self.params);
+            let (dy, count) = plan_steps(total, &self.params);
+            if let Err(reason) = self.inject_steps(0, dy, count) {
+                return AlignResult::Failed(reason);
             }
-            let dy = self.calibration.vertical_step(remaining, &self.params);
-            if dy == 0 {
-                return AlignResult::Failed(AbortReason::DragNoEffect);
-            }
-            if self.pointer.step(0, dy).is_err() {
-                return AlignResult::Failed(AbortReason::DragNoEffect);
-            }
-            self.steps = self.steps.saturating_add(1);
             match self.observe() {
                 Observe::Fixed(after) => {
+                    let injected = dy.saturating_mul(count as i32);
                     let moved = after.center.y - before.center.y;
-                    if self.calibration.observe(dy, moved, &self.params) {
+                    if self.calibration.observe(injected, moved, &self.params) {
                         stalled = 0;
                     } else {
                         stalled = stalled.saturating_add(1);
@@ -506,11 +511,33 @@ impl<'a> Session<'a> {
                             return AlignResult::Failed(AbortReason::DragNoEffect);
                         }
                     }
+                    if (target_y - after.center.y).abs() <= self.params.row_tolerance_px {
+                        return AlignResult::Reached;
+                    }
                 }
                 Observe::Gone => return AlignResult::Gone,
                 Observe::Lost => return AlignResult::Failed(AbortReason::NotDetected),
             }
         }
+        // 三轮仍未进容差：开环估算在这台机器上不可信 —— 报错让用户重入，绝不无限补步。
+        AlignResult::Failed(AbortReason::DragNoEffect)
+    }
+
+    /// 开环注入：把估算出的一段位移切成 `count` 个子步一次做完；**子步之间不截图**。
+    fn inject_steps(&mut self, dx: i32, dy: i32, count: u32) -> Result<(), AbortReason> {
+        if count == 0 {
+            return Ok(());
+        }
+        if self.steps.saturating_add(count) > self.params.max_steps {
+            return Err(AbortReason::StepOverflow);
+        }
+        for _ in 0..count {
+            if self.pointer.step(dx, dy).is_err() {
+                return Err(AbortReason::DragNoEffect);
+            }
+            self.steps = self.steps.saturating_add(1);
+        }
+        Ok(())
     }
 
     /// 横拖到目标列；列索引连续 `horizontal_attempts` 次不变 → 切「等自动跳列」。
@@ -533,19 +560,20 @@ impl<'a> Session<'a> {
         }
     }
 
+    /// 开环横拖：按「差几列就横拖几个步长」一次到位 → 截**一张**确认；最多 [`ALIGN_ROUNDS`] 轮。
     fn drag_to_column_pressed(&mut self, target: usize) -> AlignResult {
         let mut unchanged = 0u32;
-        loop {
-            if self.steps >= self.params.max_steps {
-                return AlignResult::Failed(AbortReason::StepOverflow);
-            }
+        for _ in 0..ALIGN_ROUNDS {
             let before = self.cursor;
+            if before == target {
+                return AlignResult::Reached;
+            }
             let towards = sign_of(target as i32 - before as i32);
             let dx = self.params.horizontal_step_px * self.calibration.horizontal_dir * towards;
-            if self.pointer.step(dx, 0).is_err() {
-                return AlignResult::Failed(AbortReason::DragNoEffect);
+            let count = (target as i32 - before as i32).unsigned_abs();
+            if let Err(reason) = self.inject_steps(dx, 0, count) {
+                return AlignResult::Failed(reason);
             }
-            self.steps = self.steps.saturating_add(1);
             let fix = match self.observe() {
                 Observe::Fixed(fix) => fix,
                 Observe::Gone => return AlignResult::Gone,
@@ -567,9 +595,11 @@ impl<'a> Session<'a> {
                 return AlignResult::Reached;
             }
         }
+        // 三轮没切到目标列：报错让上层放弃，不无限横拖。
+        AlignResult::Failed(AbortReason::DragNoEffect)
     }
 
-    /// 「等自动跳列」：不注入输入，只轮询列索引（spec §2.3：200ms × 最多 3 次）。
+    /// 「等自动跳列」：不注入输入，只轮询列索引（spec D7：500ms × 最多 2 次，即最多 2 张）。
     fn poll_auto_advance(&mut self, target: usize) -> Step {
         for _ in 0..self.params.auto_advance_polls {
             self.clock.sleep_ms(self.params.auto_advance_poll_ms);
@@ -625,6 +655,14 @@ impl<'a> Session<'a> {
             column,
             row,
         })
+    }
+
+    /// 这一帧的旋钮块是否可信：像素数落在 `[knob_min_pixels, knob_max_pixels]` 内才算一个旋钮。
+    fn knob_trusted(&self, observation: &PanelObservation) -> bool {
+        observation
+            .knob
+            .as_ref()
+            .is_some_and(|block| block.pixels <= self.params.knob_max_pixels)
     }
 
     fn read_sequence(&mut self) -> Result<TargetSequence, String> {
@@ -701,6 +739,22 @@ fn sign_of(value: i32) -> i32 {
     value.signum()
 }
 
+/// 开环估算：把一次总位移切成「每步大小 × 步数」，每步夹在 `[min_step_px, max_step_px]`。
+///
+/// 用均分而不是「前面塞满 `max_step`、末尾留零头」：零头会掉到 `min_step_px` 以下，
+/// 而低于下限的抖动会被游戏吞掉，导致「明明还差几像素却再也不动」。
+fn plan_steps(total: i32, params: &ConsoleParams) -> (i32, u32) {
+    let magnitude = total.unsigned_abs();
+    if magnitude == 0 {
+        return (0, 0);
+    }
+    let max_step = params.max_step_px.unsigned_abs().max(1);
+    let min_step = params.min_step_px.unsigned_abs().max(1);
+    let count = magnitude.div_ceil(max_step).max(1);
+    let per = magnitude.div_ceil(count).clamp(min_step, max_step);
+    (total.signum() * per as i32, count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,5 +774,22 @@ mod tests {
         assert_eq!(sign_of(-7), -1);
         assert_eq!(sign_of(0), 0);
         assert_eq!(sign_of(9), 1);
+    }
+
+    #[test]
+    fn plan_steps_keeps_every_sub_step_inside_the_configured_band() {
+        let params = ConsoleParams::default(); // min 4 / max 20
+        // 零位移：一个子步都不发。
+        assert_eq!(plan_steps(0, &params), (0, 0));
+        // 恰好整倍数：3 步 × 20px，一点不浪费。
+        assert_eq!(plan_steps(60, &params), (20, 3));
+        // 25px：均分成 2 × 13px（而不是 20 + 5 那种零头）。
+        assert_eq!(plan_steps(25, &params), (13, 2));
+        // 小于下限的位移抬到 min_step_px，宁可多走 1px 也不发无效抖动。
+        assert_eq!(plan_steps(3, &params), (4, 1));
+        // 负位移保留方向。
+        assert_eq!(plan_steps(-60, &params), (-20, 3));
+        // 长行程等价于「上限步长 × 步数」。
+        assert_eq!(plan_steps(1_000, &params), (20, 50));
     }
 }

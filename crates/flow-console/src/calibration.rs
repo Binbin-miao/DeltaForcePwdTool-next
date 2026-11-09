@@ -69,6 +69,28 @@ impl Calibration {
         true
     }
 
+    /// 走完 `remaining_px` 面板位移所需的**总**鼠标位移（含方向符号，不夹到单步带宽）。
+    ///
+    /// 与 [`Self::vertical_step`] 的分工：那个算「一步」（必须夹在带宽内供闭环小步收敛），
+    /// 这个算「一整个行程」的开环估算，由调用方再切成若干子步（spec D7）。
+    pub fn total_step(&self, remaining_px: i32, params: &ConsoleParams) -> i32 {
+        if remaining_px == 0 {
+            return 0;
+        }
+        let magnitude = match self.gain {
+            Some(gain) => (remaining_px.unsigned_abs() as f32 / gain).round() as i32,
+            // 还没自举出增益：只能按 spec §2.3 的固定试探位移走。
+            None => params.probe_px,
+        }
+        .max(1);
+        let direction = if remaining_px > 0 {
+            self.vertical_dir
+        } else {
+            -self.vertical_dir
+        };
+        direction * magnitude
+    }
+
     /// 由「剩余面板位移」反算鼠标位移：`|鼠标| = clamp(|剩余| / 增益, [min,max])`。
     pub fn vertical_step(&self, remaining_px: i32, params: &ConsoleParams) -> i32 {
         if remaining_px == 0 {
@@ -147,6 +169,24 @@ mod tests {
         let fresh = Calibration::new(&params);
         assert_eq!(fresh.vertical_step(1000, &params), params.probe_px);
         assert_eq!(fresh.vertical_step(0, &params), 0);
+    }
+
+    #[test]
+    fn total_step_covers_the_whole_distance_without_clamping() {
+        let params = ConsoleParams::default();
+        let mut calibration = Calibration::new(&params);
+        assert!(calibration.observe(20, 40, &params)); // 增益 2.0，同向
+        // 剩余 160px 面板 → 80px 鼠标（不被 max_step_px=20 夹断，这正是开环与单步的区别）。
+        assert_eq!(calibration.total_step(160, &params), 80);
+        // 反向需求 → 方向取负。
+        assert_eq!(calibration.total_step(-160, &params), -80);
+        assert_eq!(calibration.total_step(0, &params), 0);
+        // 增益失效到极小值时总量爆炸，但不会变成 0（由调用方的步数上限兜住）。
+        let mut weak = Calibration::new(&params);
+        assert!(weak.observe(20, 1, &params)); // 增益 0.05（下限）
+        assert_eq!(weak.total_step(160, &params), 3_200);
+        // 未自举 → 固定试探位移。
+        assert_eq!(Calibration::new(&params).total_step(160, &params), params.probe_px);
     }
 
     #[test]

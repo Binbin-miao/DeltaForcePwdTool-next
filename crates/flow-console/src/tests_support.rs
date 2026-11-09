@@ -277,10 +277,13 @@ pub struct FakeScreen {
     pub world: Rc<RefCell<World>>,
     pub time: Rc<Cell<u64>>,
     pub per_grab_ms: u64,
+    /// 全部 `grab` 调用次数（含 LED 区）——「截图配额」类断言的测量口径。
+    pub grabs: u64,
 }
 
 impl Screen for FakeScreen {
     fn grab(&mut self, rect: PxRect) -> Result<Frame, String> {
+        self.grabs = self.grabs.saturating_add(1);
         self.time
             .set(self.time.get().saturating_add(self.per_grab_ms));
         if rect == PANEL {
@@ -447,6 +450,7 @@ impl Harness {
                 world: Rc::clone(&world),
                 time: Rc::clone(&time),
                 per_grab_ms: 1,
+                grabs: 0,
             },
             pointer: FakePointer::new(Rc::clone(&world)),
             clock: FakeClock { time },

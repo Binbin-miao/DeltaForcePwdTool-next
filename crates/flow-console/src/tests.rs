@@ -192,6 +192,42 @@ fn aborted_flag_never_retries_itself() {
 }
 
 #[test]
+fn the_typical_path_stays_inside_the_capture_budget() {
+    // spec D4 量化目标：4 列 × 4 行、模拟世界一次到位 → 截图 ≤ 16 张。
+    let mut harness = Harness::new(World::new());
+    let (columns, _) = expect_done(harness.run());
+    assert_eq!(columns, 4);
+    let grabs = harness.screen.grabs;
+    assert!(
+        grabs <= 16,
+        "典型路径共抓了 {grabs} 张，超出 16 张预算（子步之间必须不截图）"
+    );
+}
+
+#[test]
+fn sub_steps_share_one_capture_instead_of_capturing_per_step() {
+    // 低增益世界：首列要 19 个子步才到位。闭环旧实现会每子步抓一张（19 张/列），
+    // 开环实现必须把这些子步压进同一轮、只用一张验证。
+    let mut world = World::new();
+    world.gain = 0.4;
+    let mut harness = Harness::new(world);
+
+    let (columns, _) = expect_done(harness.run());
+    assert_eq!(columns, 4);
+    let steps = harness.pointer.steps;
+    let grabs = harness.screen.grabs;
+    assert!(steps >= 40, "低增益下必须注入大量子步，实际 {steps}");
+    assert!(
+        grabs <= 16,
+        "{steps} 个子步只允许 {grabs} 张截图（≤16），说明存在每子步截图"
+    );
+    assert!(
+        u64::from(harness.params.max_steps) >= steps / 4,
+        "单列子步数不应超过 max_steps"
+    );
+}
+
+#[test]
 fn uncalibrated_view_returns_error_instead_of_capturing() {
     let mut harness = Harness::with_params(World::new(), ConsoleParams::default());
     harness.view.col_x.truncate(2);
@@ -207,3 +243,4 @@ fn uncalibrated_view_returns_error_instead_of_capturing() {
     assert_eq!(harness.pointer.event_count(), 0);
     assert_eq!(harness.world.borrow().panel_grabs, 0, "拒绝启动时一帧都不该抓");
 }
+
