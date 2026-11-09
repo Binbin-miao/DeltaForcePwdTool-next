@@ -181,27 +181,100 @@ pub fn parse_hotkey(name: &str) -> Hotkey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use delta_hotkey::vk;
 
     #[test]
-    fn parses_function_keys() {
-        assert_eq!(parse_hotkey("F8").vk, vk::F8);
-        assert_eq!(parse_hotkey("f8").vk, vk::F8);
-        assert_eq!(parse_hotkey(" F1 ").vk, 0x70);
-        assert_eq!(parse_hotkey("F24").vk, 0x87);
+    fn parses_single_keys() {
+        assert_eq!(parse_hotkey("F8"), Ok(Hotkey::plain(0x77)));
+        // 小写等价（D1）。
+        assert_eq!(parse_hotkey("f24"), Ok(Hotkey::plain(0x87)));
+        assert_eq!(parse_hotkey(" F1 "), Ok(Hotkey::plain(0x70)));
+        assert_eq!(parse_hotkey("a"), Ok(Hotkey::plain(0x41)));
+        assert_eq!(parse_hotkey("7"), Ok(Hotkey::plain(0x37)));
+        assert_eq!(parse_hotkey("Space"), Ok(Hotkey::plain(0x20)));
+        assert_eq!(parse_hotkey("PageUp"), Ok(Hotkey::plain(0x21)));
+        assert_eq!(parse_hotkey("ArrowLeft"), Ok(Hotkey::plain(0x25)));
     }
 
     #[test]
-    fn parses_letters_and_digits() {
-        assert_eq!(parse_hotkey("A").vk, u32::from(b'A'));
-        assert_eq!(parse_hotkey("7").vk, u32::from(b'7'));
+    fn parses_modifier_combinations() {
+        assert_eq!(parse_hotkey("Ctrl+F8"), Ok(Hotkey::new(0x77, MOD_CONTROL)));
+        assert_eq!(
+            parse_hotkey("Ctrl+Alt+Shift+A"),
+            Ok(Hotkey::new(0x41, MOD_CONTROL | MOD_ALT | MOD_SHIFT))
+        );
     }
 
     #[test]
-    fn unknown_names_fall_back_to_f8() {
-        assert_eq!(parse_hotkey("").vk, vk::F8);
-        assert_eq!(parse_hotkey("Hyper").vk, vk::F8);
-        assert_eq!(parse_hotkey("F99").vk, vk::F8);
+    fn modifier_order_is_normalised() {
+        // 顺序不敏感地进，只以一种写法的串出（D1 边界）。
+        assert_eq!(
+            parse_hotkey("Shift+Ctrl+A"),
+            parse_hotkey("Ctrl+Shift+A")
+        );
+        assert_eq!(
+            format_hotkey(&parse_hotkey("Shift+Ctrl+A").expect("合法组合")),
+            "Ctrl+Shift+A"
+        );
+    }
+
+    #[test]
+    fn unknown_names_are_errors_not_f8() {
+        // 假保存的源头：这里绝不允许再回落 F8。
+        assert_eq!(parse_hotkey("sb250"), Err(HotkeyParseError::UnknownKey));
+        assert_eq!(parse_hotkey("F99"), Err(HotkeyParseError::UnknownKey));
+        assert_eq!(parse_hotkey("Hyper"), Err(HotkeyParseError::UnknownKey));
+        assert_eq!(parse_hotkey("Win+A"), Err(HotkeyParseError::UnknownKey));
+        assert_eq!(
+            parse_hotkey("Ctrl+Hyper+A"),
+            Err(HotkeyParseError::UnknownKey)
+        );
+        assert_eq!(parse_hotkey(""), Err(HotkeyParseError::Empty));
+        assert_eq!(parse_hotkey("   "), Err(HotkeyParseError::Empty));
+        assert_eq!(parse_hotkey("Ctrl"), Err(HotkeyParseError::NoMainKey));
+        assert_eq!(parse_hotkey("Ctrl+Alt"), Err(HotkeyParseError::NoMainKey));
+        // 修饰键必须写在主键前面，写反了是非法写法而不是静默纠正。
+        assert_eq!(
+            parse_hotkey("F9+Ctrl"),
+            Err(HotkeyParseError::UnknownModifier)
+        );
+    }
+
+    #[test]
+    fn every_table_entry_round_trips() {
+        for (name, vk) in KEY_TABLE {
+            assert_eq!(parse_hotkey(name), Ok(Hotkey::plain(*vk)), "{name}");
+            let hotkey = Hotkey::new(*vk, MOD_CONTROL | MOD_SHIFT);
+            assert_eq!(format_hotkey(&hotkey), format!("Ctrl+Shift+{name}"));
+            assert_eq!(parse_hotkey(&format_hotkey(&hotkey)), Ok(hotkey));
+        }
+    }
+
+    #[test]
+    fn format_orders_modifiers_and_flags_unknown_keys() {
+        assert_eq!(
+            format_hotkey(&Hotkey::new(0x77, MOD_SHIFT | MOD_ALT | MOD_CONTROL)),
+            "Ctrl+Alt+Shift+F8"
+        );
+        assert_eq!(format_hotkey(&Hotkey::default()), "F8");
+        assert_eq!(
+            format_hotkey(&Hotkey::plain(0x6A)),
+            "0x6A",
+            "未知键必须显形，不得假装成某个已知键"
+        );
+    }
+
+    #[test]
+    fn capturable_vocabulary_matches_the_parser() {
+        // ui 侧负责 egui::Key → 短名，本文件负责短名 → 虚拟键码。
+        // 这条用例把两张表钉在一起：任何一张漂移都会红。
+        for (name, key) in delta_ui::state::CAPTURABLE {
+            let chord = delta_ui::state::KeyChord::capture(*key, egui::Modifiers::default())
+                .unwrap_or_else(|| panic!("{name} 必须可捕获"));
+            assert_eq!(chord.label(), name, "捕获结果必须用同一套短名");
+            let hotkey =
+                parse_hotkey(&chord.label()).unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(format_hotkey(&hotkey), chord.label(), "{name} 归一化必须唯一");
+        }
     }
 
     #[test]

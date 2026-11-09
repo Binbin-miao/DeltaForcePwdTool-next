@@ -121,6 +121,160 @@ pub const BREATH_PERIOD_SECS: f64 = 1.2;
 pub const BLINK_PERIOD_SECS: f64 = 0.5;
 /// 成功单次高亮时长（spec：200ms）。
 pub const SUCCESS_HIGHLIGHT_SECS: f64 = 0.2;
+/// 热键冲突提示自动消失时长（spec D2：2.5s）。
+pub const HOTKEY_CONFLICT_SECS: f64 = 2.5;
+
+/// 修饰键位（与 Win32 `MOD_ALT` / `MOD_CONTROL` / `MOD_SHIFT` 同值，注册时直接按位或）。
+pub const CHORD_MOD_ALT: u32 = 0x1;
+pub const CHORD_MOD_CONTROL: u32 = 0x2;
+pub const CHORD_MOD_SHIFT: u32 = 0x4;
+
+/// 可捕获的主键清单：`egui::Key` ↔ 配置里的规范短名。
+///
+/// **唯一词汇来源**：`delta-app::platform::parse_hotkey` 按同一套短名解析，
+/// 那边的 `capturable_vocabulary_matches_the_parser` 用例把两张表钉在一起，
+/// 任何一侧漂移都会立刻变红。新增可捕获键只需在这里加一行。
+pub const CAPTURABLE: [(&str, egui::Key); 71] = [
+    ("F1", egui::Key::F1),
+    ("F2", egui::Key::F2),
+    ("F3", egui::Key::F3),
+    ("F4", egui::Key::F4),
+    ("F5", egui::Key::F5),
+    ("F6", egui::Key::F6),
+    ("F7", egui::Key::F7),
+    ("F8", egui::Key::F8),
+    ("F9", egui::Key::F9),
+    ("F10", egui::Key::F10),
+    ("F11", egui::Key::F11),
+    ("F12", egui::Key::F12),
+    ("F13", egui::Key::F13),
+    ("F14", egui::Key::F14),
+    ("F15", egui::Key::F15),
+    ("F16", egui::Key::F16),
+    ("F17", egui::Key::F17),
+    ("F18", egui::Key::F18),
+    ("F19", egui::Key::F19),
+    ("F20", egui::Key::F20),
+    ("F21", egui::Key::F21),
+    ("F22", egui::Key::F22),
+    ("F23", egui::Key::F23),
+    ("F24", egui::Key::F24),
+    ("A", egui::Key::A),
+    ("B", egui::Key::B),
+    ("C", egui::Key::C),
+    ("D", egui::Key::D),
+    ("E", egui::Key::E),
+    ("F", egui::Key::F),
+    ("G", egui::Key::G),
+    ("H", egui::Key::H),
+    ("I", egui::Key::I),
+    ("J", egui::Key::J),
+    ("K", egui::Key::K),
+    ("L", egui::Key::L),
+    ("M", egui::Key::M),
+    ("N", egui::Key::N),
+    ("O", egui::Key::O),
+    ("P", egui::Key::P),
+    ("Q", egui::Key::Q),
+    ("R", egui::Key::R),
+    ("S", egui::Key::S),
+    ("T", egui::Key::T),
+    ("U", egui::Key::U),
+    ("V", egui::Key::V),
+    ("W", egui::Key::W),
+    ("X", egui::Key::X),
+    ("Y", egui::Key::Y),
+    ("Z", egui::Key::Z),
+    ("0", egui::Key::Num0),
+    ("1", egui::Key::Num1),
+    ("2", egui::Key::Num2),
+    ("3", egui::Key::Num3),
+    ("4", egui::Key::Num4),
+    ("5", egui::Key::Num5),
+    ("6", egui::Key::Num6),
+    ("7", egui::Key::Num7),
+    ("8", egui::Key::Num8),
+    ("9", egui::Key::Num9),
+    ("Space", egui::Key::Space),
+    ("Insert", egui::Key::Insert),
+    ("Delete", egui::Key::Delete),
+    ("Home", egui::Key::Home),
+    ("End", egui::Key::End),
+    ("PageUp", egui::Key::PageUp),
+    ("PageDown", egui::Key::PageDown),
+    ("ArrowUp", egui::Key::ArrowUp),
+    ("ArrowDown", egui::Key::ArrowDown),
+    ("ArrowLeft", egui::Key::ArrowLeft),
+    ("ArrowRight", egui::Key::ArrowRight),
+];
+
+/// 一次捕获到的快捷键：主键短名 + 修饰键位。
+///
+/// 固定大小且 `Copy`，可直接放进 `SettingsAction`。字段私有、只能经
+/// [`KeyChord::capture`] 构造 —— 因此不存在「不支持的键」这种半成品值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyChord {
+    name: &'static str,
+    modifiers: u32,
+}
+
+impl KeyChord {
+    /// 从一次按键事件捕获。
+    ///
+    /// 不支持的键返回 `None`，调用方必须保持捕获态继续等待（不提交、不取消）。
+    /// 纯修饰键不构成热键：egui 对 Ctrl/Alt/Shift 只发 `Event::ModifiersChanged`，
+    /// 不产生 `Event::Key`，所以这里天然拿不到只有修饰键的和弦。
+    pub fn capture(key: egui::Key, modifiers: egui::Modifiers) -> Option<Self> {
+        let (name, _) = CAPTURABLE.iter().find(|(_, candidate)| *candidate == key)?;
+        Some(Self {
+            name,
+            modifiers: modifier_bits(modifiers),
+        })
+    }
+
+    /// 主键短名（如 `F9`、`Space`）。
+    pub fn main_name(self) -> &'static str {
+        self.name
+    }
+
+    /// 修饰键位（`CHORD_MOD_*` 的按位或）。
+    pub fn modifiers(self) -> u32 {
+        self.modifiers
+    }
+
+    /// 规范串：固定 `Ctrl+Alt+Shift+主键` 顺序，保证同一组合只有一种写法（D1）。
+    pub fn label(self) -> String {
+        let mut text = String::new();
+        for (bit, label) in [
+            (CHORD_MOD_CONTROL, "Ctrl"),
+            (CHORD_MOD_ALT, "Alt"),
+            (CHORD_MOD_SHIFT, "Shift"),
+        ] {
+            if self.modifiers & bit != 0 {
+                text.push_str(label);
+                text.push('+');
+            }
+        }
+        text.push_str(self.name);
+        text
+    }
+}
+
+fn modifier_bits(modifiers: egui::Modifiers) -> u32 {
+    (if modifiers.ctrl { CHORD_MOD_CONTROL } else { 0 })
+        | (if modifiers.alt { CHORD_MOD_ALT } else { 0 })
+        | (if modifiers.shift { CHORD_MOD_SHIFT } else { 0 })
+}
+
+/// 冲突提示文案（D2 的两种失败）。
+///
+/// `kept = Some(旧键)` = 回滚成功，旧键仍可用；`None` = 连旧键都占不到。
+pub fn conflict_copy(kept: Option<&str>) -> String {
+    match kept {
+        Some(kept) => format!("热键冲突 · 仍为 {kept}"),
+        None => "热键不可用 · 用按钮".to_owned(),
+    }
+}
 
 /// 换分辨率警示文案（≤10 字、动词开头、零技术词）。
 ///
@@ -205,10 +359,12 @@ pub struct UiState {
     pub toggles: Toggles,
     /// 进入当前状态后经过的秒数（成功 200ms 高亮 / 呼吸相位都靠它）。
     pub phase_elapsed: f64,
-    /// 设置面板里是否正在编辑热键。
+    /// 设置面板里是否正在捕获新热键。
     pub hotkey_editing: bool,
-    /// 热键输入缓冲（编辑态专用；回车才写回配置）。
-    pub hotkey_buffer: String,
+    /// 热键冲突提示文案（`None` = 不显示）。
+    pub hotkey_conflict: Option<String>,
+    /// 冲突提示的自动消失时刻（秒，与 `egui` 的 `input.time` 同一时间源）。
+    pub hotkey_conflict_until: f64,
 }
 
 /// 三个功能入口开关。
@@ -270,7 +426,8 @@ impl Default for UiState {
             },
             phase_elapsed: 0.0,
             hotkey_editing: false,
-            hotkey_buffer: String::new(),
+            hotkey_conflict: None,
+            hotkey_conflict_until: 0.0,
         }
     }
 }
@@ -328,6 +485,27 @@ impl UiState {
     pub fn dismiss_notice(&mut self) {
         self.notice = None;
         self.notice_dismissed = true;
+    }
+
+    /// 装上热键冲突提示（D2：`2.5s` 后自动消失，也可点掉）。
+    ///
+    /// **不动 `self.hotkey`**：改键失败时界面必须仍显示旧键 —— 这正是「假保存」的反面。
+    pub fn show_hotkey_conflict(&mut self, text: String, now: f64) {
+        self.hotkey_conflict = Some(text);
+        self.hotkey_conflict_until = now + HOTKEY_CONFLICT_SECS;
+    }
+
+    /// 当前应显示的冲突提示；到期即清空。
+    pub fn hotkey_conflict_text(&mut self, now: f64) -> Option<&str> {
+        if self.hotkey_conflict.is_some() && now >= self.hotkey_conflict_until {
+            self.hotkey_conflict = None;
+        }
+        self.hotkey_conflict.as_deref()
+    }
+
+    /// 点掉冲突提示。
+    pub fn dismiss_hotkey_conflict(&mut self) {
+        self.hotkey_conflict = None;
     }
 
     /// 收尾成某一态。
@@ -508,5 +686,70 @@ mod tests {
         assert_eq!(state.status_line(), "待机 · 操作台");
         state.finish(Phase::Unrecognized, "未识别到游戏界面");
         assert_eq!(state.status_line(), "未识别 · 操作台");
+    }
+
+    #[test]
+    fn capture_accepts_supported_keys_and_ignores_the_rest() {
+        let plain = egui::Modifiers::default();
+        let chord = KeyChord::capture(egui::Key::F9, plain).expect("F9 可捕获");
+        assert_eq!(chord.label(), "F9");
+        assert_eq!(chord.main_name(), "F9");
+        assert_eq!(chord.modifiers(), 0);
+
+        // 不支持的键必须返回 None（调用方继续等待），不能被当成和弦提交。
+        assert_eq!(KeyChord::capture(egui::Key::Slash, plain), None);
+        assert_eq!(KeyChord::capture(egui::Key::Escape, plain), None);
+        assert_eq!(KeyChord::capture(egui::Key::Enter, plain), None);
+        assert_eq!(KeyChord::capture(egui::Key::F25, plain), None);
+    }
+
+    #[test]
+    fn chord_label_uses_the_fixed_modifier_order() {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: true,
+            ..egui::Modifiers::default()
+        };
+        let chord = KeyChord::capture(egui::Key::F8, modifiers).expect("F8 可捕获");
+        assert_eq!(chord.label(), "Ctrl+Alt+Shift+F8");
+        assert_eq!(
+            chord.modifiers(),
+            CHORD_MOD_CONTROL | CHORD_MOD_ALT | CHORD_MOD_SHIFT
+        );
+    }
+
+    #[test]
+    fn capturable_names_are_unique() {
+        let mut names: Vec<&str> = CAPTURABLE.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), CAPTURABLE.len(), "短名必须互异（配置里只能有一种写法）");
+        let mut keys: Vec<egui::Key> = CAPTURABLE.iter().map(|(_, key)| *key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), CAPTURABLE.len(), "同一个键不得映射到两个短名");
+    }
+
+    #[test]
+    fn hotkey_conflict_expires_and_never_touches_the_current_hotkey() {
+        let mut state = UiState::default();
+        state.hotkey = "F9".to_owned();
+        assert_eq!(state.hotkey_conflict_text(0.0), None, "默认不打扰用户");
+
+        state.show_hotkey_conflict(conflict_copy(Some("F9")), 10.0);
+        assert_eq!(
+            state.hotkey_conflict_text(10.1),
+            Some("热键冲突 · 仍为 F9")
+        );
+        assert_eq!(state.hotkey, "F9", "改键失败时界面必须仍是旧键");
+
+        assert_eq!(state.hotkey_conflict_text(12.4), Some("热键冲突 · 仍为 F9"));
+        assert_eq!(state.hotkey_conflict_text(12.5), None, "2.5s 后自动消失");
+
+        state.show_hotkey_conflict(conflict_copy(None), 20.0);
+        assert_eq!(state.hotkey_conflict_text(20.0), Some("热键不可用 · 用按钮"));
+        state.dismiss_hotkey_conflict();
+        assert_eq!(state.hotkey_conflict_text(20.0), None, "也能点掉");
     }
 }

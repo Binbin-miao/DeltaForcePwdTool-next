@@ -8,7 +8,10 @@ pub mod theme;
 pub mod view;
 pub mod wizard;
 
-pub use state::{format_sequence, Action, Phase, Progress, SceneKind, UiState};
+pub use state::{
+    conflict_copy, format_sequence, Action, KeyChord, Phase, Progress, SceneKind, UiState,
+    CAPTURABLE,
+};
 pub use view::{main_window, wizard_window, WizardAction, WizardFrame};
 pub use wizard::{apply_drawn, Step, TargetKind, TargetSpec, Verdict, Wizard, WizardScene};
 
