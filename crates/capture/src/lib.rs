@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use delta_geom::{GeomError, MonitorInfo, PxRect};
+use delta_geom::{GeomError, MonitorInfo};
 use delta_vision::GrayImage;
 use thiserror::Error;
 
@@ -21,7 +21,7 @@ mod session;
 mod wgc;
 
 pub use dpi::{ensure_dpi_awareness, DpiAwareness};
-pub use gdi::{primary_monitor_size, Capturer};
+pub use gdi::primary_monitor_size;
 pub use screen_source::{LiveScreen, ScreenSource};
 pub use session::{CaptureBackend, CaptureSession, FRAME_BUDGET};
 
@@ -151,21 +151,6 @@ impl Frame {
         let index = ((y as usize) * (self.stride as usize)) + (x as usize) * 4;
         [self.data[index], self.data[index + 1], self.data[index + 2]]
     }
-}
-
-/// 抓取区域并做黑帧检查的便捷入口（供上层流程直接使用）。
-///
-/// 每次调用独立申请并释放后端资源；黑帧返回错误而不是把全黑帧交给下游。
-pub fn grab_checked(capturer: &mut Capturer, rect: PxRect) -> Result<Frame, CaptureError> {
-    let frame = capturer.grab(rect)?;
-    let black_pct = frame.black_ratio_pct();
-    if black_pct >= DEFAULT_BLACK_THRESHOLD_PCT {
-        return Err(CaptureError::BlackFrame {
-            black_pct,
-            cutoff: BLACK_LUMA_CUTOFF,
-        });
-    }
-    Ok(frame)
 }
 
 /// 屏幕尺寸的便捷包装（校准向导首次启动时用）。

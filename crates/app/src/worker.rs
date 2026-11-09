@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use delta_capture::{CaptureSession, Capturer, Frame, FRAME_BUDGET};
+use delta_capture::{CaptureBackend, CaptureSession, Frame, FRAME_BUDGET};
 use delta_config::{Config, PxView, Timings};
 use delta_geom::{MonitorInfo, PxPoint, PxRect};
 use delta_hotkey::{Hotkey, Hotkeys as HotkeyRegistry};
@@ -156,7 +156,10 @@ impl Worker {
                             let registered = platform::parse_hotkey(&wanted)
                                 .map_err(|_| ())
                                 .and_then(|hotkey| {
-                                    hotkeys.register(hotkey).map(|id| (id, hotkey)).map_err(|_| ())
+                                    hotkeys
+                                        .register(hotkey)
+                                        .map(|id| (id, hotkey))
+                                        .map_err(|_| ())
                                 });
                             match registered {
                                 Ok((id, hotkey)) => {
@@ -271,12 +274,22 @@ fn full_rect(monitor: MonitorInfo) -> PxRect {
     }
 }
 
-/// 截一张全屏（物理像素）。供校准向导等**非任务**路径使用（任务路径一律走会话）。
-pub fn grab_full(monitor: MonitorInfo) -> Result<Frame, String> {
-    let mut capturer = Capturer::new(monitor.w, monitor.h).map_err(|error| error.to_string())?;
-    capturer
-        .grab(full_rect(monitor))
-        .map_err(|error| error.to_string())
+/// 非任务路径的一次性抓屏：**独立会话**，抓一帧即 `drop`（spec D3 的两个例外之一）。
+///
+/// `backend` 一律由调用点传配置里的 `capture_backend`：用户选了哪个后端就全程用它，
+/// 不再有一条「偷偷固定 BitBlt」的旁路。这些调用点都在 UI 线程，Wgc 会在这一帧里
+/// 一次性初始化设备与采集会话（约 30~50ms）；由于预览/回显都有缓存（只在
+/// `preview.is_none()` 或框选完成时抓一次），这笔开销不会落到每帧上。
+///
+/// 每次调用新建会话也意味着**不占任务的 20 张配额**（`FRAME_BUDGET` 随任务会话生灭）。
+pub fn grab_once(rect: PxRect, backend: CaptureBackend) -> Result<Frame, String> {
+    let mut session = CaptureSession::new(backend).map_err(|error| error.to_string())?;
+    session.grab(rect).map_err(|error| error.to_string())
+}
+
+/// 截一张全屏（物理像素）。
+pub fn grab_full(monitor: MonitorInfo, backend: CaptureBackend) -> Result<Frame, String> {
+    grab_once(full_rect(monitor), backend)
 }
 
 /// 建一次识别任务的采集会话（spec D3：任务开始建、结束 `Drop`）。
@@ -435,7 +448,12 @@ fn read_sequence(session: &mut CaptureSession, view: &PxView) -> Result<String, 
 }
 
 /// 摩斯流程（薄适配：`LiveScreen` / `LiveInput` 由 flow crate 提供）。
-fn run_morse(config: &Config, view: &PxView, session: &mut CaptureSession, tx: &mpsc::Sender<UiEvent>) {
+fn run_morse(
+    config: &Config,
+    view: &PxView,
+    session: &mut CaptureSession,
+    tx: &mpsc::Sender<UiEvent>,
+) {
     let mut input = delta_flow_morse::LiveInput;
     let job = delta_flow_morse::MorseRun {
         view,
@@ -448,17 +466,24 @@ fn run_morse(config: &Config, view: &PxView, session: &mut CaptureSession, tx: &
         let mut screen = delta_flow_morse::LiveScreen::new(session);
         delta_flow_morse::run(&mut screen, &mut input, &job)
     };
-    if over_budget(session, tx, view.monitor) {
+    if over_budget(session, tx, view.monitor, config.capture_backend) {
         return;
     }
     let total = outcome.cells.len();
     let _ = tx.send(UiEvent::Progress {
-        done: outcome.cells.iter().filter(|cell| cell.digit.is_some()).count(),
+        done: outcome
+            .cells
+            .iter()
+            .filter(|cell| cell.digit.is_some())
+            .count(),
         total,
         note: "已输入数字".to_owned(),
     });
     if outcome.digits_complete() {
-        let _ = tx.send(UiEvent::Succeeded(format!("已输入数字 {}", outcome.password)));
+        let _ = tx.send(UiEvent::Succeeded(format!(
+            "已输入数字 {}",
+            outcome.password
+        )));
     } else {
         let _ = tx.send(UiEvent::Failed(format!("未识别 {}", outcome.password)));
     }
@@ -501,11 +526,13 @@ fn run_fingerprint(
         delta_flow_fingerprint::run(
             &mut screen,
             &mut input,
-            reader.as_mut().map(|reader| reader as &mut dyn delta_flow_fingerprint::TextReader),
+            reader
+                .as_mut()
+                .map(|reader| reader as &mut dyn delta_flow_fingerprint::TextReader),
             &job,
         )
     };
-    if over_budget(session, tx, view.monitor) {
+    if over_budget(session, tx, view.monitor, config.capture_backend) {
         return;
     }
     match outcome {
@@ -540,9 +567,15 @@ fn run_console(
     let params = delta_flow_console::ConsoleParams::default().with_timings(&config.timings);
     let outcome = {
         let mut screen = delta_flow_console::SystemScreen::new(session);
-        delta_flow_console::run(&mut screen, &mut pointer, &mut clock, &view.console, &params)
+        delta_flow_console::run(
+            &mut screen,
+            &mut pointer,
+            &mut clock,
+            &view.console,
+            &params,
+        )
     };
-    if over_budget(session, tx, monitor) {
+    if over_budget(session, tx, monitor, config.capture_backend) {
         return;
     }
     match outcome {
@@ -562,6 +595,7 @@ fn run_console(
                 save_failure_evidence(
                     &reason,
                     monitor,
+                    config.capture_backend,
                     &format!("已发输入事件: {}", outcome.events()),
                 );
                 let _ = tx.send(UiEvent::Failed(reason));
@@ -569,26 +603,63 @@ fn run_console(
         }
         Err(error) => {
             let reason = error.to_string();
-            save_failure_evidence(&reason, monitor, "已发输入事件: 0");
+            save_failure_evidence(&reason, monitor, config.capture_backend, "已发输入事件: 0");
             let _ = tx.send(UiEvent::Failed(reason));
         }
     }
 }
 
+/// 配额是否已用尽（纯判定，便于单测）。
+fn budget_exhausted(used: u32) -> bool {
+    used >= FRAME_BUDGET
+}
+
 /// 配额用尽（spec D4）：转成固定文案 + 留证，且**只报一次**。
 ///
 /// 返回 `true` 表示本次任务已经按「超限」收尾，调用方必须立即返回。
-fn over_budget(session: &CaptureSession, tx: &mpsc::Sender<UiEvent>, monitor: MonitorInfo) -> bool {
-    if session.frames_taken() < FRAME_BUDGET {
+fn over_budget(
+    session: &CaptureSession,
+    tx: &mpsc::Sender<UiEvent>,
+    monitor: MonitorInfo,
+    backend: CaptureBackend,
+) -> bool {
+    if !budget_exhausted(session.frames_taken()) {
         return false;
     }
     let detail = format!(
         "已抓帧数: {}（上限 {FRAME_BUDGET}）",
         session.frames_taken()
     );
-    save_failure_evidence("截图次数超限", monitor, &detail);
+    save_failure_evidence("截图次数超限", monitor, backend, &detail);
     let _ = tx.send(UiEvent::Failed("截图次数超限".to_owned()));
     true
+}
+
+/// 另一个后端：只给留证路径做兜底用。
+fn other_backend(backend: CaptureBackend) -> CaptureBackend {
+    match backend {
+        CaptureBackend::Wgc => CaptureBackend::BitBlt,
+        CaptureBackend::BitBlt => CaptureBackend::Wgc,
+    }
+}
+
+/// 留证抓屏：先用配置的后端，失败再换另一个后端补齐一次。
+///
+/// 留证发生在任务**已经失败之后**：若任务正是因所选后端初始化失败而挂，
+/// 只用它留证等于没有证据。这是留证路径专有的例外，识别任务本身绝不自动降级（spec D5）。
+fn evidence_frame(monitor: MonitorInfo, backend: CaptureBackend) -> Result<Frame, String> {
+    let first = match grab_full(monitor, backend) {
+        Ok(frame) => return Ok(frame),
+        Err(error) => error,
+    };
+    let retry = other_backend(backend);
+    grab_full(monitor, retry).map_err(|error| {
+        format!(
+            "{} 失败：{first}；{} 重试也失败：{error}",
+            backend.label(),
+            retry.label()
+        )
+    })
 }
 
 /// 任务失败留证：全屏截图 + 文本日志，落到 `logs/`。
@@ -597,7 +668,12 @@ fn over_budget(session: &CaptureSession, tx: &mpsc::Sender<UiEvent>, monitor: Mo
 /// 目标序列读成了什么、面板有没有消失；日志记录时间、原因、分辨率与 `detail`
 /// （操作台是已发事件数，配额超限是已抓帧数）。任何一步失败都只打 stderr，
 /// **不允许把主流程带崩**。
-fn save_failure_evidence(reason: &str, monitor: MonitorInfo, detail: &str) {
+fn save_failure_evidence(
+    reason: &str,
+    monitor: MonitorInfo,
+    backend: CaptureBackend,
+    detail: &str,
+) {
     let dir = std::path::Path::new("logs");
     if let Err(error) = std::fs::create_dir_all(dir) {
         eprintln!("[console] 日志目录创建失败：{error}");
@@ -609,15 +685,14 @@ fn save_failure_evidence(reason: &str, monitor: MonitorInfo, detail: &str) {
         .unwrap_or(0);
     let base = dir.join(format!("console_fail_{stamp}"));
 
-    if let Ok(mut capturer) = Capturer::new(monitor.w, monitor.h) {
-        match capturer.grab(full_rect(monitor)) {
-            Ok(frame) => {
-                if let Err(error) = write_frame_png(&base.with_extension("png"), &frame) {
-                    eprintln!("[console] 失败截图保存失败：{error}");
-                }
+    // 留证抓屏是 spec D4 允许的例外之一：独立会话、每次任务最多 1 张、不计入 20 张配额。
+    match evidence_frame(monitor, backend) {
+        Ok(frame) => {
+            if let Err(error) = write_frame_png(&base.with_extension("png"), &frame) {
+                eprintln!("[console] 失败截图保存失败：{error}");
             }
-            Err(error) => eprintln!("[console] 失败截图抓取失败：{error}"),
         }
+        Err(error) => eprintln!("[console] 失败截图抓取失败：{error}"),
     }
 
     let text = format!(
@@ -630,7 +705,10 @@ fn save_failure_evidence(reason: &str, monitor: MonitorInfo, detail: &str) {
 }
 
 /// 把 BGRA 帧编码成 PNG（RGBA）。失败只回错误，不 panic。
-fn write_frame_png(path: &std::path::Path, frame: &Frame) -> Result<(), Box<dyn std::error::Error>> {
+fn write_frame_png(
+    path: &std::path::Path,
+    frame: &Frame,
+) -> Result<(), Box<dyn std::error::Error>> {
     let file = std::fs::File::create(path)?;
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), frame.w, frame.h);
     encoder.set_color(png::ColorType::Rgba);
@@ -682,6 +760,21 @@ mod tests {
         let config = Config::default();
         assert!(!config.validate().is_empty());
         assert!(config.try_px_view().is_err());
+    }
+
+    #[test]
+    fn evidence_falls_back_to_the_other_backend() {
+        // 留证兜底的对象必须真的「另一个」，否则任务因所选后端挂掉时拿不到证据。
+        assert_eq!(other_backend(CaptureBackend::Wgc), CaptureBackend::BitBlt);
+        assert_eq!(other_backend(CaptureBackend::BitBlt), CaptureBackend::Wgc);
+    }
+
+    #[test]
+    fn budget_is_exhausted_only_at_the_limit() {
+        assert!(!budget_exhausted(0), "没抓过帧不算超限");
+        assert!(!budget_exhausted(FRAME_BUDGET - 1), "少一张还能抓");
+        assert!(budget_exhausted(FRAME_BUDGET), "正好用满即超限");
+        assert!(budget_exhausted(FRAME_BUDGET + 1), "越界也算超限");
     }
 
     #[test]

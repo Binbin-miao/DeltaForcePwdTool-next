@@ -64,6 +64,9 @@ pub struct CaptureSession {
 
 impl CaptureSession {
     /// 建立会话：`Wgc` 在这里就把设备与采集会话全部拉起，失败**立即**报错而不是以后静默降级。
+    ///
+    /// 形参里没有 `monitor`：当前只支持主显示器（`wgc.rs` 内用
+    /// `MonitorFromPoint((0,0), MONITOR_DEFAULTTOPRIMARY)` 取采集项），**多屏需把 hmonitor 传进来**。
     pub fn new(kind: CaptureBackend) -> Result<Self, CaptureError> {
         let backend = match kind {
             CaptureBackend::BitBlt => Backend::BitBlt,

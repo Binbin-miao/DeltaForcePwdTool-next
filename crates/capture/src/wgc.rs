@@ -238,7 +238,7 @@ impl WgcSession {
                 return Ok(frame);
             }
             if attempt < FRAME_WAIT_ATTEMPTS {
-                // 流程等待（等游戏侧出帧），不是「轮询截图」：单次最多 90ms，且不抓任何像素。
+                // 流程等待（等游戏侧出帧），不是「轮询截图」：单次最多 60ms（2 次间隔），且不抓任何像素。
                 std::thread::sleep(Duration::from_millis(FRAME_WAIT_MS));
             }
         }

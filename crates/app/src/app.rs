@@ -15,7 +15,7 @@ use delta_ui::{
 };
 
 use crate::platform;
-use crate::worker::{grab_full, Cmd, UiEvent, Worker};
+use crate::worker::{grab_full, grab_once, Cmd, UiEvent, Worker};
 
 /// 保存后自动关窗延时（spec D9：1.5s）。
 const SAVE_CLOSE_DELAY: Duration = Duration::from_millis(1500);
@@ -321,18 +321,19 @@ impl DeltaApp {
     }
 
     /// 截图并上传成纹理；`region` 为 `None` 时抓全屏。
+    ///
+    /// 走 [`grab_once`] / [`grab_full`]（独立会话，后端取配置里的 `capture_backend`）：
+    /// 本函数在 UI 线程，Wgc 会在这里一次性初始化设备（约 30~50ms）；预览有缓存
+    /// （只在 `preview.is_none()` 或框选完成时抓一次），不会落到每帧。
     fn capture_texture(
         &self,
         ctx: &egui::Context,
         region: Option<PxRect>,
     ) -> Option<egui::TextureHandle> {
+        let backend = self.snapshot().capture_backend;
         let frame = match region {
-            Some(rect) => {
-                let mut capturer =
-                    delta_capture::Capturer::new(self.monitor.w, self.monitor.h).ok()?;
-                capturer.grab(rect).ok()?
-            }
-            None => grab_full(self.monitor).ok()?,
+            Some(rect) => grab_once(rect, backend).ok()?,
+            None => grab_full(self.monitor, backend).ok()?,
         };
         Some(ctx.load_texture(
             "delta-preview",
@@ -438,10 +439,6 @@ impl DeltaApp {
         let config = self.snapshot();
         let dir = crate::images_dir().join(role);
         let _ = std::fs::create_dir_all(&dir);
-        let mut capturer = match delta_capture::Capturer::new(self.monitor.w, self.monitor.h) {
-            Ok(capturer) => capturer,
-            Err(_) => return,
-        };
         for (index, rect) in config.fingerprint.candidate_boxes.iter().enumerate() {
             let Ok(pixels) = rect.to_px(self.monitor) else {
                 continue;
@@ -449,7 +446,8 @@ impl DeltaApp {
             if pixels.w <= 0 || pixels.h <= 0 {
                 continue;
             }
-            let Ok(frame) = capturer.grab(pixels) else {
+            // 九格各抓一次（UI 线程、各自独立会话；不占任务配额）。
+            let Ok(frame) = grab_once(pixels, config.capture_backend) else {
                 continue;
             };
             let gray = frame.luma();
@@ -507,36 +505,36 @@ impl DeltaApp {
     }
 
     /// 只读识别：按场景读一次现有校准区域。
+    ///
+    /// 走独立会话的 `grab_once` / `grab_full`（后端取配置里的 `capture_backend`）：
+    /// 本函数在 UI 线程，Wgc 的一次性初始化开销只落在这唯一一次试跑上。
     fn readonly_test(&self, scene: WizardScene) -> Verdict {
         let config = self.snapshot();
         let Ok(view) = config.try_px_view() else {
             return Verdict::Failed("请先校准".to_owned());
         };
-        let mut capturer = match delta_capture::Capturer::new(self.monitor.w, self.monitor.h) {
-            Ok(capturer) => capturer,
-            Err(error) => return Verdict::Failed(error.to_string()),
-        };
+        let backend = config.capture_backend;
         match scene {
             WizardScene::Morse => {
                 let Some(region) = view.regions.first() else {
                     return Verdict::Failed("请先校准".to_owned());
                 };
-                match capturer.grab(region.rect) {
+                match grab_once(region.rect, backend) {
                     Ok(frame) => match delta_flow_morse::decode_gray(&frame.luma()) {
                         Ok(digit) => Verdict::Read(digit.to_string()),
                         Err(error) => Verdict::Failed(error.to_string()),
                     },
-                    Err(error) => Verdict::Failed(error.to_string()),
+                    Err(reason) => Verdict::Failed(reason),
                 }
             }
-            WizardScene::Console => match capturer.grab(view.console.led_region) {
+            WizardScene::Console => match grab_once(view.console.led_region, backend) {
                 Ok(frame) => match delta_vision::read_glyph_string(&frame.luma()) {
                     Ok(text) => Verdict::Read(text),
                     Err(error) => Verdict::Failed(error.to_string()),
                 },
-                Err(error) => Verdict::Failed(error.to_string()),
+                Err(reason) => Verdict::Failed(reason),
             },
-            WizardScene::Fingerprint | WizardScene::Recapture => match grab_full(self.monitor) {
+            WizardScene::Fingerprint | WizardScene::Recapture => match grab_full(self.monitor, backend) {
                 Ok(frame) => {
                     let verdict = delta_scene::detect(&frame, &view);
                     if verdict.is_actionable() {

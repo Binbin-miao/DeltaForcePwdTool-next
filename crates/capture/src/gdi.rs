@@ -24,24 +24,10 @@ use crate::{dpi, CaptureError, Frame};
 /// `BI_RGB`（无压缩）在 Windows SDK 里的字面值；直接用常量避免不同 windows-rs 版本的类型差异。
 const BI_RGB_VALUE: u32 = 0;
 
-/// 抓屏器的兼容壳：上层调用点仍写 `Capturer::new(..)` / `grab(..)`，但**没有**任何常驻资源。
-#[derive(Debug, Default)]
-pub struct Capturer;
-
-impl Capturer {
-    /// 只做一次性的 DPI 感知；动态库上限参数在「每次新建」模型下已无意义，仅保留签名兼容。
-    pub fn new(_max_width: i32, _max_height: i32) -> Result<Self, CaptureError> {
-        dpi::ensure_dpi_awareness();
-        Ok(Self)
-    }
-
-    /// 抓取一块区域（32bpp top-down BGRA）。
-    pub fn grab(&mut self, rect: PxRect) -> Result<Frame, CaptureError> {
-        capture(rect)
-    }
-}
-
 /// 抓取一块区域（32bpp top-down BGRA）；返回前已释放全部 GDI 句柄。
+///
+/// **本模块不对外暴露抓屏入口**：唯一的公开路径是 [`crate::CaptureSession::grab`]，
+/// 否则配额（spec D4）就会被绕过。
 pub fn capture(rect: PxRect) -> Result<Frame, CaptureError> {
     if rect.w <= 0 || rect.h <= 0 {
         return Err(CaptureError::InvalidRect {
@@ -104,9 +90,7 @@ impl GdiScope {
     fn acquire(width: i32, height: i32) -> Result<Self, CaptureError> {
         let screen = unsafe { GetDC(HWND::default()) };
         if screen.0.is_null() {
-            return Err(CaptureError::NoScreenDc {
-                code: last_error(),
-            });
+            return Err(CaptureError::NoScreenDc { code: last_error() });
         }
         let memory = unsafe { CreateCompatibleDC(screen) };
         if memory.0.is_null() {
@@ -219,35 +203,32 @@ mod tests {
 
     #[test]
     fn every_grab_returns_a_fresh_buffer_without_resident_state() {
-        let mut capturer = Capturer::new(64, 64).expect("创建抓屏器");
         let rect = PxRect {
             x: 0,
             y: 0,
             w: 32,
             h: 24,
         };
-        let first = capturer.grab(rect).expect("抓取小区域");
+        let first = capture(rect).expect("抓取小区域");
         assert_eq!((first.w, first.h, first.stride), (32, 24, 128));
         assert_eq!(first.data.len(), 32 * 24 * 4);
 
         // 大小随请求变化 —— 没有「预分配容量」这类跨调用状态可以约束它。
-        let second = capturer
-            .grab(PxRect {
-                x: 0,
-                y: 0,
-                w: 100,
-                h: 80,
-            })
-            .expect("抓取大区域");
+        let second = capture(PxRect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 80,
+        })
+        .expect("抓取大区域");
         assert_eq!((second.w, second.h), (100, 80));
         assert_eq!(second.data.len(), 100 * 80 * 4);
     }
 
     #[test]
     fn empty_rect_is_rejected_without_touching_gdi() {
-        let mut capturer = Capturer::new(8, 8).expect("创建抓屏器");
         assert!(matches!(
-            capturer.grab(PxRect {
+            capture(PxRect {
                 x: 0,
                 y: 0,
                 w: 0,
