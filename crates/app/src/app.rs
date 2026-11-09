@@ -2,7 +2,7 @@
 //!
 //! 线程纪律：`ui` 里只 `try_recv` 事件与绘制；识别一律在后台线程跑。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,8 +31,12 @@ const THUMB_MAX: [u32; 2] = [160, 64];
 const NOTICE_ON_TOP_FAILED: &str = "置顶切换失败";
 /// 图钉状态已生效但落盘失败的提示（此时三者已回滚成一致）。
 const NOTICE_ON_TOP_UNSAVED: &str = "设置未保存";
+/// 置顶回滚失败的提示：窗口确实停在新状态，只是没落盘 —— 不再谎称「已回滚」。
+const NOTICE_ON_TOP_ROLLBACK_FAILED: &str = "置顶已变未保存";
 /// 补录会话建不起来（无 D3D11 适配器等）的提示。
 const NOTICE_TEMPLATE_SESSION_FAILED: &str = "补录会话启动失败";
+/// 补录 PNG 写盘失败的提示（已删掉本次写出的所有格，目录里不留残份）。
+const NOTICE_TEMPLATE_WRITE_FAILED: &str = "模板写入失败";
 
 /// 应用状态。
 pub struct DeltaApp {
@@ -324,7 +328,16 @@ impl DeltaApp {
             return;
         }
         // 落盘失败：回滚窗口与内存，别让用户看到一个存不下来的开关。
-        let _ = platform::apply_always_on_top(previous);
+        if platform::apply_always_on_top(previous).is_err() {
+            // 回滚也失败：窗口确实停在新状态，就别再谎称它回去了 —— 承认现状、说清没存下，
+            // 也别让内存配置与窗口打架（下一次切换要从真实值算起）。
+            if let Ok(mut config) = self.config.lock() {
+                config.always_on_top = wanted;
+            }
+            self.state.always_on_top = wanted;
+            self.state.notice = Some(NOTICE_ON_TOP_ROLLBACK_FAILED.to_owned());
+            return;
+        }
         if let Ok(mut config) = self.config.lock() {
             config.always_on_top = previous;
         }
@@ -467,7 +480,8 @@ impl DeltaApp {
     ///
     /// **要么全存、要么不存**：WGC 在静态画面（暂停/加载/菜单）下可能只出第一帧，
     /// 后面各格全抓不到；残缺模板会让后续识别一直失败且原因难查，所以格数不齐时
-    /// 直接中止并出提示，不落半份模板。
+    /// 直接中止并出提示，不落半份模板。写盘同理：任一格写失败就删掉本次已写出的所有格
+    /// —— 零字节/截断的 PNG 比没有 PNG 更坏，它会安静地把识别带偏。
     fn save_template_cells(&mut self) {
         let Some(wizard) = self.wizard.as_ref() else {
             return;
@@ -492,17 +506,17 @@ impl DeltaApp {
             self.state.notice = Some(notice);
             return;
         }
+        let mut written: Vec<PathBuf> = Vec::with_capacity(captured.frames.len());
         for (index, frame) in captured.frames {
-            let gray = frame.luma();
-            let Ok(file) = std::fs::File::create(dir.join(format!("{}.png", index + 1))) else {
-                continue;
-            };
-            let mut encoder = png::Encoder::new(file, gray.w, gray.h);
-            encoder.set_color(png::ColorType::Grayscale);
-            encoder.set_depth(png::BitDepth::Eight);
-            if let Ok(mut writer) = encoder.write_header() {
-                let _ = writer.write_image_data(gray.as_slice());
+            let path = dir.join(format!("{}.png", index + 1));
+            if write_cell_png(&path, &frame.luma()).is_err() {
+                // 这一格可能已经建出空文件或半截文件，单独删掉；之前写成的整格由 clear 收。
+                let _ = std::fs::remove_file(&path);
+                discard_cells(&written);
+                self.state.notice = Some(NOTICE_TEMPLATE_WRITE_FAILED.to_owned());
+                return;
             }
+            written.push(path);
         }
     }
 
@@ -695,15 +709,38 @@ struct CellCapture {
 }
 
 /// 抓帧不足时的用户提示；`None` 表示九格齐备、可以落盘。
+///
+/// 措辞必须是「一格都没存」：`save_template_cells` 在 `failed` 非空时**一张 PNG 都不写**，
+/// 说「只存下 n/9 格」会让用户以为手里还有 n 格可用模板，实际后续识别全失败。
 fn incomplete_cells_notice(captured: &CellCapture) -> Option<String> {
     if captured.failed.is_empty() {
         return None;
     }
-    Some(format!(
-        "只存下 {}/{} 格",
-        captured.frames.len(),
-        delta_config::CANDIDATE_BOX_COUNT
-    ))
+    Some(format!("缺 {} 格，未保存", captured.failed.len()))
+}
+
+/// 把一格灰度帧写成 PNG；任一步失败都返回 `Err`，由调用方统一清场。
+///
+/// 单独成函数是为了让「写失败必须显形」这件事有单一落点：不在这里 `continue`，
+/// 也不要让 `write_image_data` 的返回值被丢掉。
+fn write_cell_png(path: &Path, gray: &delta_vision::GrayImage) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|error| format!("{path:?}: {error}"))?;
+    let mut encoder = png::Encoder::new(file, gray.w, gray.h);
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| format!("{path:?}: {error}"))?;
+    writer
+        .write_image_data(gray.as_slice())
+        .map_err(|error| format!("{path:?}: {error}"))
+}
+
+/// 删掉本次已写出的格（删不掉就忽略：尽力不留残份，不为此再堆一层提示）。
+fn discard_cells(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// 按百分比矩形逐格抓图，返回序号与帧（顺序与入参一致；空格跳过，抓失败另记）。
@@ -1003,9 +1040,35 @@ mod tests {
         );
         assert_eq!(
             incomplete_cells_notice(&captured),
-            Some("只存下 7/9 格".to_owned()),
-            "残缺时必须给出可见提示"
+            Some("缺 2 格，未保存".to_owned()),
+            "残缺时必须明说「一格都没存」，而不是让人以为还有 7 格可用"
         );
+    }
+
+    #[test]
+    fn a_failed_cell_write_is_reported_and_the_written_cells_are_removed() {
+        // 「要么全存、要么不存」在写盘侧的落点：写失败必须能被看见，且已写出的格要被删掉，
+        // 不能留下零字节/截断的 PNG 去把后续识别安静地带偏。
+        let root = std::env::temp_dir().join(format!("delta-pwd-cells-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("临时目录可建");
+        let first = root.join("1.png");
+        let gray = delta_capture::Frame::new(2, 2, vec![0; 2 * 2 * 4], Instant::now())
+            .expect("测试帧长度正确")
+            .luma();
+
+        assert_eq!(write_cell_png(&first, &gray), Ok(()), "正常路径要写得出来");
+        assert!(first.is_file(), "写成功就必须有文件");
+
+        let orphan = root.join("no-such-dir/2.png");
+        assert!(
+            write_cell_png(&orphan, &gray).is_err(),
+            "父目录不存在时必须返回错误，不能静默吞掉"
+        );
+
+        discard_cells(std::slice::from_ref(&first));
+        assert!(!first.exists(), "失败清场必须删掉本次已写出的格");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1043,19 +1106,23 @@ mod tests {
             session.grab(rect).map_err(|error| error.to_string())
         });
         let frames = captured.frames.len() as u32;
-        assert!(frames > 0, "默认后端必须至少抓到第一格");
         assert_eq!(
             session.frames_taken(),
             frames,
             "抓到的每一格都必须出自同一个会话"
         );
-        if captured.failed.is_empty() {
-            assert_eq!(frames, delta_config::CANDIDATE_BOX_COUNT as u32);
-        } else {
-            // 静态桌面下 WGC 只出首帧是已知行为：此时保存会被 `incomplete_cells_notice` 拦住，
-            // 这里只把实测格数打出来，供换机器复现时对照。
-            eprintln!("[test] {backend:?} 静态桌面只出了 {frames} 帧");
+        if frames < delta_config::CANDIDATE_BOX_COUNT as u32 {
+            // 静态桌面下 WGC 只出首帧是已知行为，此时保存会被 `incomplete_cells_notice` 拦住，
+            // 本用例无法验证「九格一个会话」：明确跳过，而不是把断言降级成 `> 0` 的安慰剂
+            // （`> 0` 在只出首帧的机器上会静默变绿，等于没验）。
+            eprintln!("[test] {backend:?} 只出了 {frames} 帧（静态桌面），跳过九格断言");
+            return;
         }
+        assert_eq!(
+            frames,
+            delta_config::CANDIDATE_BOX_COUNT as u32,
+            "默认后端必须抓满九格"
+        );
         for (_, frame) in &captured.frames {
             assert_eq!(frame.luma().as_slice().len(), (frame.w * frame.h) as usize);
         }

@@ -3,3 +3,4 @@
 *.log
 .patches/
 /dist
+*.ttf.bak
