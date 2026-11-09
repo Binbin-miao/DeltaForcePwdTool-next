@@ -49,7 +49,7 @@ const FRAME_WAIT_MS: u64 = 30;
 // windows-rs 0.58 没有生成这个接口，因此在这里按 IID 补一份最小声明（只有第 4 个虚函数有用）。
 #[repr(transparent)]
 #[derive(PartialEq, Eq, Clone)]
-pub struct IDirect3DDxgiInterfaceAccess(windows::core::IUnknown);
+struct IDirect3DDxgiInterfaceAccess(windows::core::IUnknown);
 
 unsafe impl Interface for IDirect3DDxgiInterfaceAccess {
     type Vtable = IDirect3DDxgiInterfaceAccess_Vtbl;
@@ -68,7 +68,7 @@ impl std::ops::Deref for IDirect3DDxgiInterfaceAccess {
 // COM 虚表字段名必须与原生方法名一致，才能与头文件逐行对照。
 #[allow(non_snake_case)]
 #[repr(C)]
-pub struct IDirect3DDxgiInterfaceAccess_Vtbl {
+struct IDirect3DDxgiInterfaceAccess_Vtbl {
     pub base__: windows::core::IUnknown_Vtbl,
     pub GetInterface: unsafe extern "system" fn(
         *mut c_void,
@@ -244,7 +244,8 @@ impl WgcSession {
         }
         Err(CaptureError::WgcNoFrame {
             attempts: FRAME_WAIT_ATTEMPTS,
-            wait_ms: FRAME_WAIT_MS * u64::from(FRAME_WAIT_ATTEMPTS),
+            // 只在重试之间等待，最后一次失败后不再 sleep。
+            wait_ms: FRAME_WAIT_MS * u64::from(FRAME_WAIT_ATTEMPTS - 1),
         })
     }
 }

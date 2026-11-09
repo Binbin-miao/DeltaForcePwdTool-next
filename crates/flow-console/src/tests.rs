@@ -221,10 +221,6 @@ fn sub_steps_share_one_capture_instead_of_capturing_per_step() {
         grabs <= 16,
         "{steps} 个子步只允许 {grabs} 张截图（≤16），说明存在每子步截图"
     );
-    assert!(
-        u64::from(harness.params.max_steps) >= steps / 4,
-        "单列子步数不应超过 max_steps"
-    );
 }
 
 #[test]

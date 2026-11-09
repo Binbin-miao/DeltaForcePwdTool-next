@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use delta_geom::{MonitorInfo, PxRect};
+use delta_geom::PxRect;
 
 use crate::{gdi, wgc, CaptureError, Frame};
 
@@ -59,13 +59,12 @@ enum Backend {
 pub struct CaptureSession {
     backend: Backend,
     kind: CaptureBackend,
-    monitor: MonitorInfo,
     used: u32,
 }
 
 impl CaptureSession {
     /// 建立会话：`Wgc` 在这里就把设备与采集会话全部拉起，失败**立即**报错而不是以后静默降级。
-    pub fn new(kind: CaptureBackend, monitor: MonitorInfo) -> Result<Self, CaptureError> {
+    pub fn new(kind: CaptureBackend) -> Result<Self, CaptureError> {
         let backend = match kind {
             CaptureBackend::BitBlt => Backend::BitBlt,
             CaptureBackend::Wgc => Backend::Wgc(wgc::WgcSession::new()?),
@@ -73,7 +72,6 @@ impl CaptureSession {
         Ok(Self {
             backend,
             kind,
-            monitor,
             used: 0,
         })
     }
@@ -81,11 +79,6 @@ impl CaptureSession {
     /// 本会话使用的后端。
     pub fn backend(&self) -> CaptureBackend {
         self.kind
-    }
-
-    /// 本会话对应的屏幕尺寸。
-    pub fn monitor(&self) -> MonitorInfo {
-        self.monitor
     }
 
     /// 已抓取的帧数（供测试与「超限只报一次」的日志去重使用）。
@@ -112,10 +105,6 @@ impl CaptureSession {
 mod tests {
     use super::*;
 
-    fn monitor() -> MonitorInfo {
-        MonitorInfo::new(64, 64).expect("测试用显示器尺寸")
-    }
-
     fn tiny_rect() -> PxRect {
         PxRect {
             x: 0,
@@ -136,7 +125,7 @@ mod tests {
     #[test]
     fn the_twenty_first_grab_is_rejected_by_the_budget() {
         let mut session =
-            CaptureSession::new(CaptureBackend::BitBlt, monitor()).expect("BitBlt 会话可建");
+            CaptureSession::new(CaptureBackend::BitBlt).expect("BitBlt 会话可建");
         for round in 0..FRAME_BUDGET {
             session
                 .grab(tiny_rect())
@@ -162,22 +151,20 @@ mod tests {
     #[test]
     fn a_new_session_starts_with_a_full_budget() {
         let mut first =
-            CaptureSession::new(CaptureBackend::BitBlt, monitor()).expect("BitBlt 会话可建");
+            CaptureSession::new(CaptureBackend::BitBlt).expect("BitBlt 会话可建");
         first.grab(tiny_rect()).expect("抓取");
         assert_eq!(first.frames_taken(), 1);
         drop(first);
 
         let second =
-            CaptureSession::new(CaptureBackend::BitBlt, monitor()).expect("BitBlt 会话可建");
+            CaptureSession::new(CaptureBackend::BitBlt).expect("BitBlt 会话可建");
         assert_eq!(second.frames_taken(), 0, "任务结束配额必须归零");
         assert_eq!(second.backend(), CaptureBackend::BitBlt);
-        assert_eq!(second.monitor().w, 64);
     }
 
     #[test]
     fn wgc_captures_a_real_frame_when_the_backend_is_available() {
-        let monitor = crate::monitor_info().expect("主显示器尺寸可读");
-        let mut session = match CaptureSession::new(CaptureBackend::Wgc, monitor) {
+        let mut session = match CaptureSession::new(CaptureBackend::Wgc) {
             Ok(session) => session,
             // 没有可用 D3D11 适配器的机器会在初始化处失败；那条分支的可读性由上一个用例覆盖。
             Err(_) => return,
@@ -199,7 +186,7 @@ mod tests {
     #[test]
     fn wgc_session_initialises_or_reports_a_readable_hresult() {
         // 本机可能没有可用的 D3D11 适配器：两条分支都必须给出可定位的信息，且绝不回退 BitBlt。
-        match CaptureSession::new(CaptureBackend::Wgc, monitor()) {
+        match CaptureSession::new(CaptureBackend::Wgc) {
             Ok(session) => {
                 assert_eq!(session.backend(), CaptureBackend::Wgc);
                 assert_eq!(session.frames_taken(), 0);

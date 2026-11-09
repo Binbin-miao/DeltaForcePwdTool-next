@@ -657,7 +657,7 @@ impl<'a> Session<'a> {
         })
     }
 
-    /// 这一帧的旋钮块是否可信：像素数落在 `[knob_min_pixels, knob_max_pixels]` 内才算一个旋钮。
+    /// 这一帧的旋钮块是否可信（只判上限：下限 `knob_min_pixels` 已在 `analyze_panel` 里把关）。
     fn knob_trusted(&self, observation: &PanelObservation) -> bool {
         observation
             .knob
