@@ -205,6 +205,10 @@ pub struct UiState {
     pub toggles: Toggles,
     /// 进入当前状态后经过的秒数（成功 200ms 高亮 / 呼吸相位都靠它）。
     pub phase_elapsed: f64,
+    /// 设置面板里是否正在编辑热键。
+    pub hotkey_editing: bool,
+    /// 热键输入缓冲（编辑态专用；回车才写回配置）。
+    pub hotkey_buffer: String,
 }
 
 /// 三个功能入口开关。
@@ -265,6 +269,8 @@ impl Default for UiState {
                 console: true,
             },
             phase_elapsed: 0.0,
+            hotkey_editing: false,
+            hotkey_buffer: String::new(),
         }
     }
 }

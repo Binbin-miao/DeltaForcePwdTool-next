@@ -46,6 +46,9 @@ pub fn load(path: &Path) -> Result<Loaded, ConfigError> {
             })
         }
     };
+    // 开箱即用：从未校准过的区域用内置坐标补齐（用户已校准的值一律保留）。
+    // 这样新装、旧空配置、换机器都能直接跑，不必先进游戏框选。
+    let config = config.with_builtin_regions();
     // 关键不变量：像素值每次都从百分比重新换算，绝不回填进 config。
     let view = if config.monitor.is_calibrated() {
         Some(config.try_px_view()?)
@@ -98,7 +101,9 @@ fn display(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MissingArea, RegionEntry, CONFIG_FILE_NAME, MORSE_REGION_COUNT};
+    use crate::{
+        MissingArea, RegionEntry, CANDIDATE_BOX_COUNT, CONFIG_FILE_NAME, MORSE_REGION_COUNT,
+    };
     use delta_geom::{MonitorInfo, PctPoint, PctRect};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -172,14 +177,20 @@ mod tests {
             "load 不得改动磁盘上的百分比"
         );
 
-        // 连续 load 后再次 save：仍必须字节级一致，证明像素值没有回写。
+        // 连续 load 后再次 save：必须**收敛**，证明像素值没有被回写。
+        // 首次 save 会把空区域补齐成内置坐标（这是预期行为），之后必须字节级稳定。
         let reloaded = load(&path).expect("加载");
         save(&path, &reloaded.config).expect("二次保存");
-        assert_eq!(
-            fs::read(&path).expect("读取落盘内容"),
-            bytes_before,
-            "save 写入了像素值（百分比被污染）"
-        );
+        let after_fill = fs::read(&path).expect("读取落盘内容");
+        for round in 0..3 {
+            let again = load(&path).expect("加载");
+            save(&path, &again.config).expect("再次保存");
+            assert_eq!(
+                fs::read(&path).expect("读取落盘内容"),
+                after_fill,
+                "第 {round} 次 load→save 后字节漂移（像素值被回写或内置值重复合并）"
+            );
+        }
     }
 
     #[test]
@@ -203,7 +214,9 @@ mod tests {
         let dir = TempDir::new();
         let absent = dir.join("absent.json");
         let loaded = load(&absent).expect("文件缺失视为首次运行");
-        assert_eq!(loaded.config, Config::default());
+        // 首次运行即填内置坐标：不校准也能直接用（这是「开箱即用」的核心保证）。
+        assert_eq!(loaded.config, Config::default().with_builtin_regions());
+        assert!(loaded.config.regions.iter().all(|entry| entry.rect.w > 0.0));
         assert!(loaded.view.is_none());
         assert_eq!(loaded.view().unwrap_err().to_string(), "主显示器尺寸未校准，无法生成像素视图：需先运行校准向导");
 
@@ -214,10 +227,14 @@ mod tests {
         assert!(!loaded.config.ocr_enabled);
         assert_eq!(loaded.config.timings.morse_after_input_ms, 600);
         assert_eq!(loaded.config.regions.len(), MORSE_REGION_COUNT);
-        assert!(loaded
-            .config
-            .validate()
-            .contains(&MissingArea::FingerprintCandidateBox { index: 0 }));
+        // 部分配置同样会被内置坐标补齐：不再报「指纹格缺失」，
+        // 只剩「主显示器未校准」一项（那是换算像素时才需要的锚点）。
+        assert_eq!(
+            loaded.config.fingerprint.candidate_boxes.len(),
+            CANDIDATE_BOX_COUNT
+        );
+        assert!(loaded.config.fingerprint.candidate_boxes[0].w > 0.0);
+        assert_eq!(loaded.config.validate(), vec![MissingArea::Monitor]);
     }
 
     #[test]

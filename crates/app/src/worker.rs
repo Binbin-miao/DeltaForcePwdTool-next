@@ -43,8 +43,10 @@ pub enum UiEvent {
 /// UI → 后台的命令。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
-    /// 一键识别（热键或主按钮）。
+    /// 一键识别（自动判别场景）。
     Trigger,
+    /// 强制跑指定场景，跳过自动判别（对齐上游「F5 只跑摩斯 / F6 只跑指纹」）。
+    Force(SceneKind),
     /// 只读检查：找窗 + 场景判别，不产生任何输入。
     Probe,
     /// 请求取消（在流程边界生效）。
@@ -55,8 +57,20 @@ pub enum Cmd {
 pub struct Worker {
     pub events: mpsc::Receiver<UiEvent>,
     pub commands: mpsc::Sender<Cmd>,
+    /// 改键通道：把新热键名送进热键泵线程，实现「改完立刻生效」。
+    hotkey_tx: mpsc::Sender<String>,
     shutdown: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
+}
+
+impl Worker {
+    /// 热更新全局热键：改完立即生效，无需重启。
+    ///
+    /// 新键注册失败（被别的程序占用）时只是暂时没有全局热键，主按钮仍可用，
+    /// 不会让程序崩掉。
+    pub fn set_hotkey(&self, name: String) {
+        let _ = self.hotkey_tx.send(name);
+    }
 }
 
 impl Drop for Worker {
@@ -73,28 +87,58 @@ impl Worker {
         let shutdown = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
 
-        let hotkey_name = config
-            .lock()
-            .map(|config| config.hotkeys.scene.clone())
-            .unwrap_or_else(|_| "F8".to_owned());
+        // 四个热键：一键识别（自动判别）+ 三个强制键（对齐上游 F5/F6，另加操作台 F7）。
+        let bindings: Vec<(String, Cmd)> = {
+            let keys = match config.lock() {
+                Ok(cfg) => cfg.hotkeys.clone(),
+                Err(_) => delta_config::Hotkeys::default(),
+            };
+            vec![
+                (keys.scene, Cmd::Trigger),
+                (keys.morse, Cmd::Force(SceneKind::Morse)),
+                (keys.fingerprint, Cmd::Force(SceneKind::Fingerprint)),
+                (keys.console, Cmd::Force(SceneKind::Console)),
+            ]
+        };
+        let (hotkey_tx, hotkey_rx) = mpsc::channel::<String>();
         {
             let trigger = commands.clone();
             let stop = shutdown.clone();
             std::thread::Builder::new()
                 .name("delta-hotkey".to_owned())
                 .spawn(move || {
-                    // 注册失败（被其它程序占用）只是没有全局热键，主按钮仍可用。
+                    // 注册失败（被其它程序占用）只是没有该热键，主按钮仍可用。
                     let Ok(hotkeys) = delta_hotkey::Hotkeys::new() else {
                         return;
                     };
-                    if hotkeys.register(platform::parse_hotkey(&hotkey_name)).is_err() {
-                        return;
+                    let mut routes: Vec<(u32, Cmd)> = Vec::new();
+                    let mut scene_id: Option<u32> = None;
+                    for (name, cmd) in &bindings {
+                        if let Ok(id) = hotkeys.register(platform::parse_hotkey(name)) {
+                            if matches!(cmd, Cmd::Trigger) {
+                                scene_id = Some(id);
+                            }
+                            routes.push((id, *cmd));
+                        }
                     }
                     while !stop.load(Ordering::Relaxed) {
-                        if hotkeys.next_event(HOTKEY_POLL).is_some()
-                            && trigger.send(Cmd::Trigger).is_err()
-                        {
-                            break;
+                        // 改键只重绑「一键识别」；其余三键改配置文件后重启生效。
+                        if let Ok(name) = hotkey_rx.try_recv() {
+                            if let Some(id) = scene_id.take() {
+                                let _ = hotkeys.unregister(id);
+                                routes.retain(|(route, _)| *route != id);
+                            }
+                            if let Ok(id) = hotkeys.register(platform::parse_hotkey(&name)) {
+                                scene_id = Some(id);
+                                routes.push((id, Cmd::Trigger));
+                            }
+                        }
+                        if let Some(event) = hotkeys.next_event(HOTKEY_POLL) {
+                            if let Some((_, cmd)) = routes.iter().find(|(id, _)| *id == event.id) {
+                                if trigger.send(*cmd).is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
                 })
@@ -118,7 +162,11 @@ impl Worker {
                             }
                             Cmd::Trigger => {
                                 cancel.store(false, Ordering::SeqCst);
-                                run_once(&config, monitor, &event_tx, &cancel);
+                                run_once(&config, monitor, &event_tx, &cancel, None);
+                            }
+                            Cmd::Force(kind) => {
+                                cancel.store(false, Ordering::SeqCst);
+                                run_once(&config, monitor, &event_tx, &cancel, Some(kind));
                             }
                         }
                     }
@@ -129,6 +177,7 @@ impl Worker {
         Self {
             events,
             commands,
+            hotkey_tx,
             shutdown,
             cancel,
         }
@@ -211,6 +260,7 @@ fn run_once(
     monitor: MonitorInfo,
     tx: &mpsc::Sender<UiEvent>,
     cancel: &AtomicBool,
+    forced: Option<SceneKind>,
 ) {
     let _ = tx.send(UiEvent::Started);
     let snapshot = snapshot(config);
@@ -231,8 +281,19 @@ fn run_once(
             return;
         }
     };
-    let verdict = delta_scene::detect(&frame, &view);
-    let scene = map_scene(verdict.scene);
+    // 强制模式（上游 F5/F6 的等价物）：跳过判别直接用指定场景，
+    // 用于自动判别不准时人工兜底。自动模式下判别为 Unknown 立即拒绝，零输入。
+    let (scene, actionable, reason) = match forced {
+        Some(kind) => (kind, true, ""),
+        None => {
+            let verdict = delta_scene::detect(&frame, &view);
+            (
+                map_scene(verdict.scene),
+                verdict.is_actionable(),
+                verdict.reason,
+            )
+        }
+    };
     let sequence = if scene == SceneKind::Console {
         read_sequence(&view).ok().map(|raw| delta_ui::format_sequence(&raw))
     } else {
@@ -240,9 +301,9 @@ fn run_once(
     };
     let _ = tx.send(UiEvent::Scene { scene, sequence });
 
-    if !verdict.is_actionable() {
+    if !actionable {
         // spec D6 硬约束：拒绝执行，不产生任何输入。
-        let _ = tx.send(UiEvent::Rejected(verdict.reason.to_owned()));
+        let _ = tx.send(UiEvent::Rejected(reason.to_owned()));
         return;
     }
     if cancel.load(Ordering::SeqCst) {
@@ -293,7 +354,8 @@ fn run_morse(config: &Config, view: &PxView, tx: &mpsc::Sender<UiEvent>) {
     let job = delta_flow_morse::MorseRun {
         view,
         timings: &config.timings,
-        auto_click: true,
+        // 上游 morse_auto_click 的等价物：控制输入完成后是否自动点确认。
+        auto_click: config.auto_confirm,
     };
     let outcome = delta_flow_morse::run(&mut screen, &mut input, &job);
     let total = outcome.cells.len();
@@ -339,7 +401,8 @@ fn run_fingerprint(config: &Config, view: &PxView, tx: &mpsc::Sender<UiEvent>) {
         view,
         library: &library,
         timings: &config.timings,
-        auto_click: true,
+        // 上游 fingerprint_auto_click 的等价物：false → 只出标注图，不点击。
+        auto_click: config.fingerprint_auto_click,
         ocr_enabled: config.ocr_enabled,
         evidence_dir: crate::evidence_dir(),
     };
@@ -403,13 +466,78 @@ fn run_console(
                 let reason = outcome
                     .abort_reason()
                     .map_or_else(|| "已取消".to_owned(), |reason| reason.to_string());
+                // 操作台处于 BETA：失败必留证（截图 + 文本日志），供用户自测定位。
+                save_console_evidence(&reason, monitor, outcome.events());
                 let _ = tx.send(UiEvent::Failed(reason));
             }
         }
         Err(error) => {
-            let _ = tx.send(UiEvent::Failed(error.to_string()));
+            let reason = error.to_string();
+            save_console_evidence(&reason, monitor, 0);
+            let _ = tx.send(UiEvent::Failed(reason));
         }
     }
+}
+
+/// 操作台失败留证：全屏截图 + 文本日志，落到 `logs/`。
+///
+/// 操作台是 BETA 功能，用户自测时靠这两份证据定位：截屏能看出当时卡在哪一列、
+/// 目标序列读成了什么、面板有没有消失；日志记录时间、原因、分辨率与已发事件数。
+/// 任何一步失败都只打 stderr，**不允许把主流程带崩**。
+fn save_console_evidence(reason: &str, monitor: MonitorInfo, events: u64) {
+    let dir = std::path::Path::new("logs");
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        eprintln!("[console] 日志目录创建失败：{error}");
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let base = dir.join(format!("console_fail_{stamp}"));
+
+    if let Ok(mut capturer) = Capturer::new(monitor.w, monitor.h) {
+        let full = PxRect {
+            x: 0,
+            y: 0,
+            w: monitor.w,
+            h: monitor.h,
+        };
+        match capturer.grab(full) {
+            Ok(frame) => {
+                if let Err(error) = write_frame_png(&base.with_extension("png"), &frame) {
+                    eprintln!("[console] 失败截图保存失败：{error}");
+                }
+            }
+            Err(error) => eprintln!("[console] 失败截图抓取失败：{error}"),
+        }
+    }
+
+    let text = format!(
+        "时间(unix): {stamp}\n原因: {reason}\n分辨率: {}x{}\n已发输入事件: {events}\n",
+        monitor.w, monitor.h
+    );
+    if let Err(error) = std::fs::write(base.with_extension("txt"), text) {
+        eprintln!("[console] 失败日志保存失败：{error}");
+    }
+}
+
+/// 把 BGRA 帧编码成 PNG（RGBA）。失败只回错误，不 panic。
+fn write_frame_png(path: &std::path::Path, frame: &Frame) -> Result<(), Box<dyn std::error::Error>> {
+    let file = std::fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), frame.w, frame.h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    let mut rgba = Vec::with_capacity((frame.w as usize) * (frame.h as usize) * 4);
+    for y in 0..frame.h {
+        for x in 0..frame.w {
+            let [b, g, r] = frame.pixel(x, y);
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    writer.write_image_data(&rgba)?;
+    Ok(())
 }
 
 /// 供 UI 显示用的时序快照（当前未在 UI 中展示，保留给设置面板的后续扩展）。

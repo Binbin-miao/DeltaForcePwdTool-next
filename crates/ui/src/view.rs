@@ -144,7 +144,13 @@ fn main_layout(ui: &egui::Ui, full: Rect, state: &mut UiState, time: f64) -> Opt
             Vec2::new(width, theme::TOGGLE_H),
         );
         let usable = state.is_calibrated() && enabled;
-        if toggle_row(ui, row, scene.label(), usable, &painter) {
+        // 操作台是 BETA：标签直接带标记，让用户一眼知道这块还在自测阶段。
+        let label = if matches!(scene, crate::SceneKind::Console) {
+            "操作台 · BETA"
+        } else {
+            scene.label()
+        };
+        if toggle_row(ui, row, label, usable, &painter) {
             action = Some(Action::ToggleFlow(scene));
         }
         top = row.bottom() + theme::SPACE_XS;
@@ -865,6 +871,10 @@ fn dashed_pct_rect(painter: &egui::Painter, stage: Rect, rect: PctRect, color: C
 /// 设置浮层素材（v1 只暴露三项：热键、OCR 兜底、配置路径）。
 pub struct SettingsView<'a> {
     pub hotkey: &'a str,
+    /// 是否正在编辑热键（编辑态显示输入框）。
+    pub hotkey_editing: bool,
+    /// 热键输入缓冲。
+    pub hotkey_buffer: &'a mut String,
     pub ocr_enabled: bool,
     pub config_path: &'a str,
 }
@@ -875,6 +885,10 @@ pub enum SettingsAction {
     /// 只读检查游戏与场景，不产生任何输入。
     Probe,
     ToggleOcr,
+    /// 点热键行 → 进入编辑态。
+    EditHotkey,
+    /// 编辑态回车 → 提交新热键（调用方校验后写配置并热更新）。
+    CommitHotkey,
     Close,
 }
 
@@ -896,7 +910,7 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
         theme::TEXT_1,
     );
 
-    // 热键（只读，改键请编辑配置文件）
+    // 热键（点一下即可编辑，回车生效）
     let hotkey_row = Rect::from_min_size(
         Pos2::new(content.left(), content.top() + theme::SPACE_XXL),
         Vec2::new(content.width(), theme::TOGGLE_H),
@@ -909,13 +923,52 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
         theme::text(theme::FONT_BODY),
         theme::TEXT_2,
     );
-    painter.text(
-        hotkey_row.right_center() - Vec2::new(theme::SPACE_M, 0.0),
-        Align2::RIGHT_CENTER,
-        view.hotkey,
-        theme::mono(theme::FONT_BODY),
-        theme::TEXT_1,
-    );
+    if view.hotkey_editing {
+        let field = Rect::from_min_max(
+            Pos2::new(
+                hotkey_row.left() + content.width() * 0.45,
+                hotkey_row.top() + theme::SPACE_XS,
+            ),
+            Pos2::new(
+                hotkey_row.right() - theme::SPACE_S,
+                hotkey_row.bottom() - theme::SPACE_XS,
+            ),
+        );
+        let response = ui.put(
+            field,
+            egui::TextEdit::singleline(view.hotkey_buffer)
+                .hint_text("F8 / Ctrl+F8")
+                .char_limit(16),
+        );
+        response.request_focus();
+        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            action = Some(SettingsAction::CommitHotkey);
+        }
+    } else {
+        let response = ui.interact(
+            hotkey_row,
+            ui.scope_id().with("hotkey-row"),
+            egui::Sense::click(),
+        );
+        painter.text(
+            hotkey_row.right_center() - Vec2::new(theme::SPACE_M, 0.0),
+            Align2::RIGHT_CENTER,
+            if response.hovered() {
+                format!("{} · 点这里改", view.hotkey)
+            } else {
+                view.hotkey.to_owned()
+            },
+            theme::mono(theme::FONT_BODY),
+            if response.hovered() {
+                theme::ACCENT
+            } else {
+                theme::TEXT_1
+            },
+        );
+        if response.clicked() {
+            action = Some(SettingsAction::EditHotkey);
+        }
+    }
 
     // OCR 兜底开关
     let ocr_row = Rect::from_min_size(

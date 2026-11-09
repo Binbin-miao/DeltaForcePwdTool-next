@@ -443,14 +443,21 @@ impl eframe::App for DeltaApp {
             return;
         }
         if self.settings_open {
+            // 借用拆分：hotkey 读、buffer 写，用 mem::take 避开同结构双借用。
+            let hotkey_text = self.state.hotkey.clone();
+            let hotkey_editing = self.state.hotkey_editing;
+            let mut buffer = std::mem::take(&mut self.state.hotkey_buffer);
             let action = delta_ui::view::settings_panel(
                 ui,
                 delta_ui::view::SettingsView {
-                    hotkey: &self.state.hotkey,
+                    hotkey: &hotkey_text,
+                    hotkey_editing,
+                    hotkey_buffer: &mut buffer,
                     ocr_enabled: self.snapshot().ocr_enabled,
                     config_path: &self.config_path.display().to_string(),
                 },
             );
+            self.state.hotkey_buffer = buffer;
             match action {
                 Some(delta_ui::view::SettingsAction::Probe) => {
                     self.settings_open = false;
@@ -461,6 +468,23 @@ impl eframe::App for DeltaApp {
                         config.ocr_enabled = !config.ocr_enabled;
                     }
                     let _ = self.persist();
+                }
+                Some(delta_ui::view::SettingsAction::EditHotkey) => {
+                    self.state.hotkey_editing = true;
+                    self.state.hotkey_buffer = self.state.hotkey.clone();
+                }
+                Some(delta_ui::view::SettingsAction::CommitHotkey) => {
+                    self.state.hotkey_editing = false;
+                    let name = self.state.hotkey_buffer.trim().to_owned();
+                    if !name.is_empty() {
+                        if let Ok(mut config) = self.config.lock() {
+                            config.hotkeys.scene = name.clone();
+                        }
+                        // 热更新：改完立刻生效，不用重启。
+                        self.worker.set_hotkey(name.clone());
+                        self.state.hotkey = name;
+                        let _ = self.persist();
+                    }
                 }
                 Some(delta_ui::view::SettingsAction::Close) => self.settings_open = false,
                 None => {}

@@ -74,6 +74,23 @@ pub struct Config {
     pub accepted_disclaimer: bool,
     /// OCR 兜底引擎开关（spec D2）。
     pub ocr_enabled: bool,
+    /// 是否自动点「确认」按钮（默认开）。
+    ///
+    /// 开启时：`confirm_clicks` 为空会回退到内置坐标（上游 2K 版那两个点），做到开箱即用；
+    /// 关闭时：无论配置里有没有坐标都不点 —— 这样 spec 不变量 4「空数组 = 跳过确认」
+    /// 仍然可以被用户主动表达（把开关关掉即可），不会被内置值悄悄覆盖。
+    pub auto_confirm: bool,
+    /// 指纹是否真的自动点击（对齐上游 `fingerprint_auto_click`）。
+    ///
+    /// `false` → 只产出标注图、不点击，用于核对识别结果（上游手动模式）。
+    pub fingerprint_auto_click: bool,
+    /// 当前实际屏幕分辨率（**不持久化**）。
+    ///
+    /// 百分比才是唯一持久真相：换算像素必须按「当前屏幕」，而不是「上次校准时的屏幕」，
+    /// 否则换了分辨率还用旧尺寸换算，整张坐标图会整体偏移 —— 这正是「免校准」能成立的前提。
+    /// `serde(skip)` 保证它永远不落盘，也不会覆盖校准基线。
+    #[serde(skip)]
+    pub runtime_monitor: MonitorInfo,
 }
 
 impl Default for Config {
@@ -88,6 +105,9 @@ impl Default for Config {
             timings: Timings::default(),
             accepted_disclaimer: false,
             ocr_enabled: true,
+            auto_confirm: true,
+            fingerprint_auto_click: true,
+            runtime_monitor: MonitorInfo::default(),
         }
     }
 }
@@ -96,7 +116,13 @@ impl Config {
     /// 把百分比配置换算成**独立的**像素视图。每次调用都从百分比重新计算，
     /// 不读取也不写回任何既有像素值 —— 这是「连续 load 不漂移」的结构性保证。
     pub fn try_px_view(&self) -> Result<PxView, ConfigError> {
-        let monitor = MonitorInfo::new(self.monitor.w, self.monitor.h)?;
+        // 换算一律按「当前屏幕」：runtime_monitor 优先，未注入时才回退到持久化基线。
+        let source = if self.runtime_monitor.is_calibrated() {
+            self.runtime_monitor
+        } else {
+            self.monitor
+        };
+        let monitor = MonitorInfo::new(source.w, source.h)?;
         let regions = self
             .regions
             .iter()
@@ -140,11 +166,21 @@ impl Config {
                 row_y,
                 knob_center: self.console.knob_center.to_px(monitor)?,
             },
-            confirm_clicks: self
-                .confirm_clicks
-                .iter()
-                .map(|point| Ok(point.to_px(monitor)?))
-                .collect::<Result<Vec<_>, ConfigError>>()?,
+            // 自动确认开 + 配置里没写坐标 → 用内置坐标（开箱即用）；
+            // 自动确认关 → 一律空数组（spec 不变量 4 的「空 = 跳过」）。
+            confirm_clicks: if self.auto_confirm && self.confirm_clicks.is_empty() {
+                builtin::CONFIRM_CLICKS
+                    .iter()
+                    .map(|point| Ok(point.to_px(monitor)?))
+                    .collect::<Result<Vec<_>, ConfigError>>()?
+            } else if self.auto_confirm {
+                self.confirm_clicks
+                    .iter()
+                    .map(|point| Ok(point.to_px(monitor)?))
+                    .collect::<Result<Vec<_>, ConfigError>>()?
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -161,7 +197,7 @@ impl Config {
     /// 列出所有未校准的必填区域。空列表 == 全部就绪（spec D9 的 UI 灰置依据）。
     pub fn validate(&self) -> Vec<MissingArea> {
         let mut missing = Vec::new();
-        if !self.monitor.is_calibrated() {
+        if !self.monitor.is_calibrated() && !self.runtime_monitor.is_calibrated() {
             missing.push(MissingArea::Monitor);
         }
         for index in 0..MORSE_REGION_COUNT {
@@ -310,14 +346,157 @@ impl Default for ConsoleConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Hotkeys {
+    /// 一键识别（自动判别场景）。
     pub scene: String,
+    /// 强制跑摩斯（对齐上游 `F5`）。
+    pub morse: String,
+    /// 强制跑指纹（对齐上游 `F6`）。
+    pub fingerprint: String,
+    /// 强制跑操作台。
+    pub console: String,
 }
 
 impl Default for Hotkeys {
     fn default() -> Self {
         Self {
             scene: "F8".to_owned(),
+            // 与上游一致：F5 摩斯、F6 指纹；操作台是本版新增，占用 F7。
+            morse: "F5".to_owned(),
+            fingerprint: "F6".to_owned(),
+            console: "F7".to_owned(),
         }
+    }
+}
+
+// ───────────────────── 内置默认区域（开箱即用，免校准） ─────────────────────
+
+/// 内置区域坐标（百分比，与分辨率无关）。
+///
+/// 来源：
+/// - **摩斯 / 指纹**：上游 Python 版 `config/settings.json` 的 2K(2560×1440) 基准坐标，
+///   逐个折算成屏幕百分比。上游是靠「按当前分辨率等比缩放」实现自适应的，这里改成
+///   直接用百分比表达 —— 效果等价，且不会重现上游「重复 load 二次缩放漂移」的缺陷。
+/// - **操作台**：实测游戏画面（1280×720 录屏帧）逐元素量取后折算。
+///
+/// 意义：**不校准也能直接用**。校准向导退化成微调手段，只有换分辨率、改游戏 UI 缩放、
+/// 或者游戏大版本改版时才需要走一遍。
+pub mod builtin {
+    use super::{PctPoint, PctRect, RegionEntry, CANDIDATE_BOX_COUNT, CONSOLE_COLUMNS, CONSOLE_ROWS};
+
+    const fn rect(x: f32, y: f32, w: f32, h: f32) -> PctRect {
+        PctRect { x, y, w, h }
+    }
+    const fn point(x: f32, y: f32) -> PctPoint {
+        PctPoint { x, y }
+    }
+
+    /// 摩斯三个点划区：上游 2K 坐标 (699/967/1234, 514, 200×50)。
+    pub const MORSE: [PctRect; 3] = [
+        rect(0.273047, 0.356944, 0.078125, 0.034722),
+        rect(0.377734, 0.356944, 0.078125, 0.034722),
+        rect(0.482031, 0.356944, 0.078125, 0.034722),
+    ];
+
+    /// 摩斯输入完成后依次点击的两个确认点：上游 2K 坐标 (1241/1359, 1060)。
+    pub const CONFIRM_CLICKS: [PctPoint; 2] =
+        [point(0.484766, 0.736111), point(0.530859, 0.736111)];
+
+    /// 指纹人名区：上游 2K (706,657)-(866,689)。
+    pub const NAME_REGION: PctRect = rect(0.275781, 0.456250, 0.062500, 0.022222);
+    /// 指纹模式数字区：上游 2K (1030,530)-(1365,930)。
+    pub const NUMBER_REGION: PctRect = rect(0.402344, 0.368056, 0.130859, 0.277778);
+    /// 九宫格候选指纹：3 列 × 3 行，上游 2K 列 x=1522/1650/1778，行 y=560/687/815，格 105×105。
+    pub const CANDIDATE_COL_X: [f32; 3] = [0.594531, 0.644531, 0.694531];
+    pub const CANDIDATE_ROW_Y: [f32; 3] = [0.388889, 0.477083, 0.565972];
+    pub const CANDIDATE_W: f32 = 0.041016;
+    pub const CANDIDATE_H: f32 = 0.072917;
+
+    /// 操作台 LED 目标序列：录屏帧 (869,113)，378×47。
+    pub const LED_REGION: PctRect = rect(0.678906, 0.156944, 0.295313, 0.065278);
+    /// 操作台面板：录屏帧 (66,86)，614×460。
+    pub const PANEL_REGION: PctRect = rect(0.051563, 0.119444, 0.479688, 0.638889);
+    /// 面板内 4 列的 x（面板宽度四等分中心）。
+    pub const COL_X: [f32; CONSOLE_COLUMNS] = [0.111524, 0.231446, 0.351368, 0.471290];
+    /// 面板内 4 行的 y（录屏帧实测 204 / 277 / 350 / 424，帧高 720）。
+    pub const ROW_Y: [f32; CONSOLE_ROWS] = [0.283333, 0.384722, 0.486111, 0.588889];
+    /// 旋钮中心：录屏帧实测约 (719, 331)/(1280×720)。
+    pub const KNOB_CENTER: PctPoint = point(0.561719, 0.459722);
+
+    /// 摩斯三区条目（名字与校准向导一致，便于逐项覆盖）。
+    pub fn regions() -> Vec<RegionEntry> {
+        MORSE
+            .iter()
+            .enumerate()
+            .map(|(index, rect)| RegionEntry {
+                name: format!("morse_cell_{}", index + 1),
+                rect: *rect,
+            })
+            .collect()
+    }
+
+    /// 九宫格候选（行主序，与上游 `candidate_boxes` 顺序一致）。
+    pub fn candidate_boxes() -> Vec<PctRect> {
+        let mut boxes = Vec::with_capacity(CANDIDATE_BOX_COUNT);
+        for row in CANDIDATE_ROW_Y {
+            for col in CANDIDATE_COL_X {
+                boxes.push(rect(col, row, CANDIDATE_W, CANDIDATE_H));
+            }
+        }
+        boxes
+    }
+
+    pub fn confirm_clicks() -> Vec<PctPoint> {
+        CONFIRM_CLICKS.to_vec()
+    }
+}
+
+/// 百分比矩形是否已设置（宽高都大于 0）。
+///
+/// 注意：`PctRect` 本身不带 `is_calibrated`（那是 `MonitorInfo` / `PxRect` 的方法），
+/// 且**不能**用 `x/y != 0` 判断 —— 贴左边缘的合法区域 x 就是 0。
+fn is_set(rect: PctRect) -> bool {
+    rect.w > 0.0 && rect.h > 0.0
+}
+
+impl Config {
+    /// 用内置坐标补齐「从未校准过」的区域。
+    ///
+    /// 只在对应区域**全空**时覆盖，已校准的值一律保留 —— 用户的微调结果不会被抹掉。
+    /// 这是「开箱即用」的核心：新装、旧空配置、换机器都能直接跑，不必先进游戏框选。
+    pub fn with_builtin_regions(mut self) -> Self {
+        if self.regions.len() != MORSE_REGION_COUNT
+            || self.regions.iter().all(|entry| !is_set(entry.rect))
+        {
+            self.regions = builtin::regions();
+        }
+        if !is_set(self.fingerprint.name_region) && !is_set(self.fingerprint.number_region) {
+            self.fingerprint = FingerprintConfig {
+                name_region: builtin::NAME_REGION,
+                number_region: builtin::NUMBER_REGION,
+                candidate_boxes: builtin::candidate_boxes(),
+            };
+        }
+        if !is_set(self.console.panel_region) {
+            self.console = ConsoleConfig {
+                led_region: builtin::LED_REGION,
+                panel_region: builtin::PANEL_REGION,
+                col_x: builtin::COL_X.to_vec(),
+                row_y: builtin::ROW_Y.to_vec(),
+                knob_center: builtin::KNOB_CENTER,
+            };
+        }
+        // 注意：**不回填 confirm_clicks**。它由 `auto_confirm` 开关在 `try_px_view` 里
+        // 决定是否回退到内置坐标 —— 配置层保持「空就是空」，spec 不变量 4 才不被破坏。
+        self
+    }
+
+    /// 注入「当前实际屏幕分辨率」（不落盘），供百分比→像素换算使用。
+    ///
+    /// 与持久化的 [`Config::monitor`]（上次校准时的分辨率基线）刻意分离：
+    /// 前者用于换算与提示，后者只用于判断「屏幕是否变过」。
+    pub fn with_runtime_monitor(mut self, monitor: MonitorInfo) -> Self {
+        self.runtime_monitor = monitor;
+        self
     }
 }
 
@@ -595,11 +774,12 @@ mod tests {
 
     #[test]
     fn legacy_hotkey_fields_are_ignored_not_fatal() {
-        // 旧配置文件里的 `morse` / `fingerprint` 已删除：必须被静默忽略（前向兼容），
-        // 且剩下的 `scene` 仍正常读出。
-        let json = r#"{"hotkeys":{"scene":"F7","morse":"F9","fingerprint":"F10"}}"#;
-        let config: Config = serde_json::from_str(json).expect("旧配置必须仍能解析");
+        // 四个键都能配（对齐上游 F5/F6，另加操作台）；未知字段静默忽略（前向兼容）。
+        let json = r#"{"hotkeys":{"scene":"F7","morse":"F9","fingerprint":"F10","console":"F11","future":"X1"}}"#;
+        let config: Config = serde_json::from_str(json).expect("配置必须仍能解析");
         assert_eq!(config.hotkeys.scene, "F7");
-        assert_eq!(config.hotkeys, Hotkeys { scene: "F7".to_owned() });
+        assert_eq!(config.hotkeys.morse, "F9");
+        assert_eq!(config.hotkeys.fingerprint, "F10");
+        assert_eq!(config.hotkeys.console, "F11");
     }
 }

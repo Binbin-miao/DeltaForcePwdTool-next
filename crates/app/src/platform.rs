@@ -25,6 +25,39 @@ fn wide(text: &str) -> Vec<u16> {
     OsStr::new(text).encode_wide().chain(Some(0)).collect()
 }
 
+/// 是否以管理员身份运行。
+///
+/// **为什么必须要管理员**：游戏通常以管理员启动，Windows 的 UIPI 会静默丢弃
+/// 低权限进程发往高权限窗口的 `SendInput`。也就是说「权限不够时点击看起来发出去了，
+/// 游戏却一点反应都没有」—— 上游 Python 版同样要求管理员，这里保持一致的体验。
+pub fn is_elevated() -> bool {
+    unsafe { windows::Win32::UI::Shell::IsUserAnAdmin().as_bool() }
+}
+
+/// 以管理员身份重启自身（弹 UAC）。返回 `true` = 已交给新进程，旧进程应退出。
+///
+/// 用户拒绝 UAC 时返回 `false`：程序仍以普通权限运行，界面可用、热键可用，
+/// 但点进游戏可能无效 —— 由调用方在界面上给出提示，而不是直接拒绝启动。
+pub fn relaunch_elevated() -> bool {
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let verb = wide("runas");
+    let file = wide(&exe.to_string_lossy());
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut info).is_ok() }
+}
+
 /// 单实例守卫：持有互斥量句柄直到进程退出。
 pub struct SingleInstance {
     _handle: windows::Win32::Foundation::HANDLE,
