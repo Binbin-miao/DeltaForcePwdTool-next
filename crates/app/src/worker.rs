@@ -10,6 +10,7 @@ use std::time::Duration;
 use delta_capture::{Capturer, Frame};
 use delta_config::{Config, PxView, Timings};
 use delta_geom::{MonitorInfo, PxPoint, PxRect};
+use delta_hotkey::{Hotkey, Hotkeys as HotkeyRegistry};
 use delta_ui::SceneKind;
 
 use crate::platform;
@@ -38,6 +39,14 @@ pub enum UiEvent {
     /// spec D6：未识别必须拒绝执行，零输入。
     Rejected(String),
     TimedOut(String),
+    /// 改键成功：`state.hotkey` 只在这条回执之后才换成新键。
+    HotkeyApplied(String),
+    /// 改键失败（spec D2）：`kept = Some(旧键)` 表示旧键已回滚可用；
+    /// `kept = None` 表示连旧键都占不到，本会话只剩按钮。
+    HotkeyConflict {
+        wanted: String,
+        kept: Option<String>,
+    },
 }
 
 /// UI → 后台的命令。
@@ -104,6 +113,7 @@ impl Worker {
         {
             let trigger = commands.clone();
             let stop = shutdown.clone();
+            let notify = event_tx.clone();
             std::thread::Builder::new()
                 .name("delta-hotkey".to_owned())
                 .spawn(move || {
@@ -111,10 +121,24 @@ impl Worker {
                     let Ok(hotkeys) = delta_hotkey::Hotkeys::new() else {
                         return;
                     };
+                    // 启动读配置是 spec D3 唯一允许回落 F8 的地方，且必须留痕。
+                    let resolved: Vec<(String, Hotkey, Cmd)> = bindings
+                        .iter()
+                        .map(|(name, cmd)| (name.clone(), startup_hotkey(name), *cmd))
+                        .collect();
                     let mut routes: Vec<(u32, Cmd)> = Vec::new();
                     let mut scene_id: Option<u32> = None;
-                    for (name, cmd) in &bindings {
-                        if let Ok(id) = hotkeys.register(platform::parse_hotkey(name)) {
+                    // 「一键识别」当前真正在案的键名 + 实际注册用的 `Hotkey`。
+                    // 改键失败时靠它回滚（D2），因此不能只记名字、更不能重新解析。
+                    let (mut scene_name, mut scene_key) = resolved
+                        .iter()
+                        .find(|(_, _, cmd)| matches!(cmd, Cmd::Trigger))
+                        .map_or_else(
+                            || (String::new(), Hotkey::default()),
+                            |(name, hotkey, _)| (name.clone(), *hotkey),
+                        );
+                    for (_, hotkey, cmd) in &resolved {
+                        if let Ok(id) = hotkeys.register(*hotkey) {
                             if matches!(cmd, Cmd::Trigger) {
                                 scene_id = Some(id);
                             }
@@ -123,14 +147,35 @@ impl Worker {
                     }
                     while !stop.load(Ordering::Relaxed) {
                         // 改键只重绑「一键识别」；其余三键改配置文件后重启生效。
-                        if let Ok(name) = hotkey_rx.try_recv() {
+                        if let Ok(wanted) = hotkey_rx.try_recv() {
                             if let Some(id) = scene_id.take() {
                                 let _ = hotkeys.unregister(id);
                                 routes.retain(|(route, _)| *route != id);
                             }
-                            if let Ok(id) = hotkeys.register(platform::parse_hotkey(&name)) {
-                                scene_id = Some(id);
-                                routes.push((id, Cmd::Trigger));
+                            // 解析失败只可能是捕获表与解析表漂移，一样按「注册失败」显形。
+                            let registered = platform::parse_hotkey(&wanted)
+                                .map_err(|_| ())
+                                .and_then(|hotkey| {
+                                    hotkeys.register(hotkey).map(|id| (id, hotkey)).map_err(|_| ())
+                                });
+                            match registered {
+                                Ok((id, hotkey)) => {
+                                    scene_id = Some(id);
+                                    routes.push((id, Cmd::Trigger));
+                                    scene_name = wanted.clone();
+                                    scene_key = hotkey;
+                                    let _ = notify.send(UiEvent::HotkeyApplied(wanted));
+                                }
+                                Err(()) => {
+                                    let kept = restore_scene(
+                                        &hotkeys,
+                                        &scene_name,
+                                        scene_key,
+                                        &mut routes,
+                                        &mut scene_id,
+                                    );
+                                    let _ = notify.send(UiEvent::HotkeyConflict { wanted, kept });
+                                }
                             }
                         }
                         if let Some(event) = hotkeys.next_event(HOTKEY_POLL) {
@@ -187,6 +232,35 @@ impl Worker {
     pub fn request_cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
     }
+}
+
+/// 启动读配置：这是 spec D3 **唯一**允许回落 F8 的地方，且必须 `eprintln` 留痕。
+///
+/// 其余调用点（改键、回滚）一律不得回落 —— 那样会把「写错的键」伪装成「生效的 F8」。
+fn startup_hotkey(name: &str) -> Hotkey {
+    platform::parse_hotkey(name).unwrap_or_else(|error| {
+        eprintln!("[hotkey] 配置里的热键 {name:?} 无法解析（{error}），本会话回落 F8");
+        Hotkey::default()
+    })
+}
+
+/// 改键失败后的回滚（spec D2）：把旧键重新注册回去。
+///
+/// 返回界面该显示的「仍为 X」；`None` = 连旧键都占不到（接口被别的程序抢走了）。
+fn restore_scene(
+    hotkeys: &HotkeyRegistry,
+    scene_name: &str,
+    scene_key: Hotkey,
+    routes: &mut Vec<(u32, Cmd)>,
+    scene_id: &mut Option<u32>,
+) -> Option<String> {
+    let Ok(id) = hotkeys.register(scene_key) else {
+        eprintln!("[hotkey] 旧键 {scene_name} 也注册不上，本会话只剩按钮可用");
+        return None;
+    };
+    *scene_id = Some(id);
+    routes.push((id, Cmd::Trigger));
+    Some(scene_name.to_owned())
 }
 
 /// 取当前配置快照（锁内只做 clone，不做耗时操作）。
@@ -575,6 +649,14 @@ mod tests {
         let config = Config::default();
         assert!(!config.validate().is_empty());
         assert!(config.try_px_view().is_err());
+    }
+
+    #[test]
+    fn only_the_startup_reader_falls_back_to_f8() {
+        // spec D3：启动读配置是唯一允许回落的地方，其他调用点一律 Err。
+        assert_eq!(startup_hotkey("sb250"), Hotkey::default());
+        assert_eq!(startup_hotkey("F9"), Hotkey::plain(0x78));
+        assert_eq!(startup_hotkey("Ctrl+Shift+A"), Hotkey::new(0x41, 0x2 | 0x4));
     }
 
     #[test]

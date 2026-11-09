@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 use delta_config::Config;
 use delta_geom::{MonitorInfo, PxRect};
 use delta_ui::{
-    Action, Phase, Progress, Step, UiState, Verdict, Wizard, WizardAction, WizardFrame,
-    WizardScene,
+    conflict_copy, Action, KeyChord, Phase, Progress, Step, UiState, Verdict, Wizard, WizardAction,
+    WizardFrame, WizardScene,
 };
 
+use crate::platform;
 use crate::worker::{grab_full, Cmd, UiEvent, Worker};
 
 /// 保存后自动关窗延时（spec D9：1.5s）。
@@ -89,11 +90,14 @@ impl DeltaApp {
         delta_config::save(&self.config_path, &config).map_err(|error| error.to_string())
     }
 
-    /// 重新同步「未校准项」与热键标签。
+    /// 重新同步「未校准项」。
+    ///
+    /// **不碰 `state.hotkey`**：那个值只由热键线程的回执改写（`HotkeyApplied`）。
+    /// 若在这里按配置回填，一次「注册失败但已落盘」的改键会借校准动作重新变成
+    /// 「界面显示新键、实际仍是旧键」的假保存。
     fn sync_calibration(&mut self) {
         let config = self.snapshot();
         self.state.missing = config.validate().iter().map(ToString::to_string).collect();
-        self.state.hotkey = config.hotkeys.scene.clone();
     }
 
     /// 收后台事件。
@@ -115,6 +119,19 @@ impl DeltaApp {
                 UiEvent::Failed(message) => self.finish(Phase::Unrecognized, message),
                 UiEvent::Rejected(message) => self.finish(Phase::Unrecognized, message),
                 UiEvent::TimedOut(message) => self.finish(Phase::TimedOut, message),
+                UiEvent::HotkeyApplied(name) => {
+                    // 只有拿到成功回执才换显示（D2：不允许静默失败）。
+                    self.state.hotkey = name;
+                    self.state.dismiss_hotkey_conflict();
+                    let _ = self.persist();
+                }
+                UiEvent::HotkeyConflict { wanted, kept } => {
+                    let now = ctx.input(|input| input.time);
+                    eprintln!("[hotkey] {wanted} 注册失败，回滚结果：{kept:?}");
+                    // `state.hotkey` 保持旧值 —— 这正是「假保存」的反面。
+                    self.state
+                        .show_hotkey_conflict(conflict_copy(kept.as_deref()), now);
+                }
             }
             ctx.request_repaint();
         }
@@ -124,6 +141,26 @@ impl DeltaApp {
     fn finish(&mut self, phase: Phase, message: String) {
         self.state.finish(phase, message);
         self.phase_started = Instant::now();
+    }
+
+    /// 提交一次捕获到的热键（spec D3 / D5）。
+    ///
+    /// 只写配置 + 交给热键线程；**这里不动 `state.hotkey`** —— 界面要等 worker 回执
+    /// （`HotkeyApplied` / `HotkeyConflict`）才换显示，否则又会变成「看起来保存成功」。
+    fn commit_hotkey(&mut self, chord: KeyChord) {
+        let name = chord.label();
+        // 捕获结果必然可解析（`capturable_vocabulary_matches_the_parser` 把两张表钉死）。
+        // 解析失败说明不变量被破坏：说出来，绝不设默认值糊过去。
+        if platform::parse_hotkey(&name).is_err() {
+            self.finish(Phase::Unrecognized, "热键写法不识别".to_owned());
+            return;
+        }
+        if let Ok(mut config) = self.config.lock() {
+            config.hotkeys.scene = name.clone();
+        }
+        // 先落盘再热更新：即使本次注册被占用，下次启动仍按用户意图重试。
+        let _ = self.persist();
+        self.worker.set_hotkey(name);
     }
 
     /// 处理主界面动作。
@@ -443,21 +480,21 @@ impl eframe::App for DeltaApp {
             return;
         }
         if self.settings_open {
-            // 借用拆分：hotkey 读、buffer 写，用 mem::take 避开同结构双借用。
+            let now = ctx.input(|input| input.time);
+            // 冲突提示到期即消失：每帧结算一次，视图只拿到结果。
+            let conflict = self.state.hotkey_conflict_text(now).map(str::to_owned);
             let hotkey_text = self.state.hotkey.clone();
             let hotkey_editing = self.state.hotkey_editing;
-            let mut buffer = std::mem::take(&mut self.state.hotkey_buffer);
             let action = delta_ui::view::settings_panel(
                 ui,
                 delta_ui::view::SettingsView {
                     hotkey: &hotkey_text,
                     hotkey_editing,
-                    hotkey_buffer: &mut buffer,
+                    hotkey_conflict: conflict.as_deref(),
                     ocr_enabled: self.snapshot().ocr_enabled,
                     config_path: &self.config_path.display().to_string(),
                 },
             );
-            self.state.hotkey_buffer = buffer;
             match action {
                 Some(delta_ui::view::SettingsAction::Probe) => {
                     self.settings_open = false;
@@ -471,20 +508,14 @@ impl eframe::App for DeltaApp {
                 }
                 Some(delta_ui::view::SettingsAction::EditHotkey) => {
                     self.state.hotkey_editing = true;
-                    self.state.hotkey_buffer = self.state.hotkey.clone();
+                    self.state.dismiss_hotkey_conflict();
                 }
-                Some(delta_ui::view::SettingsAction::CommitHotkey) => {
+                Some(delta_ui::view::SettingsAction::CancelHotkey) => {
                     self.state.hotkey_editing = false;
-                    let name = self.state.hotkey_buffer.trim().to_owned();
-                    if !name.is_empty() {
-                        if let Ok(mut config) = self.config.lock() {
-                            config.hotkeys.scene = name.clone();
-                        }
-                        // 热更新：改完立刻生效，不用重启。
-                        self.worker.set_hotkey(name.clone());
-                        self.state.hotkey = name;
-                        let _ = self.persist();
-                    }
+                }
+                Some(delta_ui::view::SettingsAction::CommitHotkey(chord)) => {
+                    self.state.hotkey_editing = false;
+                    self.commit_hotkey(chord);
                 }
                 Some(delta_ui::view::SettingsAction::Close) => self.settings_open = false,
                 None => {}

@@ -155,27 +155,191 @@ pub fn activate_existing_app(title: &str) -> bool {
     }
 }
 
-/// 热键名 → `Hotkey`。支持 `F1..F24`、`A..Z`、`0..9`（大小写不敏感）。
+/// 修饰键位（与 Win32 `MOD_ALT` / `MOD_CONTROL` / `MOD_SHIFT` 同值，注册时直接按位或）。
+pub const MOD_ALT: u32 = 0x1;
+pub const MOD_CONTROL: u32 = 0x2;
+pub const MOD_SHIFT: u32 = 0x4;
+
+/// 键名 → 虚拟键码的**唯一词汇表**（spec D1 的可用键集合）。
 ///
-/// 配置文件里存的是 `"F8"` 这样的短名（`delta-config::Hotkeys`），本函数是唯一解析点：
-/// 解析不出来就回落到 spec D6 的默认 F8，绝不 panic。
-pub fn parse_hotkey(name: &str) -> Hotkey {
-    let name = name.trim().to_ascii_uppercase();
-    if let Some(digits) = name.strip_prefix('F') {
-        if let Ok(index) = digits.parse::<u32>() {
-            if (1..=24).contains(&index) {
-                // F1 = 0x70，F24 = 0x87。
-                return Hotkey::plain(0x70 + index - 1);
-            }
+/// `delta_ui::state::CAPTURABLE` 是同一套短名的 egui 侧映射，
+/// `capturable_vocabulary_matches_the_parser` 用例把两张表钉在一起。
+pub const KEY_TABLE: [(&str, u32); 71] = [
+    ("F1", 0x70),
+    ("F2", 0x71),
+    ("F3", 0x72),
+    ("F4", 0x73),
+    ("F5", 0x74),
+    ("F6", 0x75),
+    ("F7", 0x76),
+    ("F8", 0x77),
+    ("F9", 0x78),
+    ("F10", 0x79),
+    ("F11", 0x7A),
+    ("F12", 0x7B),
+    ("F13", 0x7C),
+    ("F14", 0x7D),
+    ("F15", 0x7E),
+    ("F16", 0x7F),
+    ("F17", 0x80),
+    ("F18", 0x81),
+    ("F19", 0x82),
+    ("F20", 0x83),
+    ("F21", 0x84),
+    ("F22", 0x85),
+    ("F23", 0x86),
+    ("F24", 0x87),
+    ("A", 0x41),
+    ("B", 0x42),
+    ("C", 0x43),
+    ("D", 0x44),
+    ("E", 0x45),
+    ("F", 0x46),
+    ("G", 0x47),
+    ("H", 0x48),
+    ("I", 0x49),
+    ("J", 0x4A),
+    ("K", 0x4B),
+    ("L", 0x4C),
+    ("M", 0x4D),
+    ("N", 0x4E),
+    ("O", 0x4F),
+    ("P", 0x50),
+    ("Q", 0x51),
+    ("R", 0x52),
+    ("S", 0x53),
+    ("T", 0x54),
+    ("U", 0x55),
+    ("V", 0x56),
+    ("W", 0x57),
+    ("X", 0x58),
+    ("Y", 0x59),
+    ("Z", 0x5A),
+    ("0", 0x30),
+    ("1", 0x31),
+    ("2", 0x32),
+    ("3", 0x33),
+    ("4", 0x34),
+    ("5", 0x35),
+    ("6", 0x36),
+    ("7", 0x37),
+    ("8", 0x38),
+    ("9", 0x39),
+    ("Space", 0x20),
+    ("Insert", 0x2D),
+    ("Delete", 0x2E),
+    ("Home", 0x24),
+    ("End", 0x23),
+    ("PageUp", 0x21),
+    ("PageDown", 0x22),
+    ("ArrowUp", 0x26),
+    ("ArrowDown", 0x28),
+    ("ArrowLeft", 0x25),
+    ("ArrowRight", 0x27),
+];
+
+/// 热键写法解析失败的原因。**每一种失败都必须显形**，不允许静默回落（spec D3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyParseError {
+    /// 空串或只有空白。
+    Empty,
+    /// 不认识的主键名（`sb250` / `F99` / `Win` / `Hyper`）。
+    UnknownKey,
+    /// 修饰键位写了主键名（`F9+Ctrl`）—— 顺序写反了，是非法写法而非可纠正的笔误。
+    UnknownModifier,
+    /// 只有修饰键，没有主键（`Ctrl` / `Ctrl+Alt`）。
+    NoMainKey,
+}
+
+impl std::fmt::Display for HotkeyParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::Empty => "热键为空",
+            Self::UnknownKey => "热键里有不认识的键名",
+            Self::UnknownModifier => "修饰键要写在主键前面",
+            Self::NoMainKey => "热键缺少主键",
+        };
+        f.write_str(text)
+    }
+}
+
+impl std::error::Error for HotkeyParseError {}
+
+/// 修饰键短名 → 位；不是修饰键返回 `None`。
+fn modifier_bit(token: &str) -> Option<u32> {
+    if token.eq_ignore_ascii_case("Ctrl") || token.eq_ignore_ascii_case("Control") {
+        return Some(MOD_CONTROL);
+    }
+    if token.eq_ignore_ascii_case("Alt") {
+        return Some(MOD_ALT);
+    }
+    if token.eq_ignore_ascii_case("Shift") {
+        return Some(MOD_SHIFT);
+    }
+    None
+}
+
+/// 主键短名 → 虚拟键码（大小写不敏感）。
+fn key_code(token: &str) -> Option<u32> {
+    KEY_TABLE
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(token))
+        .map(|(_, code)| *code)
+}
+
+/// 热键写法 → `Hotkey`。支持 `Ctrl`/`Alt`/`Shift` 任意组合 + 一个主键（spec D1）。
+///
+/// 配置文件里存的是 `"Ctrl+Shift+A"` 这样的规范短名，本函数是唯一解析点。
+/// **失败返回 `Err`，绝不回落 F8** —— 回落只允许发生在启动读配置那一处（D3）。
+pub fn parse_hotkey(name: &str) -> Result<Hotkey, HotkeyParseError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(HotkeyParseError::Empty);
+    }
+    let tokens: Vec<&str> = trimmed.split('+').map(str::trim).collect();
+    // 空槽（`Ctrl+` / `Ctrl++A`）说明主键位没给出来。
+    if tokens.iter().any(|token| token.is_empty()) {
+        return Err(HotkeyParseError::NoMainKey);
+    }
+    // 全是修饰键 = 没有主键（纯修饰键不构成热键，D1 显式边界）。
+    if tokens.iter().all(|token| modifier_bit(token).is_some()) {
+        return Err(HotkeyParseError::NoMainKey);
+    }
+    let (main, modifiers) = tokens.split_last().ok_or(HotkeyParseError::NoMainKey)?;
+    let mut bits = 0;
+    for token in modifiers {
+        match modifier_bit(token) {
+            Some(bit) => bits |= bit,
+            // 修饰键位写了已知主键 → 顺序写反；不认识的词 → 压根不是键名。
+            None if key_code(token).is_some() => return Err(HotkeyParseError::UnknownModifier),
+            None => return Err(HotkeyParseError::UnknownKey),
         }
     }
-    let mut characters = name.chars();
-    if let (Some(single), None) = (characters.next(), characters.next()) {
-        if single.is_ascii_alphanumeric() {
-            return Hotkey::plain(single as u32);
+    let code = key_code(main).ok_or(HotkeyParseError::UnknownKey)?;
+    Ok(Hotkey::new(code, bits))
+}
+
+/// `Hotkey` → 规范写法：固定 `Ctrl+Alt+Shift+主键` 顺序（spec D1）。
+///
+/// 词汇表外的虚拟键码显形为 `0x6A`，**不得**假装成某个已知键。
+pub fn format_hotkey(hotkey: &Hotkey) -> String {
+    let main = KEY_TABLE
+        .iter()
+        .find(|(_, code)| *code == hotkey.vk)
+        .map_or_else(|| format!("0x{:02X}", hotkey.vk), |(name, _)| (*name).to_owned());
+    let mut text = String::new();
+    for (bit, label) in [
+        (MOD_CONTROL, "Ctrl"),
+        (MOD_ALT, "Alt"),
+        (MOD_SHIFT, "Shift"),
+    ] {
+        if hotkey.modifiers & bit != 0 {
+            text.push_str(label);
+            text.push('+');
         }
     }
-    Hotkey::default()
+    text.push_str(&main);
+    text
 }
 
 #[cfg(test)]
@@ -242,8 +406,8 @@ mod tests {
     #[test]
     fn every_table_entry_round_trips() {
         for (name, vk) in KEY_TABLE {
-            assert_eq!(parse_hotkey(name), Ok(Hotkey::plain(*vk)), "{name}");
-            let hotkey = Hotkey::new(*vk, MOD_CONTROL | MOD_SHIFT);
+            assert_eq!(parse_hotkey(name), Ok(Hotkey::plain(vk)), "{name}");
+            let hotkey = Hotkey::new(vk, MOD_CONTROL | MOD_SHIFT);
             assert_eq!(format_hotkey(&hotkey), format!("Ctrl+Shift+{name}"));
             assert_eq!(parse_hotkey(&format_hotkey(&hotkey)), Ok(hotkey));
         }
@@ -268,7 +432,7 @@ mod tests {
         // ui 侧负责 egui::Key → 短名，本文件负责短名 → 虚拟键码。
         // 这条用例把两张表钉在一起：任何一张漂移都会红。
         for (name, key) in delta_ui::state::CAPTURABLE {
-            let chord = delta_ui::state::KeyChord::capture(*key, egui::Modifiers::default())
+            let chord = delta_ui::state::KeyChord::capture(key, egui::Modifiers::default())
                 .unwrap_or_else(|| panic!("{name} 必须可捕获"));
             assert_eq!(chord.label(), name, "捕获结果必须用同一套短名");
             let hotkey =

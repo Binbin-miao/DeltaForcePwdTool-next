@@ -276,6 +276,44 @@ pub fn conflict_copy(kept: Option<&str>) -> String {
     }
 }
 
+/// 捕获态下，一帧事件流的判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureOutcome {
+    /// 还没按到能构成热键的键 —— 继续等，既不提交也不取消。
+    Pending,
+    /// 无修饰的 `Esc`：只取消捕获，不关面板（D4）。
+    Cancel,
+    /// 捕获到一个可提交的组合。
+    Commit(KeyChord),
+}
+
+/// 从一帧 egui 事件流里读出捕获结果。
+///
+/// 只认「新按下、非长按重复」的键事件：长按会刷出一串重复事件，若照单全收
+/// 会在用户还没松手时连提交好几次。不可捕获的键（含纯修饰键）一律忽略并继续等待 ——
+/// 用户按 Ctrl 之后紧接着按 F9，中间那一拍 Ctrl 不该被当成「无效键」把捕获踢掉。
+pub fn read_capture(events: &[egui::Event]) -> CaptureOutcome {
+    for event in events {
+        let egui::Event::Key {
+            key,
+            pressed: true,
+            repeat: false,
+            modifiers,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if *key == egui::Key::Escape && modifier_bits(*modifiers) == 0 {
+            return CaptureOutcome::Cancel;
+        }
+        if let Some(chord) = KeyChord::capture(*key, *modifiers) {
+            return CaptureOutcome::Commit(chord);
+        }
+    }
+    CaptureOutcome::Pending
+}
+
 /// 换分辨率警示文案（≤10 字、动词开头、零技术词）。
 ///
 /// 语义：百分比坐标仍然有效，但绝对像素会偏移 —— 建议重跑一次校准。
@@ -731,10 +769,95 @@ mod tests {
         assert_eq!(keys.len(), CAPTURABLE.len(), "同一个键不得映射到两个短名");
     }
 
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn capture_commits_supported_keys_and_cancels_only_on_bare_escape() {
+        let plain = egui::Modifiers::default();
+        assert_eq!(
+            read_capture(&[key_event(egui::Key::F9, plain)]),
+            CaptureOutcome::Commit(KeyChord::capture(egui::Key::F9, plain).expect("F9 可捕获"))
+        );
+        // 无修饰的 Esc 只取消捕获（D4），面板是否关掉由视图决定。
+        assert_eq!(
+            read_capture(&[key_event(egui::Key::Escape, plain)]),
+            CaptureOutcome::Cancel
+        );
+        // Ctrl+Esc 不是「取消」—— 它是一个合法的组合键，必须能被捕获。
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::default()
+        };
+        assert_eq!(
+            read_capture(&[key_event(egui::Key::Escape, ctrl)]),
+            CaptureOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn capture_keeps_waiting_on_unsupported_keys_and_modifier_only_presses() {
+        let plain = egui::Modifiers::default();
+        // 不可捕获的键：忽略并继续等，绝不取消（否则按错一下就掉出捕获态）。
+        assert_eq!(
+            read_capture(&[key_event(egui::Key::Slash, plain)]),
+            CaptureOutcome::Pending
+        );
+        // 纯修饰键只产生 `ModifiersChanged`，不构成热键（D1 显式边界）。
+        assert_eq!(
+            read_capture(&[egui::Event::ModifiersChanged(egui::Modifiers {
+                ctrl: true,
+                ..egui::Modifiers::default()
+            })]),
+            CaptureOutcome::Pending
+        );
+        // 长按重复事件必须忽略，否则一次长按会连提交好几次。
+        assert_eq!(
+            read_capture(&[egui::Event::Key {
+                key: egui::Key::F9,
+                physical_key: None,
+                pressed: true,
+                repeat: true,
+                modifiers: plain,
+            }]),
+            CaptureOutcome::Pending
+        );
+        assert_eq!(read_capture(&[]), CaptureOutcome::Pending);
+    }
+
+    #[test]
+    fn capture_reads_the_modifier_combination_from_the_same_event() {
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..egui::Modifiers::default()
+        };
+        match read_capture(&[key_event(egui::Key::J, ctrl_shift)]) {
+            CaptureOutcome::Commit(chord) => {
+                assert_eq!(chord.label(), "Ctrl+Shift+J");
+                assert_eq!(
+                    chord.modifiers(),
+                    CHORD_MOD_CONTROL | CHORD_MOD_SHIFT,
+                    "修饰键位必须与 Win32 MOD_* 同值"
+                );
+            }
+            other => panic!("必须捕获成组合键，实际 {other:?}"),
+        }
+    }
+
     #[test]
     fn hotkey_conflict_expires_and_never_touches_the_current_hotkey() {
-        let mut state = UiState::default();
-        state.hotkey = "F9".to_owned();
+        let mut state = UiState {
+            hotkey: "F9".to_owned(),
+            ..UiState::default()
+        };
         assert_eq!(state.hotkey_conflict_text(0.0), None, "默认不打扰用户");
 
         state.show_hotkey_conflict(conflict_copy(Some("F9")), 10.0);

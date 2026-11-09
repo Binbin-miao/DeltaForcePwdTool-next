@@ -6,7 +6,7 @@
 use delta_geom::PctRect;
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
-use crate::state::{Action, Phase, UiState};
+use crate::state::{read_capture, Action, CaptureOutcome, KeyChord, Phase, UiState};
 use crate::theme;
 use crate::wizard::{Step, Verdict, Wizard, WizardScene};
 
@@ -871,10 +871,10 @@ fn dashed_pct_rect(painter: &egui::Painter, stage: Rect, rect: PctRect, color: C
 /// 设置浮层素材（v1 只暴露三项：热键、OCR 兜底、配置路径）。
 pub struct SettingsView<'a> {
     pub hotkey: &'a str,
-    /// 是否正在编辑热键（编辑态显示输入框）。
+    /// 是否正在捕获新热键（捕获态只显示提示，没有任何文本输入框）。
     pub hotkey_editing: bool,
-    /// 热键输入缓冲。
-    pub hotkey_buffer: &'a mut String,
+    /// 热键冲突提示文案（`None` = 不显示）。
+    pub hotkey_conflict: Option<&'a str>,
     pub ocr_enabled: bool,
     pub config_path: &'a str,
 }
@@ -885,17 +885,43 @@ pub enum SettingsAction {
     /// 只读检查游戏与场景，不产生任何输入。
     Probe,
     ToggleOcr,
-    /// 点热键行 → 进入编辑态。
+    /// 点热键行 → 进入捕获态。
     EditHotkey,
-    /// 编辑态回车 → 提交新热键（调用方校验后写配置并热更新）。
-    CommitHotkey,
+    /// 捕获成功 → 提交这一组键（调用方格式化后写配置并热更新）。
+    CommitHotkey(KeyChord),
+    /// 捕获态下 Esc / 点热键行外 → 只退出捕获，不关面板（D4）。
+    CancelHotkey,
     Close,
+}
+
+/// 捕获态的一帧结算：可捕获键提交、Esc 或点行外取消、其余继续等。
+fn resolve_capture(ui: &egui::Ui, editing: bool, hotkey_row: Rect) -> Option<SettingsAction> {
+    if !editing {
+        return None;
+    }
+    match read_capture(&ui.input(|input| input.events.clone())) {
+        CaptureOutcome::Commit(chord) => return Some(SettingsAction::CommitHotkey(chord)),
+        CaptureOutcome::Cancel => return Some(SettingsAction::CancelHotkey),
+        CaptureOutcome::Pending => {}
+    }
+    let clicked_outside = ui.input(|input| {
+        input.pointer.any_click()
+            && input
+                .pointer
+                .interact_pos()
+                .is_some_and(|position| !hotkey_row.contains(position))
+    });
+    if clicked_outside {
+        return Some(SettingsAction::CancelHotkey);
+    }
+    None
 }
 
 /// 设置浮层（覆在主界面上，不新开窗口）。
 pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<SettingsAction> {
     let mut action = None;
-    if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
+    // D4：捕获态下 Esc 只取消捕获 —— 所以「Esc 关面板」必须先排除捕获态。
+    if !view.hotkey_editing && ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
         action = Some(SettingsAction::Close);
     }
     let full = ui.max_rect();
@@ -923,47 +949,54 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
         theme::text(theme::FONT_BODY),
         theme::TEXT_2,
     );
+    // 捕获结算先于既有控件：这一帧的按键/取消不会被按钮点击覆盖掉。
+    if action.is_none() {
+        action = resolve_capture(ui, view.hotkey_editing, hotkey_row);
+    }
     if view.hotkey_editing {
-        let field = Rect::from_min_max(
-            Pos2::new(
-                hotkey_row.left() + content.width() * 0.45,
-                hotkey_row.top() + theme::SPACE_XS,
-            ),
-            Pos2::new(
-                hotkey_row.right() - theme::SPACE_S,
-                hotkey_row.bottom() - theme::SPACE_XS,
-            ),
+        // 捕获态：只提示按键，绝不提供文本输入（spec D3 删自由输入）。
+        painter.text(
+            hotkey_row.left_center() + Vec2::new(content.width() * 0.45, 0.0),
+            Align2::LEFT_CENTER,
+            "请按下新热键…",
+            theme::text(theme::FONT_BODY),
+            theme::ACCENT,
         );
-        let response = ui.put(
-            field,
-            egui::TextEdit::singleline(view.hotkey_buffer)
-                .hint_text("F8 / Ctrl+F8")
-                .char_limit(16),
+        painter.text(
+            hotkey_row.right_center() - Vec2::new(theme::SPACE_M, 0.0),
+            Align2::RIGHT_CENTER,
+            "Esc 取消",
+            theme::text(theme::FONT_LABEL),
+            theme::TEXT_3,
         );
-        response.request_focus();
-        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-            action = Some(SettingsAction::CommitHotkey);
-        }
     } else {
         let response = ui.interact(
             hotkey_row,
             ui.scope_id().with("hotkey-row"),
             egui::Sense::click(),
         );
+        // 冲突态：右侧这一格换成红色冲突文案（文案里已含「仍为 F8」，旧键信息不丢），
+        // 行内本来就只有一个右槽位，改文案不新增元素、不挤压下方开关行。
+        let conflict = view.hotkey_conflict;
+        let (label, font, color) = match (conflict, response.hovered()) {
+            (Some(text), _) => (text.to_owned(), theme::text(theme::FONT_BODY), theme::ERR),
+            (None, true) => (
+                format!("{} · 点这里改", view.hotkey),
+                theme::mono(theme::FONT_BODY),
+                theme::ACCENT,
+            ),
+            (None, false) => (
+                view.hotkey.to_owned(),
+                theme::mono(theme::FONT_BODY),
+                theme::TEXT_1,
+            ),
+        };
         painter.text(
             hotkey_row.right_center() - Vec2::new(theme::SPACE_M, 0.0),
             Align2::RIGHT_CENTER,
-            if response.hovered() {
-                format!("{} · 点这里改", view.hotkey)
-            } else {
-                view.hotkey.to_owned()
-            },
-            theme::mono(theme::FONT_BODY),
-            if response.hovered() {
-                theme::ACCENT
-            } else {
-                theme::TEXT_1
-            },
+            label,
+            font,
+            color,
         );
         if response.clicked() {
             action = Some(SettingsAction::EditHotkey);
@@ -1036,6 +1069,109 @@ mod tests {
         assert!((back.y - original.y).abs() < 1e-4);
         assert!((back.w - original.w).abs() < 1e-4);
         assert!((back.h - original.h).abs() < 1e-4);
+    }
+
+    /// 在一帧里跑一次设置浮层，返回它给出的动作。
+    fn panel_action(
+        events: Vec<egui::Event>,
+        hotkey_editing: bool,
+        hotkey_conflict: Option<&str>,
+    ) -> Option<SettingsAction> {
+        let ctx = egui::Context::default();
+        let mut action = None;
+        let input = egui::RawInput {
+            events,
+            ..egui::RawInput::default()
+        };
+        ctx.run_ui(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = settings_panel(
+                    ui,
+                    SettingsView {
+                        hotkey: "F8",
+                        hotkey_editing,
+                        hotkey_conflict,
+                        ocr_enabled: true,
+                        config_path: "C:/cfg.toml",
+                    },
+                );
+            });
+        })
+        // 无后端可上传纹理：显式清空，别让 epaint 把「未消费的 delta」当成泄漏。
+        .textures_delta
+        .clear();
+        action
+    }
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn escape_while_capturing_cancels_without_closing_the_panel() {
+        // D4：捕获态下 Esc 只能退出捕获，绝不能落到「关闭设置面板」。
+        let action = panel_action(
+            vec![key_event(egui::Key::Escape, egui::Modifiers::default())],
+            true,
+            None,
+        );
+        assert_eq!(action, Some(SettingsAction::CancelHotkey));
+
+        // 非捕获态下 Esc 仍然是「关面板」，语义没被改坏。
+        let action = panel_action(
+            vec![key_event(egui::Key::Escape, egui::Modifiers::default())],
+            false,
+            None,
+        );
+        assert_eq!(action, Some(SettingsAction::Close));
+    }
+
+    #[test]
+    fn capturing_a_key_commits_the_chord_and_unsupported_keys_keep_waiting() {
+        let action = panel_action(
+            vec![key_event(egui::Key::F9, egui::Modifiers::default())],
+            true,
+            None,
+        );
+        match action {
+            Some(SettingsAction::CommitHotkey(chord)) => assert_eq!(chord.label(), "F9"),
+            other => panic!("按 F9 必须提交 F9，实际 {other:?}"),
+        }
+
+        // 不可捕获的键不提交也不取消；纯修饰键同理。
+        assert_eq!(
+            panel_action(
+                vec![key_event(egui::Key::Slash, egui::Modifiers::default())],
+                true,
+                None
+            ),
+            None,
+            "按 / 必须继续等待"
+        );
+        assert_eq!(
+            panel_action(
+                vec![egui::Event::ModifiersChanged(egui::Modifiers {
+                    ctrl: true,
+                    ..egui::Modifiers::default()
+                })],
+                true,
+                None
+            ),
+            None,
+            "只按 Ctrl 不构成热键"
+        );
+    }
+
+    #[test]
+    fn panel_renders_a_conflict_line_without_taking_the_click() {
+        // 冲突提示只影响绘制；此时点热键行仍是「进入捕获」，语义不变。
+        assert_eq!(panel_action(Vec::new(), false, Some("热键冲突 · 仍为 F8")), None);
     }
 
     #[test]
