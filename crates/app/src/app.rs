@@ -480,8 +480,8 @@ impl DeltaApp {
     ///
     /// **要么全存、要么不存**：WGC 在静态画面（暂停/加载/菜单）下可能只出第一帧，
     /// 后面各格全抓不到；残缺模板会让后续识别一直失败且原因难查，所以格数不齐时
-    /// 直接中止并出提示，不落半份模板。写盘同理：任一格写失败就删掉本次已写出的所有格
-    /// —— 零字节/截断的 PNG 比没有 PNG 更坏，它会安静地把识别带偏。
+    /// 直接中止并出提示，不落半份模板。写盘同理：[`persist_cell_pngs`] 先把九格写成
+    /// `.tmp`，全部成功后才 rename 换名 —— 任何一步失败都不会碰到目录里原有的模板。
     fn save_template_cells(&mut self) {
         let Some(wizard) = self.wizard.as_ref() else {
             return;
@@ -506,17 +506,9 @@ impl DeltaApp {
             self.state.notice = Some(notice);
             return;
         }
-        let mut written: Vec<PathBuf> = Vec::with_capacity(captured.frames.len());
-        for (index, frame) in captured.frames {
-            let path = dir.join(format!("{}.png", index + 1));
-            if write_cell_png(&path, &frame.luma()).is_err() {
-                // 这一格可能已经建出空文件或半截文件，单独删掉；之前写成的整格由 clear 收。
-                let _ = std::fs::remove_file(&path);
-                discard_cells(&written);
-                self.state.notice = Some(NOTICE_TEMPLATE_WRITE_FAILED.to_owned());
-                return;
-            }
-            written.push(path);
+        if let Err(reason) = persist_cell_pngs(&dir, &captured.frames) {
+            eprintln!("[templates] 模板落盘失败：{reason}");
+            self.state.notice = Some(NOTICE_TEMPLATE_WRITE_FAILED.to_owned());
         }
     }
 
@@ -708,21 +700,65 @@ struct CellCapture {
     failed: Vec<usize>,
 }
 
-/// 抓帧不足时的用户提示；`None` 表示九格齐备、可以落盘。
+/// 缺格提示；`None` 表示九格齐备、可以落盘。
 ///
-/// 措辞必须是「一格都没存」：`save_template_cells` 在 `failed` 非空时**一张 PNG 都不写**，
+/// 措辞必须是「未保存」：`save_template_cells` 在缺格时**一张 PNG 都不写**，
 /// 说「只存下 n/9 格」会让用户以为手里还有 n 格可用模板，实际后续识别全失败。
 fn incomplete_cells_notice(captured: &CellCapture) -> Option<String> {
     if captured.failed.is_empty() {
         return None;
     }
+    if captured.frames.is_empty() {
+        // 「一帧都没抓到」（设备/窗口异常）与「静态画面只出首帧」是两种不同的故障，
+        // 排查方向完全不同，不能共用一句「缺 9 格」。
+        return Some(format!("一帧都没抓到，未保存（{}/9 格失败）", captured.failed.len()));
+    }
     Some(format!("缺 {} 格，未保存", captured.failed.len()))
+}
+
+/// 模板目录里的正式文件名：`<序号>.png`。
+fn cell_path(dir: &Path, index: usize) -> PathBuf {
+    dir.join(format!("{}.png", index + 1))
+}
+
+/// 单格写盘的临时文件名：九格全部写成 `.tmp` 后才统一 rename 成 [`cell_path`]。
+fn cell_tmp_path(dir: &Path, index: usize) -> PathBuf {
+    dir.join(format!("{}.png.tmp", index + 1))
+}
+
+/// 把九格写进模板目录：**先全部写 `.tmp`，九格都成功后再逐个 rename 落定**。
+///
+/// 两阶段的原因：`File::create` 正式名会就地截断旧模板。若第 5 格写失败，
+/// `1..4.png` 已是新图、`5..9.png` 还是旧图 —— 目录里照样九张齐全，`loading.rs`
+/// 按连续前缀零警告接受，新旧混合的模板会静默生效，正是最坏的残份。
+/// 所以所有可能失败的动作（写 PNG、`finish` 刷 IEND）都排在 rename 之前；
+/// rename 只做不带数据写入的换名，旧模板在那一刻才被替换。
+fn persist_cell_pngs(
+    dir: &Path,
+    cells: &[(usize, delta_capture::Frame)],
+) -> Result<(), String> {
+    for (index, frame) in cells {
+        if let Err(reason) = write_cell_png(&cell_tmp_path(dir, *index), &frame.luma()) {
+            discard_cell_temps(dir, cells);
+            return Err(reason);
+        }
+    }
+    for (index, _) in cells {
+        let (temp, target) = (cell_tmp_path(dir, *index), cell_path(dir, *index));
+        if let Err(error) = std::fs::rename(&temp, &target) {
+            // 未 rename 的 `.tmp` 清掉；已经落定的格**不删** —— 那是新且可解码的整格，
+            // 删掉才是真丢数据。
+            discard_cell_temps(dir, cells);
+            return Err(format!("{target:?}: {error}"));
+        }
+    }
+    Ok(())
 }
 
 /// 把一格灰度帧写成 PNG；任一步失败都返回 `Err`，由调用方统一清场。
 ///
 /// 单独成函数是为了让「写失败必须显形」这件事有单一落点：不在这里 `continue`，
-/// 也不要让 `write_image_data` 的返回值被丢掉。
+/// 也不要让 `write_image_data` / `finish` 的返回值被丢掉。
 fn write_cell_png(path: &Path, gray: &delta_vision::GrayImage) -> Result<(), String> {
     let file = std::fs::File::create(path).map_err(|error| format!("{path:?}: {error}"))?;
     let mut encoder = png::Encoder::new(file, gray.w, gray.h);
@@ -733,13 +769,17 @@ fn write_cell_png(path: &Path, gray: &delta_vision::GrayImage) -> Result<(), Str
         .map_err(|error| format!("{path:?}: {error}"))?;
     writer
         .write_image_data(gray.as_slice())
-        .map_err(|error| format!("{path:?}: {error}"))
+        .map_err(|error| format!("{path:?}: {error}"))?;
+    // png 0.17 的 `Writer::drop` 不写 IEND 块，不 finish 的 PNG 可能不完整。
+    writer.finish().map_err(|error| format!("{path:?}: {error}"))
 }
 
-/// 删掉本次已写出的格（删不掉就忽略：尽力不留残份，不为此再堆一层提示）。
-fn discard_cells(paths: &[PathBuf]) {
-    for path in paths {
-        let _ = std::fs::remove_file(path);
+/// 删掉本次产生的 `.tmp` 残份（删不掉就忽略：尽力不留残份，不为此再堆一层提示）。
+///
+/// 只碰 `.tmp`：正式 `<序号>.png` 一律不动，用户原有的模板必须绝对安全。
+fn discard_cell_temps(dir: &Path, cells: &[(usize, delta_capture::Frame)]) {
+    for (index, _) in cells {
+        let _ = std::fs::remove_file(cell_tmp_path(dir, *index));
     }
 }
 
@@ -1045,30 +1085,113 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_failed_cell_write_is_reported_and_the_written_cells_are_removed() {
-        // 「要么全存、要么不存」在写盘侧的落点：写失败必须能被看见，且已写出的格要被删掉，
-        // 不能留下零字节/截断的 PNG 去把后续识别安静地带偏。
-        let root = std::env::temp_dir().join(format!("delta-pwd-cells-{}", std::process::id()));
+    /// 落盘测试专用临时目录。
+    fn cells_scratch_dir(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "delta-pwd-cells-{tag}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("临时目录可建");
-        let first = root.join("1.png");
-        let gray = delta_capture::Frame::new(2, 2, vec![0; 2 * 2 * 4], Instant::now())
-            .expect("测试帧长度正确")
-            .luma();
+        root
+    }
 
-        assert_eq!(write_cell_png(&first, &gray), Ok(()), "正常路径要写得出来");
-        assert!(first.is_file(), "写成功就必须有文件");
+    /// 九格样本：每格尺寸与像素值都不同，读回时才能分辨「串格」与「整片同值」。
+    fn sample_cells(count: usize) -> Vec<(usize, delta_capture::Frame)> {
+        (0..count)
+            .map(|index| {
+                let (w, h) = (3 + index as u32, 2 + index as u32);
+                let value = (index as u8 + 1) * 10;
+                let frame = delta_capture::Frame::new(
+                    w,
+                    h,
+                    vec![value; (w * h * 4) as usize],
+                    Instant::now(),
+                )
+                .expect("测试帧长度正确");
+                (index, frame)
+            })
+            .collect()
+    }
 
-        let orphan = root.join("no-such-dir/2.png");
+    #[test]
+    fn saved_cells_round_trip_through_the_template_decoder() {
+        // 写盘测试必须**读回来**：只断言文件存在的话，缺 IEND 的残断 PNG 也能让用例变绿。
+        // 这里用模板库自己的解码器（`loading.rs::decode_png_gray`）逐格读回，
+        // 尺寸与像素都要原样复原 —— 这条同时守住「写完必须 finish」。
+        let root = cells_scratch_dir("roundtrip");
+        let cells = sample_cells(9);
+        assert_eq!(persist_cell_pngs(&root, &cells), Ok(()), "九格必须全部落盘");
+
+        for (index, frame) in &cells {
+            let path = root.join(format!("{}.png", index + 1));
+            let decoded = delta_templates::decode_png_gray(&path)
+                .unwrap_or_else(|error| panic!("{} 必须能被模板库解码：{error}", path.display()));
+            assert_eq!((decoded.w, decoded.h), (frame.w, frame.h), "尺寸必须原样复原");
+            assert_eq!(
+                decoded.as_slice(),
+                frame.luma().as_slice(),
+                "像素必须原样复原（第 {index} 格不许串格）"
+            );
+            assert!(
+                !root.join(format!("{}.png.tmp", index + 1)).exists(),
+                "落定后不许留 .tmp"
+            );
+        }
+
+        let gray = cells[0].1.luma();
         assert!(
-            write_cell_png(&orphan, &gray).is_err(),
+            write_cell_png(&root.join("no-such-dir/2.png"), &gray).is_err(),
             "父目录不存在时必须返回错误，不能静默吞掉"
         );
-
-        discard_cells(std::slice::from_ref(&first));
-        assert!(!first.exists(), "失败清场必须删掉本次已写出的格");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_cell_write_leaves_every_existing_template_untouched() {
+        // 崩溃现场：直接覆盖写正式名时，第 5 格失败会留下「1-4 新、5-9 旧」的九张齐全目录，
+        // `loading.rs` 按连续前缀零警告接受 —— 新旧混合模板静默生效，比没有 PNG 更坏。
+        // 这里把第 5 格写盘逼失败，断言原有九张**一张都没被截断**，且清理只清 `.tmp`。
+        let root = cells_scratch_dir("atomic");
+        let old = delta_vision::GrayImage::filled(2, 2, 7).expect("合法图");
+        for index in 0..9 {
+            write_cell_png(&cell_path(&root, index), &old).expect("旧模板先落盘");
+        }
+        // 第 5 格的 `.tmp` 位置被一个目录占住：Windows 下 `File::create` 必失败。
+        std::fs::create_dir_all(cell_tmp_path(&root, 4)).expect("占位目录可建");
+
+        let error = persist_cell_pngs(&root, &sample_cells(9)).expect_err("写不进去必须报错");
+        assert!(error.contains("5.png.tmp"), "错误必须点名是哪一格：{error}");
+
+        for index in 0..9 {
+            let path = cell_path(&root, index);
+            let decoded = delta_templates::decode_png_gray(&path)
+                .unwrap_or_else(|error| panic!("{} 必须完好：{error}", path.display()));
+            assert!(
+                decoded.as_slice().iter().all(|&value| value == 7),
+                "{index} 号旧模板被截断覆盖了"
+            );
+        }
+        for index in 0..4 {
+            assert!(
+                !cell_tmp_path(&root, index).exists(),
+                "失败清场必须删掉本次写的 .tmp"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn zero_frames_are_reported_differently_from_a_partial_capture() {
+        // 「一帧都没抓到」（设备/窗口异常）与「静态画面只出首帧」排查方向完全不同，
+        // 提示必须能分辨；两者都不保存。
+        let monitor = monitor(2560, 1440);
+        let boxes = delta_config::builtin::candidate_boxes();
+        let captured = capture_cells(&boxes, monitor, |_| Err("WGC 未取到首帧".to_owned()));
+        assert!(captured.frames.is_empty(), "抓帧全失败时不该有帧");
+        let notice = incomplete_cells_notice(&captured).expect("零帧必须提示");
+        assert!(notice.contains("一帧都没抓到"), "{notice}");
+        assert!(notice.contains("未保存"), "{notice}");
     }
 
     #[test]
