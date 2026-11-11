@@ -1460,7 +1460,7 @@ pub fn settings_panel(
         false,
         pal,
     );
-    let field = row_slot(rows.keywords, content.width() * 0.45);
+    let field = hit(row_slot(rows.keywords, content.width() * 0.45));
     let response = ui.put(
         field,
         egui::TextEdit::singleline(&mut *view.keywords).hint_text("三角洲, Delta Force"),
@@ -2149,7 +2149,7 @@ mod tests {
                                         f_key_hook: true,
                                         keywords: &mut keywords,
                                     },
-                                    &*theme::palette(theme_id),
+                                    theme::palette(theme_id),
                                 );
                             });
                     })
