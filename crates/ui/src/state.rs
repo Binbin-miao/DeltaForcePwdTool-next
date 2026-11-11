@@ -5,9 +5,9 @@
 
 use egui::Color32;
 
-use crate::theme;
+use crate::theme::{self, Palette};
 
-pub use delta_config::CaptureBackend;
+pub use delta_config::{CaptureBackend, ThemeId};
 
 /// 场景（与 `delta-scene::Scene` 一一对应，UI 侧不反向依赖业务 crate）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,30 +58,24 @@ impl Phase {
     }
 
     /// 状态点 / 描边用的状态色。
-    pub fn color(self) -> Color32 {
+    pub fn color(self, pal: &Palette) -> Color32 {
         match self {
-            Self::Idle => theme::TEXT_3,
-            Self::Running => theme::ACCENT,
-            Self::Success => theme::OK,
-            Self::Unrecognized => theme::WARN,
-            Self::TimedOut => theme::ERR,
+            Self::Idle => pal.text_3,
+            Self::Running => pal.accent,
+            Self::Success => pal.ok,
+            Self::Unrecognized => pal.warn,
+            Self::TimedOut => pal.err,
         }
     }
 
-    /// 主按钮文案。
-    pub fn primary_label(self, hotkey: &str) -> String {
+    /// 结果区五态（`ui-themes.md` §3.4）：运行中 = Loading，未识别 = Partial，超时 = Error。
+    pub fn result_state(self) -> ResultState {
         match self {
-            Self::Idle => format!("开始识别  {hotkey}"),
-            Self::Running => "取消操作".to_owned(),
-            Self::Success | Self::Unrecognized | Self::TimedOut => "重新识别".to_owned(),
-        }
-    }
-
-    /// 主按钮动作。
-    pub fn primary_action(self) -> Action {
-        match self {
-            Self::Idle | Self::Success | Self::Unrecognized | Self::TimedOut => Action::Start,
-            Self::Running => Action::Cancel,
+            Self::Idle => ResultState::Idle,
+            Self::Running => ResultState::Loading,
+            Self::Success => ResultState::Success,
+            Self::Unrecognized => ResultState::Partial,
+            Self::TimedOut => ResultState::Error,
         }
     }
 
@@ -117,6 +111,148 @@ impl Phase {
     }
 }
 
+/// 结果区五态（`ui-themes.md` §3.4）。与 [`Phase`] 一一对应但语义独立：
+/// 「未识别」在界面上的表现是 **Partial（带警告描边 + 核对提示）**，不是纯错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultState {
+    /// 空闲：**不画空卡**，只一行「就绪 · 按 F8 开始」。
+    Idle,
+    /// 识别中：保留上一结果 + 实测进度（禁止假进度）。
+    Loading,
+    /// 成功：结果区 1px `ok` 描边。
+    Success,
+    /// 部分成功：`warn` 描边 + 「识别可能有误，请核对」。
+    Partial,
+    /// 失败：`err` 描边 + 人话原因 + 重试链。
+    Error,
+}
+
+impl ResultState {
+    /// 结果区描边色（`None` = 不画描边）。
+    pub fn border(self, pal: &Palette) -> Option<Color32> {
+        match self {
+            Self::Idle | Self::Loading => None,
+            Self::Success => Some(pal.ok),
+            Self::Partial => Some(pal.warn),
+            Self::Error => Some(pal.err),
+        }
+    }
+}
+
+/// 结果区的三场景内容（spec D2b：摩斯 / 指纹 / 操作台**共用**一块结果区）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResultContent {
+    /// 主内容（26px 等宽）：`4 2 7` / `1 → 3 → 5` / `01 · 00 · 01 · 11`。
+    pub headline: String,
+    /// 右下状态标签（12px）：`已输入` / `已点击` / `已拖 3/4 列`。
+    pub tag: String,
+}
+
+impl ResultContent {
+    pub fn new(headline: impl Into<String>, tag: impl Into<String>) -> Self {
+        Self {
+            headline: headline.into(),
+            tag: tag.into(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.headline.trim().is_empty() && self.tag.trim().is_empty()
+    }
+}
+
+/// 摩斯结果：把连续数字排成 26px 等宽可读的一行（`427` → `4 2 7`），
+/// 标签订正「自动下载开关」的真实后果（spec D2b）。
+pub fn morse_result(password: &str, auto_download: bool) -> ResultContent {
+    let digits: String = password.chars().filter(char::is_ascii_digit).collect();
+    let headline = if digits.is_empty() {
+        "—".to_owned()
+    } else {
+        digits
+            .chars()
+            .map(|digit| digit.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    ResultContent::new(
+        headline,
+        if auto_download {
+            "已输入"
+        } else {
+            "已识别·未输入"
+        },
+    )
+}
+
+/// 指纹结果：按模板号升序的点击顺序 `1 → 3 → 5`。
+pub fn fingerprint_result(order: &[u32], auto_click: bool) -> ResultContent {
+    let headline = if order.is_empty() {
+        "—".to_owned()
+    } else {
+        order
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" → ")
+    };
+    ResultContent::new(headline, if auto_click { "已点击" } else { "未点击" })
+}
+
+/// 操作台结果：目标序列（用户点名要保留的信息） + 已拖列数。
+pub fn console_result(sequence: Option<&str>, dragged: usize, total: usize) -> ResultContent {
+    let headline = sequence
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map_or_else(|| "—".to_owned(), format_sequence);
+    let total = if total == 0 { CONSOLE_TOTAL } else { total };
+    ResultContent::new(headline, format!("已拖 {dragged}/{total} 列"))
+}
+
+/// 操作台列数（spec D7：4 列 × 4 行）。
+pub const CONSOLE_TOTAL: usize = 4;
+
+/// 主按钮的四种形态（spec §3.4 的按钮谓词）。
+///
+/// **不满足条件时改文案、点击走修复动作**，绝不静默禁用 —— 一个点了没反应的按钮
+/// 比一个说明为什么不能点的按钮更让人困惑。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryState {
+    /// `已校准 && 至少一个开关为开`。
+    Ready,
+    /// 未校准 → 「先校准」→ 打开校准向导。
+    NeedsCalibration,
+    /// 三个流程开关全关 → 「请开启至少一项」→ 当场打开流程开关。
+    NoFlow,
+    /// 识别中 → 「取消操作」。
+    Running,
+}
+
+impl PrimaryState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "开始识别",
+            Self::NeedsCalibration => "先校准",
+            Self::NoFlow => "请开启至少一项",
+            Self::Running => "取消操作",
+        }
+    }
+
+    /// 点击后要执行的动作。
+    pub fn action(self) -> Action {
+        match self {
+            Self::Ready => Action::Start,
+            Self::NeedsCalibration => Action::OpenCalibration,
+            Self::NoFlow => Action::EnableFlows,
+            Self::Running => Action::Cancel,
+        }
+    }
+
+    /// 是否是「实心 accent 填充」的可用态（其余形态走 `bg_raised` + 描边）。
+    pub fn filled(self) -> bool {
+        matches!(self, Self::Ready | Self::Running)
+    }
+}
+
 /// 运行中描边呼吸周期（spec：1.2s）。
 pub const BREATH_PERIOD_SECS: f64 = 1.2;
 /// 未识别慢闪周期（spec：2Hz）。
@@ -125,6 +261,8 @@ pub const BLINK_PERIOD_SECS: f64 = 0.5;
 pub const SUCCESS_HIGHLIGHT_SECS: f64 = 0.2;
 /// 热键冲突提示自动消失时长（spec D2：2.5s）。
 pub const HOTKEY_CONFLICT_SECS: f64 = 2.5;
+/// 运行态主按钮的防连点窗口（spec §3.4 Loading 行：二次点击 300ms 内忽略）。
+pub const CANCEL_CLICK_GUARD_SECS: f64 = 0.3;
 
 /// 修饰键位（与 Win32 `MOD_ALT` / `MOD_CONTROL` / `MOD_SHIFT` 同值，注册时直接按位或）。
 pub const CHORD_MOD_ALT: u32 = 0x1;
@@ -240,10 +378,13 @@ impl KeyChord {
     /// 不产生 `Event::Key`，所以这里天然拿不到只有修饰键的和弦。
     pub fn capture(key: egui::Key, modifiers: egui::Modifiers) -> Option<Self> {
         let (name, _) = CAPTURABLE.iter().find(|(_, candidate)| *candidate == key)?;
-        Some(Self {
-            name,
-            modifiers: modifier_bits(modifiers),
-        })
+        let modifiers = modifier_bits(modifiers);
+        // 无修饰的 F 不许做全局热键：`RegisterHotKey` 会独占它，游戏里开门/拾取全失效
+        // （spec D3 选低级钩子的唯一理由）。带修饰键不占用单键，照常允许。
+        if delta_config::single_key_rejection(name).is_some() && modifiers == 0 {
+            return None;
+        }
+        Some(Self { name, modifiers })
     }
 
     /// 主键短名（如 `F9`、`Space`）。
@@ -335,6 +476,14 @@ pub enum Action {
     ToggleMorseAutoDownload,
     /// F 键低级键盘钩子总开关（spec D3 边界 3；关 = 卸载钩子）。
     ToggleFKeyHook,
+    /// 全关时的修复动作：把三个流程开关一并打开（「请开启至少一项」按钮的落点）。
+    EnableFlows,
+    /// 换主题（设置页，立即生效不重启）。
+    SetTheme(ThemeId),
+    /// 换主色（`None` = 恢复该主题的默认 accent）。
+    SetAccent(Option<String>),
+    /// 提交编辑后的游戏窗口关键词（逗号分隔原文，调用方负责切分与校验）。
+    CommitKeywords(String),
     /// 点掉一次性警示（如「屏幕变了 · 建议重校」）。
     DismissNotice,
 }
@@ -459,6 +608,41 @@ pub struct UiState {
     ///
     /// 默认值直接取自 `delta_config`，两份默认值不允许各写一遍（否则一改就漂）。
     pub game_title_keywords: Vec<String>,
+    /// 关键词编辑框的当前文本（逗号分隔；回车/失焦才提交，不逐字落盘）。
+    pub keywords_buffer: String,
+    /// 当前主题（spec D7：默认 Frost；切换立即生效，不重启）。
+    pub theme_id: ThemeId,
+    /// 自定义主色（`#RRGGBB`；`None` = 该主题自带 accent）。
+    pub accent_override: Option<String>,
+    /// 结果区内容（spec D2b：摩斯 / 指纹 / 操作台共用一块结果区）。
+    pub result: Option<ResultContent>,
+    /// 上一次「取消操作」被接受的时刻（防连点，`None` = 还没点过）。
+    pub last_cancel_at: Option<f64>,
+}
+
+/// 开关网格的六格（spec D2 定稿：3 行 × 2 列，第 6 格是热键键帽）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridCell {
+    /// 三个流程开关（摩斯 / 指纹 / 操作台）。
+    Flow(SceneKind),
+    /// 指纹自动点击（`config.fingerprint_auto_click`）。
+    FingerprintAutoClick,
+    /// 摩斯自动下载（`config.auto_confirm`）。
+    MorseAutoDownload,
+    /// 热键键帽：**不可点**，只显示当前生效的热键。
+    Keycap,
+}
+
+impl GridCell {
+    /// 这一格被点击后要做什么（键帽没有动作）。
+    pub fn action(self) -> Option<Action> {
+        match self {
+            Self::Flow(scene) => Some(Action::ToggleFlow(scene)),
+            Self::FingerprintAutoClick => Some(Action::ToggleFingerprintAutoClick),
+            Self::MorseAutoDownload => Some(Action::ToggleMorseAutoDownload),
+            Self::Keycap => None,
+        }
+    }
 }
 
 /// 三个功能入口开关。
@@ -497,10 +681,23 @@ impl Toggles {
             (SceneKind::Console, self.console),
         ]
     }
+
+    /// 是否至少有一个流程开关为开（主按钮谓词的一半，§3.4）。
+    pub fn any_on(self) -> bool {
+        self.morse || self.fingerprint || self.console
+    }
+
+    /// 全关时的修复动作：三个一并打开。
+    pub fn enable_all(&mut self) {
+        self.morse = true;
+        self.fingerprint = true;
+        self.console = true;
+    }
 }
 
 impl Default for UiState {
     fn default() -> Self {
+        let keywords = delta_config::Config::default().game_title_keywords;
         Self {
             phase: Phase::Idle,
             scene: SceneKind::Unknown,
@@ -528,7 +725,12 @@ impl Default for UiState {
             fingerprint_auto_click: true,
             morse_auto_download: true,
             f_key_hook: true,
-            game_title_keywords: delta_config::Config::default().game_title_keywords,
+            game_title_keywords: keywords.clone(),
+            keywords_buffer: keywords.join(", "),
+            theme_id: ThemeId::default(),
+            accent_override: None,
+            result: None,
+            last_cancel_at: None,
         }
     }
 }
@@ -542,6 +744,80 @@ impl UiState {
     /// 主按钮是否可点：已校准 + 不在运行中。
     pub fn start_enabled(&self) -> bool {
         self.is_calibrated() && self.phase != Phase::Running
+    }
+
+    /// 主按钮形态（§3.4 的按钮谓词：`已校准 && 至少一个开关为开`）。
+    pub fn primary_state(&self) -> PrimaryState {
+        if self.phase == Phase::Running {
+            return PrimaryState::Running;
+        }
+        if !self.is_calibrated() {
+            return PrimaryState::NeedsCalibration;
+        }
+        if !self.toggles.any_on() {
+            return PrimaryState::NoFlow;
+        }
+        PrimaryState::Ready
+    }
+
+    /// 运行态的防连点判定：300ms 内的第二次「取消」被忽略（并**不**刷新计时起点）。
+    pub fn cancel_allowed(&mut self, now: f64) -> bool {
+        if self
+            .last_cancel_at
+            .is_some_and(|last| now - last < CANCEL_CLICK_GUARD_SECS)
+        {
+            return false;
+        }
+        self.last_cancel_at = Some(now);
+        true
+    }
+
+    /// 当前解析出的色板（主题 + 自定义主色，§2.7）。
+    pub fn palette(&self) -> Palette {
+        theme::resolve(self.theme_id, self.accent_override.as_deref())
+    }
+
+    /// 开关网格的六格（行主序＝左上→右上→左中→…，spec D2 的档位表）。
+    pub fn grid(&self) -> [(GridCell, &'static str, bool); 6] {
+        [
+            (GridCell::Flow(SceneKind::Morse), "摩斯解码", self.toggles.morse),
+            (
+                GridCell::Flow(SceneKind::Fingerprint),
+                "指纹识别",
+                self.toggles.fingerprint,
+            ),
+            (
+                GridCell::Flow(SceneKind::Console),
+                "操作台 · BETA",
+                self.toggles.console,
+            ),
+            (
+                GridCell::FingerprintAutoClick,
+                "指纹自动点击",
+                self.fingerprint_auto_click,
+            ),
+            (
+                GridCell::MorseAutoDownload,
+                "摩斯自动下载",
+                self.morse_auto_download,
+            ),
+            (GridCell::Keycap, "热键", false),
+        ]
+    }
+
+    /// 结果区五态。
+    pub fn result_state(&self) -> ResultState {
+        self.phase.result_state()
+    }
+
+    /// 空闲态的那一行提示（替代「空的高对比卡」，§3.4）。
+    pub fn idle_hint(&self) -> String {
+        format!("就绪 · 按 {} 开始", self.hotkey)
+    }
+
+    /// 结果区主内容（`None` = 没有可显示的东西）。
+    pub fn result_content(&self) -> Option<&ResultContent> {
+        self.result.as_ref().filter(|content| !content.is_empty())
     }
 
     /// 序列显示串：非操作台场景显示 `──`（spec：非操作台场景没有目标序列）。
@@ -563,11 +839,19 @@ impl UiState {
     }
 
     /// 进入运行态（警示让位给进度，否则用户看不见识别进展）。
+    ///
+    /// **不清 `result`**：Loading 态必须保留上一结果（§3.4「保留上一结果，不清空」）。
     pub fn begin_run(&mut self) {
         self.phase = Phase::Running;
         self.progress = Progress::new(0, 0, "");
         self.message.clear();
         self.notice = None;
+        self.last_cancel_at = None;
+    }
+
+    /// 装结果区内容（spec D2b）。
+    pub fn set_result(&mut self, content: ResultContent) {
+        self.result = Some(content);
     }
 
     /// 装上「屏幕变了」警示：用户已点掉过就不再打扰。
@@ -649,7 +933,21 @@ impl UiState {
 
     /// 游戏前台关键词（spec D3 边界 5）。
     pub fn set_game_title_keywords(&mut self, keywords: Vec<String>) {
+        self.keywords_buffer = keywords.join(", ");
         self.game_title_keywords = keywords;
+    }
+
+    /// 把编辑框原文切成关键词列表：逗号（中英文）分隔、去空白、去空项。
+    ///
+    /// 空结果**不**替换现有关键词（空列表 = 永不响应，等于静默关掉 F 键监听）。
+    pub fn parse_keywords(raw: &str) -> Vec<String> {
+        let items: Vec<String> = raw
+            .split([',', '，', ';', '；'])
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_owned)
+            .collect();
+        items
     }
 }
 
@@ -669,6 +967,7 @@ mod tests {
 
     #[test]
     fn five_phases_have_distinct_labels_and_colors() {
+        let pal = theme::palette(ThemeId::default());
         let phases = [
             Phase::Idle,
             Phase::Running,
@@ -680,7 +979,7 @@ mod tests {
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), 5, "五态文案必须互异");
-        let mut colors: Vec<[u8; 4]> = phases.iter().map(|p| p.color().to_array()).collect();
+        let mut colors: Vec<[u8; 4]> = phases.iter().map(|p| p.color(pal).to_array()).collect();
         colors.sort_unstable();
         colors.dedup();
         assert_eq!(colors.len(), 5, "五态颜色必须互异");
@@ -715,12 +1014,13 @@ mod tests {
     }
 
     #[test]
-    fn primary_button_follows_phase() {
-        assert_eq!(Phase::Idle.primary_label("F8"), "开始识别  F8");
-        assert_eq!(Phase::Running.primary_label("F8"), "取消操作");
-        assert_eq!(Phase::Success.primary_label("F8"), "重新识别");
-        assert_eq!(Phase::Idle.primary_action(), Action::Start);
-        assert_eq!(Phase::Running.primary_action(), Action::Cancel);
+    fn primary_button_copy_follows_the_phase() {
+        // 主按钮文案由 `PrimaryState` 决定（§3.4）：热键不再塞进按钮文字，
+        // 而是以 30% alpha 画在按钮右侧。
+        assert_eq!(PrimaryState::Ready.label(), "开始识别");
+        assert_eq!(PrimaryState::Running.label(), "取消操作");
+        assert_eq!(PrimaryState::Running.action(), Action::Cancel);
+        assert_eq!(PrimaryState::Ready.action(), Action::Start);
     }
 
     #[test]
@@ -1007,6 +1307,175 @@ mod tests {
 
         state.set_capture_test(test_capture_result());
         assert!(state.capture_test_error.is_none(), "成功即清掉旧错误");
+    }
+
+    #[test]
+    fn primary_button_has_three_honest_forms_instead_of_a_silent_disable() {
+        let mut state = UiState::default();
+        assert_eq!(state.primary_state(), PrimaryState::Ready);
+        assert_eq!(state.primary_state().label(), "开始识别");
+        assert_eq!(state.primary_state().action(), Action::Start);
+        assert!(state.primary_state().filled(), "可用态是实心 accent 填充");
+
+        // 未校准 → 改文案 + 点它去校准（不是灰掉不管）。
+        state.missing = vec!["操作台 LED 目标序列区域".to_owned()];
+        assert_eq!(state.primary_state(), PrimaryState::NeedsCalibration);
+        assert_eq!(state.primary_state().label(), "先校准");
+        assert_eq!(state.primary_state().action(), Action::OpenCalibration);
+        assert!(!state.primary_state().filled());
+
+        // 三个流程开关全关 → 改文案 + 点它当场把开关打开。
+        state.missing.clear();
+        state.toggles = Toggles {
+            morse: false,
+            fingerprint: false,
+            console: false,
+        };
+        assert_eq!(state.primary_state(), PrimaryState::NoFlow);
+        assert_eq!(state.primary_state().label(), "请开启至少一项");
+        assert_eq!(state.primary_state().action(), Action::EnableFlows);
+        state.toggles.enable_all();
+        assert_eq!(state.primary_state(), PrimaryState::Ready, "修复动作要能回到可用");
+
+        // 运行中 → 取消。
+        state.begin_run();
+        assert_eq!(state.primary_state(), PrimaryState::Running);
+        assert_eq!(state.primary_state().label(), "取消操作");
+        assert_eq!(state.primary_state().action(), Action::Cancel);
+    }
+
+    #[test]
+    fn cancel_click_is_ignored_within_300ms() {
+        let mut state = UiState::default();
+        state.begin_run();
+        assert!(state.cancel_allowed(10.0), "第一次点击必须生效");
+        assert!(!state.cancel_allowed(10.1), "300ms 内的连点必须被吞");
+        assert!(!state.cancel_allowed(10.29));
+        assert!(state.cancel_allowed(10.3), "过了 300ms 才接受下一次");
+        // 重新开始一轮 → 防连点窗口重置。
+        state.begin_run();
+        assert!(state.cancel_allowed(10.31));
+    }
+
+    #[test]
+    fn result_area_covers_the_three_scenarios() {
+        // 摩斯：密码数字排成 26px 可读的一行，标签点明「自动下载」的真实后果。
+        assert_eq!(morse_result("427", true), ResultContent::new("4 2 7", "已输入"));
+        assert_eq!(
+            morse_result("427", false),
+            ResultContent::new("4 2 7", "已识别·未输入")
+        );
+        // 指纹：点击顺序（按模板号升序）。
+        assert_eq!(
+            fingerprint_result(&[1, 3, 5], true),
+            ResultContent::new("1 → 3 → 5", "已点击")
+        );
+        assert_eq!(fingerprint_result(&[1, 3, 5], false).tag, "未点击");
+        // 操作台：目标序列（用户点名保留的信息）+ 已拖列数。
+        assert_eq!(
+            console_result(Some("01-00-01-11"), 3, 4),
+            ResultContent::new("01 · 00 · 01 · 11", "已拖 3/4 列")
+        );
+        // 空数据不崩，也不假装有结果。
+        assert_eq!(morse_result("", true).headline, "—");
+        assert_eq!(fingerprint_result(&[], true).headline, "—");
+        assert_eq!(console_result(None, 0, 0).headline, "—");
+        assert!(!console_result(None, 0, 0).is_empty(), "标签仍要有内容");
+    }
+
+    #[test]
+    fn grid_has_six_cells_in_the_spec_order() {
+        let mut state = UiState::default();
+        let grid = state.grid();
+        assert_eq!(grid.len(), 6, "3 行 × 2 列 = 6 格");
+        let labels: Vec<&str> = grid.iter().map(|(_, label, _)| *label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "摩斯解码",
+                "指纹识别",
+                "操作台 · BETA",
+                "指纹自动点击",
+                "摩斯自动下载",
+                "热键"
+            ]
+        );
+        // 第 6 格是键帽：不可点，没有动作。
+        assert_eq!(grid[5].0, GridCell::Keycap);
+        assert_eq!(grid[5].0.action(), None);
+        assert!(!grid[5].2, "键帽没有开关状态");
+        // 五格各有动作，且都写回真实状态。
+        assert_eq!(
+            grid[3].0.action(),
+            Some(Action::ToggleFingerprintAutoClick)
+        );
+        assert_eq!(grid[4].0.action(), Some(Action::ToggleMorseAutoDownload));
+        assert_eq!(
+            grid[0].0.action(),
+            Some(Action::ToggleFlow(SceneKind::Morse))
+        );
+        state.fingerprint_auto_click = false;
+        assert!(!state.grid()[3].2);
+    }
+
+    #[test]
+    fn idle_draws_hint_instead_of_an_empty_card() {
+        let state = UiState::default();
+        assert_eq!(state.result_state(), ResultState::Idle);
+        assert_eq!(state.result_state().border(&state.palette()), None);
+        assert_eq!(state.idle_hint(), "就绪 · 按 F8 开始");
+        assert!(state.result_content().is_none(), "空闲态没有结果内容");
+
+        // 三态描边：成功 ok / 部分 warn / 失败 err（§3.4）。
+        let pal = state.palette();
+        assert_eq!(ResultState::Success.border(&pal), Some(pal.ok));
+        assert_eq!(ResultState::Partial.border(&pal), Some(pal.warn));
+        assert_eq!(ResultState::Error.border(&pal), Some(pal.err));
+    }
+
+    #[test]
+    fn plain_f_is_not_capturable_but_ctrl_f_is() {
+        let plain = egui::Modifiers::default();
+        // 全局注册无修饰的 F 会吞掉游戏交互键 → 捕获阶段就拒绝（继续等待）。
+        assert_eq!(KeyChord::capture(egui::Key::F, plain), None);
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::default()
+        };
+        let chord = KeyChord::capture(egui::Key::F, ctrl).expect("Ctrl+F 不独占单键");
+        assert_eq!(chord.main_name(), "F");
+        assert_eq!(chord.modifiers(), CHORD_MOD_CONTROL);
+        assert_eq!(read_capture(&[key_event(egui::Key::F, plain)]), CaptureOutcome::Pending);
+    }
+
+    #[test]
+    fn keywords_parse_splits_both_comma_styles_and_ignores_blanks() {
+        assert_eq!(
+            UiState::parse_keywords("三角洲, Delta Force"),
+            vec!["三角洲".to_owned(), "Delta Force".to_owned()]
+        );
+        assert_eq!(
+            UiState::parse_keywords(" 三角洲 ，Delta Force ; "),
+            vec!["三角洲".to_owned(), "Delta Force".to_owned()]
+        );
+        assert!(UiState::parse_keywords("  ,  ").is_empty());
+    }
+
+    #[test]
+    fn theme_and_accent_reach_the_palette() {
+        let mut state = UiState::default();
+        assert_eq!(state.theme_id, ThemeId::Frost, "spec D7：默认霜白");
+        assert_eq!(state.palette(), *theme::palette(ThemeId::Frost));
+
+        state.theme_id = ThemeId::Ember;
+        assert_eq!(state.palette().bg_panel, theme::palette(ThemeId::Ember).bg_panel);
+
+        state.accent_override = Some("#B23A2A".to_owned());
+        assert_ne!(
+            state.palette().accent,
+            theme::palette(ThemeId::Ember).accent,
+            "自定义主色必须真的生效"
+        );
     }
 
     #[test]

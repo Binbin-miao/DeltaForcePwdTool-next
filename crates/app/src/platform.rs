@@ -399,6 +399,12 @@ pub fn parse_hotkey(name: &str) -> Result<Hotkey, HotkeyParseError> {
 /// 返回**实际生效**的 `Hotkey`：热键线程注册它，`initial_state` 用 [`format_hotkey`]
 /// 显示它 —— 因此面板永远不会显示一个没生效的名字（复审 S2-1）。
 pub fn startup_hotkey(name: &str) -> Hotkey {
+    // 配置层已拒绝无修饰的 `F`（`RegisterHotKey` 会全局独占，吞掉游戏交互键）。
+    // 老配置里万一写着，这里也**绝不注册**它 —— 否则界面说在监听、游戏里按 F 却全失灵。
+    if let Some(reason) = delta_config::single_key_rejection(name) {
+        eprintln!("[hotkey] 配置里的热键 {name:?} 被拒（{reason}），本会话回落 F8");
+        return Hotkey::default();
+    }
     parse_hotkey(name).unwrap_or_else(|error| {
         eprintln!("[hotkey] 配置里的热键 {name:?} 无法解析（{error}），本会话回落 F8");
         Hotkey::default()
@@ -502,6 +508,16 @@ mod tests {
     }
 
     #[test]
+    fn plain_f_is_never_registered_as_a_global_hotkey() {
+        // 复审 S2 遗留③的最后一层保险：解析能力保留（F 键监听要用），
+        // 但启动注册路径绝不注册它 —— 否则 RegisterHotKey 会吞掉游戏交互键。
+        assert_eq!(parse_hotkey("F"), Ok(Hotkey::plain(0x46)), "解析能力不能砍");
+        assert_eq!(startup_hotkey("F"), Hotkey::default(), "F 必须回落 F8");
+        assert_eq!(startup_hotkey("ctrl+f"), Hotkey::new(0x46, MOD_CONTROL), "带修饰键允许");
+        assert_eq!(startup_hotkey("F8"), Hotkey::plain(0x77));
+    }
+
+    #[test]
     fn modifier_order_is_normalised() {
         // 顺序不敏感地进，只以一种写法的串出（D1 边界）。
         assert_eq!(
@@ -569,14 +585,30 @@ mod tests {
             delta_ui::state::CAPTURABLE.len(),
             "两张表条数必须一致：多出来的键要么解析不了、要么捕获不到"
         );
+        // 无修饰的存活检查：保留键（`F`）之外的每一个键都必须能单独捕获并原样往返。
         for (name, key) in delta_ui::state::CAPTURABLE {
+            if delta_config::single_key_rejection(name).is_some() {
+                continue;
+            }
             let chord = delta_ui::state::KeyChord::capture(key, egui::Modifiers::default())
                 .unwrap_or_else(|| panic!("{name} 必须可捕获"));
             assert_eq!(chord.main_name(), name, "捕获结果必须用同一套短名");
-            let hotkey =
-                hotkey_from_chord(chord).unwrap_or_else(|| panic!("{name} 必须可解析"));
+            let hotkey = hotkey_from_chord(chord).unwrap_or_else(|| panic!("{name} 必须可解析"));
             assert_eq!(format_hotkey(&hotkey), name, "{name} 归一化必须唯一");
             assert_eq!(parse_hotkey(name), Ok(hotkey), "{name} 必须回得去");
+        }
+        // 保留键（GameKey F）走带修饰的组合验证：词汇与往返都不受影响。
+        for (name, key) in delta_ui::state::CAPTURABLE {
+            let ctrl = egui::Modifiers {
+                ctrl: true,
+                ..egui::Modifiers::default()
+            };
+            let chord = delta_ui::state::KeyChord::capture(key, ctrl)
+                .unwrap_or_else(|| panic!("Ctrl+{name} 必须可捕获"));
+            assert_eq!(chord.main_name(), name);
+            let hotkey = hotkey_from_chord(chord).unwrap_or_else(|| panic!("Ctrl+{name} 必须可解析"));
+            assert_eq!(format_hotkey(&hotkey), format!("Ctrl+{name}"));
+            assert_eq!(parse_hotkey(&format!("Ctrl+{name}")), Ok(hotkey));
         }
     }
 

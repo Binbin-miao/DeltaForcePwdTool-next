@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use delta_config::Config;
 use delta_geom::{MonitorInfo, PxRect};
 use delta_ui::{
-    conflict_copy, Action, CaptureBackend, CaptureTestResult, KeyChord, Phase, Progress, Step,
-    UiState, Verdict, Wizard, WizardAction, WizardFrame, WizardScene,
+    console_result, conflict_copy, Action, CaptureBackend, CaptureTestResult, KeyChord, Phase,
+    Progress, SceneKind, Step, ThemeId, UiState, Verdict, Wizard, WizardAction, WizardFrame,
+    WizardScene,
 };
 
 use crate::keyhook::KeyHook;
@@ -60,6 +61,8 @@ pub struct DeltaApp {
     capture_probe: Option<Receiver<Result<CaptureProbe, String>>>,
     /// F 键低级键盘钩子（`None` = 钩子已关 / 装不上）。
     key_hook: Option<KeyHook>,
+    /// 上一帧灌进 egui 的主题（只在变化的帧调一次 `apply_visuals`）。
+    applied_theme: Option<(ThemeId, Option<String>)>,
 }
 
 /// 「测试截图」从后台线程回传的东西（纹理上传只能留到 UI 线程做）。
@@ -90,6 +93,7 @@ impl DeltaApp {
             phase_started: Instant::now(),
             capture_probe: None,
             key_hook: None,
+            applied_theme: None,
         };
         // 配置说开着就当场装上（装不上只留痕，绝不因为钩子失败而不给启动）。
         app.sync_key_hook();
@@ -147,7 +151,9 @@ impl DeltaApp {
                 }
                 UiEvent::Progress { done, total, note } => {
                     self.state.progress = Progress::new(done, total, note);
+                    self.refresh_console_result();
                 }
+                UiEvent::Result(content) => self.state.set_result(content),
                 UiEvent::Succeeded(message) => self.finish(Phase::Success, message),
                 UiEvent::Failed(message) => self.finish(Phase::Unrecognized, message),
                 UiEvent::Rejected(message) => self.finish(Phase::Unrecognized, message),
@@ -179,7 +185,22 @@ impl DeltaApp {
     /// 收尾成某一态。
     fn finish(&mut self, phase: Phase, message: String) {
         self.state.finish(phase, message);
+        // 操作台没有独立的结果事件：序列来自 `UiEvent::Scene`，已拖列数来自进度。
+        self.refresh_console_result();
         self.phase_started = Instant::now();
+    }
+
+    /// 操作台结果区（spec D2b 第三场景）。
+    fn refresh_console_result(&mut self) {
+        if self.state.scene != SceneKind::Console {
+            return;
+        }
+        let content = console_result(
+            self.state.sequence.as_deref(),
+            self.state.progress.done,
+            self.state.progress.total,
+        );
+        self.state.set_result(content);
     }
 
     /// 提交一次捕获到的热键（spec D3 / D5）。
@@ -301,6 +322,11 @@ impl DeltaApp {
             Action::OpenCalibration => self.enter_wizard(ctx),
             Action::OpenSettings => self.settings_open = true,
             Action::ToggleFlow(scene) => self.state.toggles.toggle(scene),
+            // 全关时的修复动作（主按钮文案「请开启至少一项」的落点）。
+            Action::EnableFlows => self.state.toggles.enable_all(),
+            Action::SetTheme(theme) => self.set_theme(theme),
+            Action::SetAccent(accent) => self.set_accent(accent),
+            Action::CommitKeywords(raw) => self.commit_keywords(&raw),
             Action::ToggleFingerprintAutoClick => self.toggle_fingerprint_auto_click(),
             Action::ToggleMorseAutoDownload => self.toggle_morse_auto_download(),
             Action::ToggleFKeyHook => self.toggle_f_key_hook(),
@@ -395,6 +421,44 @@ impl DeltaApp {
         self.persist_settings();
     }
 
+    /// 换主题（spec D7）：写状态 → 落盘；下一帧自绘控件与原生兜底同时换色，**不重启**。
+    fn set_theme(&mut self, theme: ThemeId) {
+        if self.state.theme_id == theme {
+            return;
+        }
+        self.state.theme_id = theme;
+        if let Ok(mut config) = self.config.lock() {
+            config.theme_id = theme;
+        }
+        self.persist_settings();
+    }
+
+    /// 换主色（`None` = 恢复该主题自带的 accent）。
+    fn set_accent(&mut self, accent: Option<String>) {
+        self.state.accent_override = accent.clone();
+        if let Ok(mut config) = self.config.lock() {
+            config.accent_override = accent;
+        }
+        self.persist_settings();
+    }
+
+    /// 提交游戏窗口关键词：空输入**不覆盖**现有关键词
+    /// （空列表 = 永不响应 F，等于静默把监听关掉）。
+    fn commit_keywords(&mut self, raw: &str) {
+        let keywords = UiState::parse_keywords(raw);
+        if keywords.is_empty() {
+            self.state.keywords_buffer = self.state.game_title_keywords.join(", ");
+            return;
+        }
+        self.state.set_game_title_keywords(keywords.clone());
+        if let Ok(mut config) = self.config.lock() {
+            config.game_title_keywords = keywords;
+        }
+        // 钩子侧热更新关键词（不必重装钩子）。
+        self.sync_key_hook();
+        self.persist_settings();
+    }
+
     /// 让钩子跟上配置：开 → 装上（关键词热更新），关 → 卸载。
     ///
     /// ⚠️ 关闭时**只是卸载**。**绝不**回退成 `RegisterHotKey("F")` —— 那是全局独占，
@@ -424,24 +488,37 @@ impl DeltaApp {
     fn install_key_hook(&mut self, keywords: Vec<String>) {
         let (sink, events) = mpsc::sync_channel::<()>(8);
         let commands = self.worker.commands.clone();
-        match KeyHook::install(keywords, sink) {
-            Ok(hook) => {
-                self.key_hook = Some(hook);
-                let forwarder = std::thread::Builder::new()
-                    .name("delta-keyhook-fwd".to_owned())
-                    .spawn(move || {
-                        // 发送端随钩子卸载一起消失 → `recv` 出错 → 本线程自然退出。
-                        while events.recv().is_ok() {
-                            if commands.send(Cmd::Trigger).is_err() {
-                                break;
-                            }
-                        }
-                    });
-                if let Err(error) = forwarder {
-                    eprintln!("[keyhook] 事件转发线程启动失败：{error}");
-                }
+        let hook = match KeyHook::install(keywords, sink) {
+            Ok(hook) => hook,
+            Err(reason) => {
+                eprintln!("[keyhook] {reason}");
+                return;
             }
-            Err(reason) => eprintln!("[keyhook] {reason}"),
+        };
+        let forwarder = std::thread::Builder::new()
+            .name("delta-keyhook-fwd".to_owned())
+            .spawn(move || {
+                // 发送端随钩子卸载一起消失 → `recv` 出错 → 本线程自然退出。
+                while events.recv().is_ok() {
+                    if commands.send(Cmd::Trigger).is_err() {
+                        break;
+                    }
+                }
+            });
+        match forwarder {
+            Ok(_) => self.key_hook = Some(hook),
+            Err(error) => {
+                // 钩子装上了但没人转发 → 「界面说开、按 F 毫无反应」的假状态。
+                // 当场卸掉钩子（`Drop` → Unhook + 清槽位），并把配置/界面一并退回「关」。
+                eprintln!("[keyhook] 事件转发线程启动失败：{error}");
+                drop(hook);
+                self.key_hook = None;
+                if let Ok(mut config) = self.config.lock() {
+                    config.f_key_hook_enabled = false;
+                }
+                self.state.set_f_key_hook(false);
+                self.state.notice = Some(NOTICE_KEY_HOOK_FAILED.to_owned());
+            }
         }
     }
 
@@ -495,7 +572,7 @@ impl DeltaApp {
     }
 
     /// 校准向导一帧。
-    fn wizard_frame(&mut self, ui: &mut egui::Ui) {
+    fn wizard_frame(&mut self, ui: &mut egui::Ui, pal: &delta_ui::theme::Palette) {
         let ctx = ui.ctx().clone();
         self.ensure_preview(&ctx);
         self.run_pending_test();
@@ -509,7 +586,7 @@ impl DeltaApp {
             monitor: [self.monitor.w.max(0) as u32, self.monitor.h.max(0) as u32],
             existing: &existing,
         };
-        let action = delta_ui::wizard_window(ui, wizard, frame);
+        let action = delta_ui::wizard_window(ui, wizard, frame, pal);
         if let Some(action) = action {
             self.apply_wizard_action(action, &ctx);
         }
@@ -723,8 +800,16 @@ impl eframe::App for DeltaApp {
         self.state.phase_elapsed = self.phase_started.elapsed().as_secs_f64();
         self.drain_events(&ctx);
 
+        // 主题：自绘控件以 `Palette` 为准；原生控件只在主题/主色**变化的帧**灌一次。
+        let pal = self.state.palette();
+        let theme_key = (self.state.theme_id, self.state.accent_override.clone());
+        if self.applied_theme.as_ref() != Some(&theme_key) {
+            delta_ui::theme::apply_visuals(&ctx, &pal);
+            self.applied_theme = Some(theme_key);
+        }
+
         if self.wizard.is_some() {
-            self.wizard_frame(ui);
+            self.wizard_frame(ui, &pal);
             self.schedule_repaint(&ctx);
             return;
         }
@@ -738,6 +823,13 @@ impl eframe::App for DeltaApp {
             let capture_locked = !self.state.capture_switchable();
             let capture_test = self.state.capture_test.clone();
             let capture_test_error = self.state.capture_test_error.clone();
+            let (theme_id, accent, f_key_hook) = (
+                self.state.theme_id,
+                self.state.accent_override.clone(),
+                self.state.f_key_hook,
+            );
+            // 关键词编辑框的文本归 UI 状态所有：先取出、交给面板编辑、再放回。
+            let mut keywords = std::mem::take(&mut self.state.keywords_buffer);
             let action = delta_ui::view::settings_panel(
                 ui,
                 delta_ui::view::SettingsView {
@@ -750,8 +842,14 @@ impl eframe::App for DeltaApp {
                     capture_locked,
                     capture_test: capture_test.as_ref(),
                     capture_test_error: capture_test_error.as_deref(),
+                    theme_id,
+                    accent_override: accent.as_deref(),
+                    f_key_hook,
+                    keywords: &mut keywords,
                 },
+                &pal,
             );
+            self.state.keywords_buffer = keywords;
             match action {
                 Some(delta_ui::view::SettingsAction::Probe) => {
                     self.settings_open = false;
@@ -778,13 +876,19 @@ impl eframe::App for DeltaApp {
                     self.set_capture_backend(backend);
                 }
                 Some(delta_ui::view::SettingsAction::TestCapture) => self.start_capture_test(&ctx),
+                Some(delta_ui::view::SettingsAction::SetTheme(theme)) => self.set_theme(theme),
+                Some(delta_ui::view::SettingsAction::SetAccent(accent)) => self.set_accent(accent),
+                Some(delta_ui::view::SettingsAction::ToggleFKeyHook) => self.toggle_f_key_hook(),
+                Some(delta_ui::view::SettingsAction::CommitKeywords(raw)) => {
+                    self.commit_keywords(&raw);
+                }
                 Some(delta_ui::view::SettingsAction::Close) => self.settings_open = false,
                 None => {}
             }
             return;
         }
 
-        if let Some(action) = delta_ui::main_window(ui, &mut self.state) {
+        if let Some(action) = delta_ui::main_window(ui, &mut self.state, &pal) {
             self.handle(action, &ctx);
         }
         self.schedule_repaint(&ctx);
@@ -975,6 +1079,9 @@ fn initial_state(config: &Config, monitor: MonitorInfo) -> UiState {
         morse_auto_download: config.auto_confirm,
         f_key_hook: config.f_key_hook_enabled,
         game_title_keywords: config.game_title_keywords.clone(),
+        keywords_buffer: config.game_title_keywords.join(", "),
+        theme_id: config.theme_id,
+        accent_override: config.accent_override.clone(),
         missing: config.validate().iter().map(ToString::to_string).collect(),
         ..UiState::default()
     };

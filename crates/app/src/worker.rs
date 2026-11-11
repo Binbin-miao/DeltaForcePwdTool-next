@@ -34,6 +34,11 @@ pub enum UiEvent {
         total: usize,
         note: String,
     },
+    /// 结果区内容（spec D2b：摩斯 / 指纹 / 操作台共用一块结果区）。
+    ///
+    /// 排版（`4 2 7` / `1 → 3 → 5` / `01 · 00 · 01 · 11`）由 `delta_ui` 的纯函数负责，
+    /// 流程层只交原始数据 —— 这样结果区的形状有唯一来源，三处不会各排一套。
+    Result(delta_ui::ResultContent),
     Succeeded(String),
     Failed(String),
     /// spec D6：未识别必须拒绝执行，零输入。
@@ -468,8 +473,16 @@ fn run_morse(config: &Config, view: &PxView, session: &mut CaptureSession, tx: &
         note: "已输入数字".to_owned(),
     });
     if outcome.digits_complete() {
+        let _ = tx.send(UiEvent::Result(delta_ui::morse_result(
+            &outcome.password,
+            config.auto_confirm,
+        )));
         let _ = tx.send(UiEvent::Succeeded(format!("已输入数字 {}", outcome.password)));
     } else {
+        let _ = tx.send(UiEvent::Result(delta_ui::morse_result(
+            &outcome.password,
+            config.auto_confirm,
+        )));
         let _ = tx.send(UiEvent::Failed(format!("未识别 {}", outcome.password)));
     }
 }
@@ -525,6 +538,12 @@ fn run_fingerprint(
                 total: outcome.pairs.len(),
                 note: "已点完格子".to_owned(),
             });
+            // 指纹结果区：按模板号升序的点击顺序（`1 → 3 → 5`），标签点明是否真的点了。
+            let order: Vec<u32> = outcome.pairs.iter().map(|pair| pair.tmpl_no).collect();
+            let _ = tx.send(UiEvent::Result(delta_ui::fingerprint_result(
+                &order,
+                config.fingerprint_auto_click,
+            )));
             let _ = tx.send(UiEvent::Succeeded(format!(
                 "{} · 已点 {} 格",
                 outcome.role,

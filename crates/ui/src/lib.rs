@@ -9,10 +9,14 @@ pub mod view;
 pub mod wizard;
 
 pub use state::{
-    conflict_copy, format_sequence, read_capture, Action, CaptureBackend, CaptureOutcome,
-    CaptureTestResult, KeyChord, Phase, Progress, SceneKind, UiState, CAPTURABLE,
+    conflict_copy, console_result, fingerprint_result, format_sequence, morse_result, read_capture,
+    Action, CaptureBackend, CaptureOutcome, CaptureTestResult, GridCell, KeyChord, Phase,
+    PrimaryState, Progress, ResultContent, ResultState, SceneKind, ThemeId, UiState, CAPTURABLE,
 };
-pub use view::{main_window, wizard_window, WizardAction, WizardFrame};
+pub use view::{
+    main_window, settings_panel, wizard_window, SettingsAction, SettingsView, WizardAction,
+    WizardFrame,
+};
 pub use wizard::{apply_drawn, Step, TargetKind, TargetSpec, Verdict, Wizard, WizardScene};
 
 /// 窗口标题（单实例激活时按它找窗）。

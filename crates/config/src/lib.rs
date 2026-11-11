@@ -53,6 +53,83 @@ pub enum ConfigError {
     Uncalibrated,
 }
 
+/// 六套主题（`docs/design/ui-themes.md` §2.1~§2.6）。
+///
+/// 定义在 config 而不是 ui：配置要持久化它，而 `delta-ui` 依赖本 crate，反向不成立。
+/// 色板数据放 `delta_ui::theme`（那边才有 egui 依赖）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeId {
+    /// 石墨（深，无彩色）。
+    Graphite,
+    /// 夜航（深，电蓝）。
+    Nightwatch,
+    /// 暗焰（深，暖橙）。
+    Ember,
+    /// 素纸（浅，墨蓝）。
+    Paper,
+    /// 霜白（浅，近黑）—— **用户拍板的默认主题**（spec D7）。
+    #[default]
+    Frost,
+    /// 瓷青（浅，翠绿）。
+    Celadon,
+}
+
+impl ThemeId {
+    /// 设置页列表里的中文名。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Graphite => "石墨",
+            Self::Nightwatch => "夜航",
+            Self::Ember => "暗焰",
+            Self::Paper => "素纸",
+            Self::Frost => "霜白",
+            Self::Celadon => "瓷青",
+        }
+    }
+
+    /// 深色主题的判定（设置页的「浅色/深色」副标题用）。
+    pub const fn is_dark(self) -> bool {
+        matches!(self, Self::Graphite | Self::Nightwatch | Self::Ember)
+    }
+
+    /// 配置里的 token → 主题。**未知 token 回落 Frost 并留痕**（前向兼容：
+    /// 一份写错主题名的配置不该让用户的校准坐标一起丢掉）。
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "graphite" => Self::Graphite,
+            "nightwatch" => Self::Nightwatch,
+            "ember" => Self::Ember,
+            "paper" => Self::Paper,
+            "frost" => Self::Frost,
+            "celadon" => Self::Celadon,
+            other => {
+                eprintln!("[config] 未知主题 {other:?}，回落 frost");
+                Self::Frost
+            }
+        }
+    }
+
+    /// 落盘 token（与 `parse` 一一对应）。
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Graphite => "graphite",
+            Self::Nightwatch => "nightwatch",
+            Self::Ember => "ember",
+            Self::Paper => "paper",
+            Self::Frost => "frost",
+            Self::Celadon => "celadon",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ThemeId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::parse(&raw))
+    }
+}
+
 /// 主显示器尺寸 + 全部校准区域（**只存百分比**）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -101,6 +178,13 @@ pub struct Config {
     /// 默认 `["三角洲", "Delta Force"]`；匹配规则是**大小写不敏感的子串包含**。
     /// 空列表 = 永不响应（不是「全都响应」）—— 用户清空后必须自己填回来。
     pub game_title_keywords: Vec<String>,
+    /// 界面主题（spec D7：默认 **Frost 霜白**；旧配置缺该字段时回落到 Frost）。
+    pub theme_id: ThemeId,
+    /// 自定义主色（`#RRGGBB`；`None` = 用该主题自带的 accent）。
+    ///
+    /// 存字符串而不是自定义类型：配置是纯 JSON，且它只是「色相载体」——
+    /// 明度/彩度由 `delta_ui::theme` 的 OKLCH 规则算，用户改不动对比度。
+    pub accent_override: Option<String>,
     /// 当前实际屏幕分辨率（**不持久化**）。
     ///
     /// 百分比才是唯一持久真相：换算像素必须按「当前屏幕」，而不是「上次校准时的屏幕」，
@@ -127,6 +211,8 @@ impl Default for Config {
             always_on_top: false,
             f_key_hook_enabled: true,
             game_title_keywords: default_game_title_keywords(),
+            theme_id: ThemeId::default(),
+            accent_override: None,
             runtime_monitor: MonitorInfo::default(),
         }
     }
@@ -517,6 +603,92 @@ impl Config {
     pub fn with_runtime_monitor(mut self, monitor: MonitorInfo) -> Self {
         self.runtime_monitor = monitor;
         self
+    }
+}
+
+// ───────────────────── 热键校验（拒绝会吞游戏键的注册） ─────────────────────
+
+/// 不允许**单独**用作全局热键的键。
+///
+/// `F` 是游戏交互键（开门/拾取）：`RegisterHotKey` 注册无修饰的 F 会全局独占，
+/// 游戏里按 F 全部失效 —— 这正是 spec D3 宁愿写低级键盘钩子也不用 `RegisterHotKey("F")`
+/// 的唯一原因。所以配置层直接拒绝，带修饰键（`Ctrl+F`）则允许：组合键不占用单键。
+pub const RESERVED_SINGLE_HOTKEYS: [&str; 1] = ["F"];
+
+/// 被拒的热键：字段名 + 原文 + 人话原因。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyRejection {
+    /// 配置字段（如 `hotkeys.scene`）。
+    pub field: &'static str,
+    /// 配置里的原文。
+    pub hotkey: String,
+    /// 为什么不行。
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for HotkeyRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} = {:?} 不可用：{}",
+            self.field, self.hotkey, self.reason
+        )
+    }
+}
+
+/// 无修饰的单键 `F` → `Some(原因)`；其它写法 → `None`。
+///
+/// 纯字符串判定：平台层的 `parse_hotkey` 必须**继续**能解析 `F`（F 键监听要用它），
+/// 「不许拿它做全局热键」是配置策略，不是解析能力。
+pub fn single_key_rejection(hotkey: &str) -> Option<&'static str> {
+    let parts: Vec<&str> = hotkey
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let [main] = parts[..] else {
+        return None;
+    };
+    RESERVED_SINGLE_HOTKEYS
+        .iter()
+        .any(|reserved| main.eq_ignore_ascii_case(reserved))
+        .then_some("F 是游戏交互键，会被全局独占；请用 F5~F8、符号键，或直接靠 F 键监听")
+}
+
+impl Hotkeys {
+    /// 四个字段（按配置顺序），供逐一校验。
+    pub fn fields(&self) -> [(&'static str, &str); 4] {
+        [
+            ("hotkeys.scene", &self.scene),
+            ("hotkeys.morse", &self.morse),
+            ("hotkeys.fingerprint", &self.fingerprint),
+            ("hotkeys.console", &self.console),
+        ]
+    }
+}
+
+impl Config {
+    /// 列出所有被拒的热键（空 = 全部可用）。
+    ///
+    /// 与 [`Config::validate`] 分开：那个列表只装「未校准区域」，UI 会把它们显示成
+    /// 「请先校准」；热键写法问题混进去会让主按钮的修复动作指错方向。
+    pub fn validate_hotkeys(&self) -> Vec<HotkeyRejection> {
+        self.hotkeys
+            .fields()
+            .into_iter()
+            .filter_map(|(field, value)| {
+                single_key_rejection(value).map(|reason| HotkeyRejection {
+                    field,
+                    hotkey: value.to_owned(),
+                    reason,
+                })
+            })
+            .collect()
+    }
+
+    /// 首个被拒的热键（启动时据此回落默认键 + 提示）。
+    pub fn hotkey_rejection(&self) -> Option<HotkeyRejection> {
+        self.validate_hotkeys().into_iter().next()
     }
 }
 
@@ -935,6 +1107,88 @@ mod tests {
                 .expect("反序列化")
                 .always_on_top
         );
+    }
+
+    #[test]
+    fn theme_id_defaults_to_frost_and_survives_old_configs() {
+        assert_eq!(Config::default().theme_id, ThemeId::Frost, "spec D7：默认霜白");
+        // 老配置没有这个字段 → 回落 Frost，不是深色主题。
+        let legacy: Config = serde_json::from_str(r#"{"ocr_enabled":true}"#).expect("老配置合法");
+        assert_eq!(legacy.theme_id, ThemeId::Frost);
+
+        // 六套都能写能读（token 是小写下划线风格）。
+        for (json, expected) in [
+            ("graphite", ThemeId::Graphite),
+            ("nightwatch", ThemeId::Nightwatch),
+            ("ember", ThemeId::Ember),
+            ("paper", ThemeId::Paper),
+            ("frost", ThemeId::Frost),
+            ("celadon", ThemeId::Celadon),
+        ] {
+            let config: Config = serde_json::from_str(&format!(r#"{{"theme_id":"{json}"}}"#))
+                .expect("主题 token 必须可读");
+            assert_eq!(config.theme_id, expected);
+            let dumped = serde_json::to_string(&config).expect("序列化");
+            assert!(dumped.contains(&format!("\"theme_id\":\"{json}\"")), "{dumped}");
+            assert_eq!(
+                serde_json::from_str::<Config>(&dumped).expect("反序列化").theme_id,
+                expected,
+                "往返必须不变"
+            );
+        }
+        // 未知主题名回落默认（前向兼容，不把整份配置读废）。
+        let unknown: Config = serde_json::from_str(r#"{"theme_id":"neon"}"#)
+            .expect("未知主题名不得让配置读不出来");
+        assert_eq!(unknown.theme_id, ThemeId::Frost);
+    }
+
+    #[test]
+    fn accent_override_round_trips_and_accepts_null() {
+        assert_eq!(Config::default().accent_override, None, "默认用主题自带主色");
+        let legacy: Config = serde_json::from_str("{}").expect("空配置合法");
+        assert_eq!(legacy.accent_override, None);
+
+        let custom: Config =
+            serde_json::from_str(r##"{"accent_override":"#B23A2A"}"##).expect("可读");
+        assert_eq!(custom.accent_override.as_deref(), Some("#B23A2A"));
+        let dumped = serde_json::to_string(&custom).expect("序列化");
+        assert_eq!(
+            serde_json::from_str::<Config>(&dumped)
+                .expect("反序列化")
+                .accent_override
+                .as_deref(),
+            Some("#B23A2A")
+        );
+    }
+
+    #[test]
+    fn plain_f_is_rejected_as_a_global_hotkey_but_ctrl_f_is_allowed() {
+        // 复审 S2 遗留③：无修饰的 F 会被 RegisterHotKey 全局独占，吞掉游戏的交互键。
+        let config: Config =
+            serde_json::from_str(r#"{"hotkeys":{"scene":"F"}}"#).expect("配置仍要能解析");
+        let rejected = config.validate_hotkeys();
+        assert_eq!(rejected.len(), 1, "F 必须被拒：{rejected:?}");
+        assert_eq!(rejected[0].field, "hotkeys.scene");
+        assert!(rejected[0].reason.contains("游戏交互键"), "{}", rejected[0]);
+        assert!(config.hotkey_rejection().is_some());
+
+        // 小写、带空格的单键 F 同样拒绝（写法等价）。
+        for spelling in ["f", " F ", "F "] {
+            let config: Config =
+                serde_json::from_str(&format!(r#"{{"hotkeys":{{"morse":"{spelling}"}}}}"#))
+                    .expect("可读");
+            assert_eq!(config.validate_hotkeys().len(), 1, "{spelling:?} 必须被拒");
+        }
+
+        // 带修饰键不独占单键 → 允许；F5~F8 与符号键当然也允许。
+        for allowed in ["Ctrl+F", "Ctrl+Alt+F", "F5", "F8", "/", "`"] {
+            assert!(
+                single_key_rejection(allowed).is_none(),
+                "{allowed:?} 不该被拒"
+            );
+        }
+        // 四个字段一起校验，默认全部可用。
+        assert!(Config::default().validate_hotkeys().is_empty());
     }
 
     #[test]

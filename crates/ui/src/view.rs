@@ -1,318 +1,84 @@
-//! 绘制层：主窗口（五态 + 收起态）、校准向导。
+//! 绘制层：主窗口（L-A 双列开关 · 单卡主体）、设置浮层、校准向导。
 //!
-//! 全部用 `Painter` 手绘（像素级对齐 token），不用 egui 默认控件皮肤 —— 这样状态色
-//! 只会出现在 2px 描边 / 状态点 / 数值文字上，不会铺成大面积色块。
+//! 全部用 `Painter` 手绘（像素级对齐 token），不用 egui 默认控件皮肤。
+//! 颜色一律来自显式传入的 `pal: &Palette`（`docs/design/ui-themes.md` §5 的结论：
+//! 不做 thread_local 访问器，否则这批纯函数就无法单测）。
 
 use delta_geom::PctRect;
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
 use crate::state::{
-    read_capture, Action, CaptureBackend, CaptureOutcome, CaptureTestResult, KeyChord, Phase,
-    UiState,
+    read_capture, Action, CaptureBackend, CaptureOutcome, CaptureTestResult, GridCell, KeyChord,
+    Phase, PrimaryState, ResultState, SceneKind, ThemeId, UiState,
 };
-use crate::theme;
+use crate::theme::{self, Palette};
 use crate::wizard::{Step, Verdict, Wizard, WizardScene};
 
 /// 主窗口一帧：返回用户动作（无动作为 `None`）。
-pub fn main_window(ui: &mut egui::Ui, state: &mut UiState) -> Option<Action> {
+pub fn main_window(ui: &mut egui::Ui, state: &mut UiState, pal: &Palette) -> Option<Action> {
     let time = state.phase_elapsed;
     let full = ui.max_rect();
     let painter = ui.painter().clone();
-    paint_shell(&painter, full, state.phase, time);
+    paint_shell(&painter, full, state.phase, time, pal);
     if state.collapsed {
-        collapsed_strip(ui, full, state)
+        collapsed_strip(ui, full, state, pal)
     } else {
-        main_layout(ui, full, state, time)
+        main_layout(ui, full, state, pal)
     }
 }
 
-/// 外壳：外扩 2px 黑 + 1px 内框（egui 无模糊阴影，只能这样模拟）。
-fn paint_shell(painter: &egui::Painter, full: Rect, phase: Phase, time: f64) {
-    painter.rect_filled(full, theme::RADIUS_WINDOW, theme::SHADOW);
-    let body = full.shrink(theme::SHADOW_EXTENT);
-    painter.rect_filled(body, theme::RADIUS_WINDOW, theme::BG_PANEL);
+// ── 外壳与通用零件 ───────────────────────────────────────────────
+
+/// 外壳：深色外扩 2px 阴影；浅色主题改 1px `line_strong` 外框（egui 无模糊，黑边会脏）。
+fn paint_shell(painter: &egui::Painter, full: Rect, phase: Phase, time: f64, pal: &Palette) {
+    let corner = pal.corner_panel();
+    if pal.dark {
+        painter.rect_filled(full, corner, pal.shadow());
+    }
+    let body = if pal.dark {
+        full.shrink(theme::SHADOW_EXTENT)
+    } else {
+        full.shrink(1.0)
+    };
+    painter.rect_filled(body, corner, pal.bg_panel);
     painter.rect_stroke(
         body,
-        theme::RADIUS_WINDOW,
-        Stroke::new(1.0, theme::LINE_STRONG),
+        corner,
+        Stroke::new(1.0, pal.line_strong),
         egui::StrokeKind::Inside,
     );
     let alpha = phase.status_alpha(time);
     if alpha > 0.0 {
         painter.rect_stroke(
             body,
-            theme::RADIUS_WINDOW,
-            theme::stroke_status(phase.color(), alpha),
+            corner,
+            Stroke::new(2.0, theme::with_alpha(phase.color(pal), alpha)),
             egui::StrokeKind::Inside,
         );
     }
 }
 
-/// 空态（供未来复用）：一整块面板底。
-fn paint_panel(painter: &egui::Painter, rect: Rect) {
-    painter.rect_filled(rect, theme::RADIUS_PANEL, theme::BG_RAISED);
-    painter.rect_stroke(
-        rect,
-        theme::RADIUS_PANEL,
-        Stroke::new(1.0, theme::LINE_SUBTLE),
-        egui::StrokeKind::Inside,
-    );
-    // 顶/左 1px 高光制造「浮起」。
+/// 面板底 + 1px 描边 + 顶部 1px 高光（浅色主题靠描边撑层级）。
+fn paint_panel(painter: &egui::Painter, rect: Rect, pal: &Palette) {
+    let corner = pal.corner_panel();
+    painter.rect_filled(rect, corner, pal.bg_raised);
+    painter.rect_stroke(rect, corner, pal.panel_stroke(), egui::StrokeKind::Inside);
     painter.line_segment(
-        [rect.left_top() + Vec2::splat(1.0), rect.right_top() + Vec2::new(-1.0, 1.0)],
-        Stroke::new(1.0, theme::HIGHLIGHT),
+        [
+            rect.left_top() + Vec2::splat(1.0),
+            rect.right_top() + Vec2::new(-1.0, 1.0),
+        ],
+        Stroke::new(1.0, pal.highlight()),
     );
 }
 
-/// 交互区域：返回是否被点击。
+/// 交互区域：返回响应（`make_persistent_id` 按控件分桶，跨帧稳定）。
 fn clickable(ui: &egui::Ui, rect: Rect, key: &str, sense: Sense) -> egui::Response {
-    // `make_persistent_id` 用根 Ui 的 id 加盐，跨帧稳定且天然按控件分桶。
     ui.interact(rect, ui.make_persistent_id(key), sense)
 }
 
-/// 主布局（自上而下：标题条 32 / 序列 72 / 三开关 / 主按钮 36 / 进度 / 底部 28）。
-fn main_layout(ui: &egui::Ui, full: Rect, state: &mut UiState, time: f64) -> Option<Action> {
-    let painter = ui.painter().clone();
-    let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
-    let width = content.width();
-    let mut action = None;
-
-    // ── 标题条 ────────────────────────────────────────────────
-    let title = Rect::from_min_size(content.min, Vec2::new(width, theme::TITLE_BAR_H));
-    let drag = clickable(ui, title, "title-drag", Sense::click_and_drag());
-    if drag.drag_started() {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-    }
-    status_dot(&painter, title.left_center() + Vec2::new(theme::SPACE_S, 0.0), state.phase, time);
-    painter.text(
-        title.left_center() + Vec2::new(theme::SPACE_S + theme::SPACE_M, 0.0),
-        Align2::LEFT_CENTER,
-        state.status_line(),
-        theme::text(theme::FONT_TITLE),
-        theme::TEXT_1,
-    );
-    // 图钉（置顶开关）排在 `△` 左边：实心 ■ = 已钉住，空心 □ = 未钉住，
-    // 两种状态一眼可分。三个按钮的矩形互不相交，`△`/`×` 的点击区域不被覆盖。
-    let pin = Rect::from_min_size(
-        Pos2::new(
-            title.right() - theme::SPACE_XXL - theme::SPACE_L * 2.0 - theme::SPACE_XS,
-            title.top() + theme::SPACE_XS,
-        ),
-        Vec2::new(theme::SPACE_L, theme::SPACE_L),
-    );
-    let pin_glyph = if state.always_on_top { "■" } else { "□" };
-    if icon_button(ui, pin, "pin", pin_glyph) {
-        action = Some(Action::ToggleAlwaysOnTop);
-    }
-    let collapse = Rect::from_min_size(
-        Pos2::new(title.right() - theme::SPACE_XXL - theme::SPACE_L, title.top() + theme::SPACE_XS),
-        Vec2::new(theme::SPACE_L, theme::SPACE_L),
-    );
-    let quit = Rect::from_min_size(
-        Pos2::new(title.right() - theme::SPACE_XL, title.top() + theme::SPACE_XS),
-        Vec2::new(theme::SPACE_L, theme::SPACE_L),
-    );
-    if icon_button(ui, collapse, "collapse", "△") {
-        action = Some(Action::Collapse);
-    }
-    if icon_button(ui, quit, "quit", "×") {
-        action = Some(Action::Quit);
-    }
-
-    // ── 目标序列 ──────────────────────────────────────────────
-    let sequence = Rect::from_min_size(
-        Pos2::new(content.left(), title.bottom() + theme::SPACE_M),
-        Vec2::new(width, theme::SEQUENCE_H),
-    );
-    paint_panel(&painter, sequence);
-    painter.rect_filled(
-        sequence,
-        theme::RADIUS_PANEL,
-        theme::BG_INSET,
-    );
-    painter.text(
-        sequence.center(),
-        Align2::CENTER_CENTER,
-        state.sequence_text(),
-        theme::mono(theme::FONT_VALUE),
-        if state.scene.shows_sequence() {
-            theme::TEXT_1
-        } else {
-            theme::TEXT_3
-        },
-    );
-
-    // ── 三个功能开关 ─────────────────────────────────────────
-    let mut top = sequence.bottom() + theme::SPACE_S;
-    for (scene, enabled) in state.toggles.entries() {
-        let row = Rect::from_min_size(
-            Pos2::new(content.left(), top),
-            Vec2::new(width, theme::TOGGLE_H),
-        );
-        let usable = state.is_calibrated() && enabled;
-        // 操作台是 BETA：标签直接带标记，让用户一眼知道这块还在自测阶段。
-        let label = if matches!(scene, crate::SceneKind::Console) {
-            "操作台 · BETA"
-        } else {
-            scene.label()
-        };
-        if toggle_row(ui, row, label, usable, &painter) {
-            action = Some(Action::ToggleFlow(scene));
-        }
-        top = row.bottom() + theme::SPACE_XS;
-    }
-
-    // ── 主按钮 ───────────────────────────────────────────────
-    let primary = Rect::from_min_size(
-        Pos2::new(content.left(), top + theme::SPACE_XS),
-        Vec2::new(width, theme::PRIMARY_H),
-    );
-    let label = state.phase.primary_label(&state.hotkey);
-    let enabled = state.phase == Phase::Running || state.start_enabled();
-    if primary_button(ui, primary, &label, enabled, state.phase) {
-        action = Some(match state.phase.primary_action() {
-            Action::Start if !state.is_calibrated() => Action::OpenCalibration,
-            other => other,
-        });
-    }
-
-    // ── 进度区 ───────────────────────────────────────────────
-    let footer = Rect::from_min_size(
-        Pos2::new(content.left(), content.bottom() - theme::FOOTER_H),
-        Vec2::new(width, theme::FOOTER_H),
-    );
-    let progress = Rect::from_min_max(
-        Pos2::new(content.left(), primary.bottom() + theme::SPACE_S),
-        Pos2::new(content.right(), footer.top() - theme::SPACE_S),
-    );
-    if let Some(notice) = state.notice_text() {
-        if notice_bar(ui, progress, notice) {
-            action = Some(Action::DismissNotice);
-        }
-    } else {
-        progress_panel(&painter, progress, state);
-    }
-
-    // ── 底部文字链 ───────────────────────────────────────────
-    if link(ui, footer.left_center(), "校准向导", &painter) {
-        action = Some(Action::OpenCalibration);
-    }
-    if link(ui, footer.right_center() - Vec2::new(theme::SPACE_XXL, 0.0), "设置", &painter) {
-        action = Some(Action::OpenSettings);
-    }
-
-    resize_grip(ui, full);
-    action
-}
-
-/// 进度区：进度文案 + 2px 进度条。
-fn progress_panel(painter: &egui::Painter, progress: Rect, state: &UiState) {
-    paint_panel(painter, progress);
-    let note = if state.missing.is_empty() {
-        state.progress.label()
-    } else {
-        "请先校准".to_owned()
-    };
-    let detail = if state.message.is_empty() {
-        note
-    } else {
-        format!("{} · {}", note, state.message)
-    };
-    painter.text(
-        progress.left_center() + Vec2::new(theme::SPACE_M, 0.0),
-        Align2::LEFT_CENTER,
-        detail,
-        theme::text(theme::FONT_BODY),
-        theme::TEXT_2,
-    );
-    let track = Rect::from_min_size(
-        Pos2::new(progress.left() + theme::SPACE_M, progress.bottom() - theme::SPACE_M),
-        Vec2::new(progress.width() - theme::SPACE_M * 2.0, 2.0),
-    );
-    painter.rect_filled(track, theme::RADIUS_BUTTON, theme::BG_INSET);
-    if state.progress.ratio() > 0.0 {
-        let filled = Rect::from_min_size(track.min, Vec2::new(track.width() * state.progress.ratio(), 2.0));
-        painter.rect_filled(filled, theme::RADIUS_BUTTON, theme::ACCENT);
-    }
-}
-
-/// 一次性警示条：**借用进度区的位置与面板底**（不新增高度，窗口固定 400×420），
-/// 描边与文字用 `WARN`（琥珀橙）—— 提醒不是错误，不用红色。
-///
-/// 返回「知道了」是否被点。
-fn notice_bar(ui: &egui::Ui, rect: Rect, notice: &str) -> bool {
-    let painter = ui.painter().clone();
-    paint_panel(&painter, rect);
-    painter.rect_stroke(
-        rect,
-        theme::RADIUS_PANEL,
-        theme::stroke_active(theme::WARN),
-        egui::StrokeKind::Inside,
-    );
-    painter.text(
-        rect.left_center() + Vec2::new(theme::SPACE_M, 0.0),
-        Align2::LEFT_CENTER,
-        notice,
-        theme::text(theme::FONT_BODY),
-        theme::WARN,
-    );
-    let button = notice_button_rect(rect);
-    secondary_button(ui, button, "知道了")
-}
-
-/// 「知道了」按钮位置：贴右居中，四周留 `SPACE_M` 边距（窄到 64px 高也不越界）。
-fn notice_button_rect(rect: Rect) -> Rect {
-    Rect::from_min_size(
-        Pos2::new(
-            rect.right() - theme::SPACE_M - theme::NOTICE_BUTTON_W,
-            rect.center().y - theme::NOTICE_BUTTON_H / 2.0,
-        ),
-        Vec2::new(theme::NOTICE_BUTTON_W, theme::NOTICE_BUTTON_H),
-    )
-}
-
-/// 收起态：176×36 悬浮条（状态点 + 场景名 + 迷你进度 + 展开箭头）。
-fn collapsed_strip(ui: &egui::Ui, full: Rect, state: &mut UiState) -> Option<Action> {
-    let painter = ui.painter().clone();
-    let time = state.phase_elapsed;
-    let strip = full.shrink(theme::SHADOW_EXTENT);
-    let mut action = None;
-    let drag = clickable(ui, strip, "collapsed-drag", Sense::click_and_drag());
-    if drag.drag_started() {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-    }
-    status_dot(&painter, strip.left_center() + Vec2::new(theme::SPACE_M, 0.0), state.phase, time);
-    painter.text(
-        strip.left_center() + Vec2::new(theme::SPACE_XL, 0.0),
-        Align2::LEFT_CENTER,
-        state.scene.label(),
-        theme::text(theme::FONT_BODY),
-        theme::TEXT_1,
-    );
-    let mini = Rect::from_min_size(
-        Pos2::new(strip.left() + 104.0, strip.center().y - 1.0),
-        Vec2::new(40.0, 2.0),
-    );
-    painter.rect_filled(mini, theme::RADIUS_BUTTON, theme::BG_INSET);
-    if state.progress.ratio() > 0.0 {
-        painter.rect_filled(
-            Rect::from_min_size(mini.min, Vec2::new(mini.width() * state.progress.ratio(), 2.0)),
-            theme::RADIUS_BUTTON,
-            theme::ACCENT,
-        );
-    }
-    let expand = Rect::from_min_size(
-        Pos2::new(strip.right() - theme::SPACE_XL, strip.center().y - theme::SPACE_S),
-        Vec2::splat(theme::SPACE_L),
-    );
-    if icon_button(ui, expand, "expand", "▽") {
-        action = Some(Action::Expand);
-    }
-    action
-}
-
-/// 状态点：颜色即状态色，尺寸固定，不呼吸放大（只呼吸 alpha）。
-fn status_dot(painter: &egui::Painter, center: Pos2, phase: Phase, time: f64) {
+/// 状态点：7px 定尺寸，只呼吸 alpha（不放大）。
+fn status_dot(painter: &egui::Painter, center: Pos2, phase: Phase, time: f64, pal: &Palette) {
     let alpha = if phase == Phase::Idle {
         1.0
     } else {
@@ -321,139 +87,581 @@ fn status_dot(painter: &egui::Painter, center: Pos2, phase: Phase, time: f64) {
     painter.circle_filled(
         center,
         theme::DOT_RADIUS,
-        with_alpha(phase.color(), alpha),
+        theme::with_alpha(phase.color(pal), alpha),
     );
 }
 
-/// 带 alpha 的颜色。
-fn with_alpha(color: Color32, alpha: f32) -> Color32 {
-    let [r, g, b, _] = color.to_array();
-    Color32::from_rgba_unmultiplied(r, g, b, (255.0 * alpha.clamp(0.0, 1.0)) as u8)
-}
-
-/// 小图标按钮（收起 / 退出 / 展开）。
-fn icon_button(ui: &egui::Ui, rect: Rect, key: &str, glyph: &str) -> bool {
+/// 小图标按钮（图钉 / 收起 / 退出 / 展开）。
+fn icon_button(ui: &egui::Ui, rect: Rect, key: &str, glyph: &str, pal: &Palette) -> bool {
     let response = clickable(ui, rect, key, Sense::click());
-    let painter = ui.painter();
     let color = if response.hovered() {
-        theme::ACCENT
+        pal.accent
     } else {
-        theme::TEXT_2
+        pal.text_2
     };
-    painter.text(
+    ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
         glyph,
-        theme::text(theme::FONT_BODY),
+        pal.text(pal.font_body),
         color,
     );
     response.clicked()
 }
 
-/// 文字链（底部「校准向导 / 设置」）。
-fn link(ui: &egui::Ui, anchor: Pos2, label: &str, painter: &egui::Painter) -> bool {
-    let width = label.chars().count() as f32 * theme::FONT_LABEL + theme::SPACE_S;
-    let rect = Rect::from_center_size(anchor + Vec2::new(width / 2.0, 0.0), Vec2::new(width, theme::FOOTER_H));
+/// 文字链（底部「校准向导 / 设置」、错误态的「重试」）。
+fn link(ui: &egui::Ui, rect: Rect, label: &str, size: f32, pal: &Palette) -> bool {
     let response = clickable(ui, rect, label, Sense::click());
     let color = if response.hovered() {
-        theme::ACCENT
+        pal.accent
     } else {
-        theme::TEXT_3
+        pal.text_3
     };
-    painter.text(
+    ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
-        theme::text(theme::FONT_LABEL),
+        pal.text(size),
         color,
     );
     response.clicked()
 }
 
-/// 功能开关行：左侧标签，右侧开关点。
-fn toggle_row(ui: &egui::Ui, rect: Rect, label: &str, on: bool, painter: &egui::Painter) -> bool {
-    let response = clickable(ui, rect, label, Sense::click());
-    let hovered = response.hovered();
-    painter.rect_filled(
-        rect,
-        theme::RADIUS_BUTTON,
-        if hovered { theme::BG_RAISED } else { theme::BG_PANEL },
-    );
-    painter.rect_stroke(
-        rect,
-        theme::RADIUS_BUTTON,
-        Stroke::new(1.0, theme::LINE_SUBTLE),
-        egui::StrokeKind::Inside,
-    );
-    let text_color = if on { theme::TEXT_1 } else { theme::TEXT_3 };
-    painter.text(
-        rect.left_center() + Vec2::new(theme::SPACE_M, 0.0),
-        Align2::LEFT_CENTER,
-        label,
-        theme::text(theme::FONT_BODY),
-        text_color,
-    );
-    let switch = Pos2::new(rect.right() - theme::SPACE_L, rect.center().y);
-    painter.circle_stroke(switch, theme::DOT_RADIUS, Stroke::new(1.0, theme::LINE_STRONG));
+/// 28×16 轨道 + 12px 滑块（状态由滑块位置表达，「开/关」二字已删除）。
+fn switch(painter: &egui::Painter, center: Pos2, on: bool, pal: &Palette) {
+    let track = Rect::from_center_size(center, Vec2::new(theme::SWITCH_W, theme::SWITCH_H));
+    let radius = egui::CornerRadius::same((theme::SWITCH_H / 2.0) as u8);
     if on {
-        painter.circle_filled(switch, theme::DOT_RADIUS, theme::ACCENT);
+        painter.rect_filled(track, radius, pal.switch_track_on());
+    } else {
+        painter.rect_filled(track, radius, pal.switch_track_off());
+        painter.rect_stroke(
+            track,
+            radius,
+            Stroke::new(1.0, pal.line_strong),
+            egui::StrokeKind::Inside,
+        );
     }
-    painter.text(
-        Pos2::new(switch.x - theme::SPACE_M, switch.y),
-        Align2::RIGHT_CENTER,
-        if on { "开" } else { "关" },
-        theme::text(theme::FONT_LABEL),
-        text_color,
+    let inset = theme::SWITCH_THUMB / 2.0 + 2.0;
+    let x = if on {
+        track.right() - inset
+    } else {
+        track.left() + inset
+    };
+    painter.circle_filled(
+        Pos2::new(x, track.center().y),
+        theme::SWITCH_THUMB / 2.0,
+        if on {
+            pal.switch_thumb_on()
+        } else {
+            pal.switch_thumb_off()
+        },
     );
-    response.clicked()
 }
 
-/// 主按钮：满宽 36，运行中变「取消操作」。
-fn primary_button(ui: &egui::Ui, rect: Rect, label: &str, enabled: bool, phase: Phase) -> bool {
-    let response = clickable(ui, rect, label, Sense::click());
-    if !enabled {
-        let painter = ui.painter();
-        painter.rect_filled(rect, theme::RADIUS_BUTTON, theme::BG_PANEL);
+// ── 主布局（`ui-themes.md` §3.1 的纵向分段表）─────────────────────
+
+/// L-A 分段的六个区段与网格六格。
+#[derive(Debug, Clone, Copy)]
+struct MainRows {
+    title: Rect,
+    result: Rect,
+    grid: [Rect; 6],
+    primary: Rect,
+    status: Rect,
+    footer: Rect,
+}
+
+/// 由内容区算出纵向分段（纯函数，便于直接断言 400×420 / 340×360）。
+///
+/// 标称 388 = 32+8+96+12+108+12+44+8+32+8+28（§3.1 表格逐行的落点）；
+/// 窗口更矮时**先压结果区（96→64），再压段间距（→4）**——不压开关行高、不删行。
+fn main_rows(content: Rect) -> MainRows {
+    let width = content.width();
+    let fixed = theme::TITLE_BAR_H
+        + theme::GRID_H
+        + theme::PRIMARY_H
+        + theme::STATUS_H
+        + theme::FOOTER_H;
+    let mut gaps = [8.0_f32, 12.0, 12.0, 8.0, 8.0];
+    let total = |result_h: f32, gaps: &[f32; 5]| fixed + result_h + gaps.iter().sum::<f32>();
+    let mut result_h = theme::RESULT_H;
+    while total(result_h, &gaps) > content.height() && result_h > theme::RESULT_MIN_H {
+        result_h -= 4.0;
+    }
+    while total(result_h, &gaps) > content.height() && gaps.iter().any(|gap| *gap > 4.0) {
+        for gap in gaps.iter_mut() {
+            *gap = (*gap - 2.0).max(4.0);
+        }
+    }
+    // 富余空间全部给结果区（窗口拉高时不留死白）。
+    let slack = content.height() - total(result_h, &gaps);
+    if slack > 0.0 {
+        result_h += slack;
+    }
+
+    let row = |top: f32, height: f32| {
+        Rect::from_min_size(Pos2::new(content.left(), top), Vec2::new(width, height))
+    };
+    let mut y = content.top();
+    let title = row(y, theme::TITLE_BAR_H);
+    y = title.bottom() + gaps[0];
+    let result = row(y, result_h);
+    y = result.bottom() + gaps[1];
+    let grid_area = row(y, theme::GRID_H);
+    y = grid_area.bottom() + gaps[2];
+    let primary = row(y, theme::PRIMARY_H);
+    y = primary.bottom() + gaps[3];
+    let status = row(y, theme::STATUS_H);
+    y = status.bottom() + gaps[4];
+    let footer = row(y, theme::FOOTER_H);
+
+    // 3 行 × 2 列：列宽 =（内容宽 − 20）/2，行高 =（108 − 2×6）/3 = 32。
+    let cell_w = (width - theme::GRID_COL_GAP) / 2.0;
+    let cell_h = (theme::GRID_H - theme::GRID_ROW_GAP * 2.0) / 3.0;
+    let mut grid = [Rect::NOTHING; 6];
+    for (index, cell) in grid.iter_mut().enumerate() {
+        let column = index % 2;
+        let row_index = index / 2;
+        *cell = Rect::from_min_size(
+            Pos2::new(
+                content.left() + column as f32 * (cell_w + theme::GRID_COL_GAP),
+                grid_area.top() + row_index as f32 * (cell_h + theme::GRID_ROW_GAP),
+            ),
+            Vec2::new(cell_w, cell_h),
+        );
+    }
+
+    MainRows {
+        title,
+        result,
+        grid,
+        primary,
+        status,
+        footer,
+    }
+}
+
+fn main_layout(ui: &egui::Ui, full: Rect, state: &mut UiState, pal: &Palette) -> Option<Action> {
+    let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
+    let rows = main_rows(content);
+    let mut action = None;
+
+    // ── 1 标题条：状态点 + 状态文字 + 右侧三个 16px 图标 ────────────
+    let drag = clickable(ui, rows.title, "title-drag", Sense::click_and_drag());
+    if drag.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    let painter = ui.painter();
+    status_dot(
+        painter,
+        rows.title.left_center() + Vec2::new(theme::SPACE_S, 0.0),
+        state.phase,
+        state.phase_elapsed,
+        pal,
+    );
+    painter.text(
+        rows.title.left_center() + Vec2::new(theme::SPACE_S + theme::SPACE_M, 0.0),
+        Align2::LEFT_CENTER,
+        state.status_line(),
+        pal.text(pal.font_title),
+        pal.text_1,
+    );
+    let icon = theme::ICON_BUTTON;
+    let icon_at = |index: f32| {
+        Rect::from_min_size(
+            Pos2::new(
+                rows.title.right() - icon * index - theme::SPACE_XS * index,
+                rows.title.top() + (theme::TITLE_BAR_H - icon) / 2.0,
+            ),
+            Vec2::splat(icon),
+        )
+    };
+    let (quit, collapse, pin) = (icon_at(1.0), icon_at(2.0), icon_at(3.0));
+    if icon_button(ui, pin, "pin", if state.always_on_top { "■" } else { "□" }, pal) {
+        action = Some(Action::ToggleAlwaysOnTop);
+    }
+    if icon_button(ui, collapse, "collapse", "△", pal) {
+        action = Some(Action::Collapse);
+    }
+    if icon_button(ui, quit, "quit", "×", pal) {
+        action = Some(Action::Quit);
+    }
+
+    // ── 2 结果区：空闲不画卡；有结果单卡 + 五态描边 ──────────────────
+    if let Some(produced) = result_area(ui, rows.result, state, pal) {
+        action = Some(produced);
+    }
+
+    // ── 3 开关网格：3 行 × 2 列，六格 ────────────────────────────
+    for (index, (cell, label, on)) in state.grid().into_iter().enumerate() {
+        if let Some(produced) = grid_cell(ui, rows.grid[index], cell, label, on, &state.hotkey, pal)
+        {
+            action = Some(produced);
+        }
+    }
+
+    // ── 4 主按钮：满宽实心 accent ───────────────────────────────
+    if let Some(produced) = primary_button(ui, rows.primary, state, pal) {
+        action = Some(produced);
+    }
+
+    // ── 5 状态行：12px 文案 + 底部 2px 进度轨 ────────────────────
+    status_row(ui, rows.status, state, pal);
+
+    // ── 6 底部文字链 ───────────────────────────────────────────
+    let link_w = 6.0 * pal.font_label + theme::SPACE_S;
+    let left = Rect::from_min_size(
+        Pos2::new(rows.footer.left(), rows.footer.top()),
+        Vec2::new(link_w, rows.footer.height()),
+    );
+    if link(ui, left, "校准向导", pal.font_label, pal) {
+        action = Some(Action::OpenCalibration);
+    }
+    let right = Rect::from_min_size(
+        Pos2::new(rows.footer.right() - link_w, rows.footer.top()),
+        Vec2::new(link_w, rows.footer.height()),
+    );
+    if link(ui, right, "设置", pal.font_label, pal) {
+        action = Some(Action::OpenSettings);
+    }
+
+    resize_grip(ui, full, pal);
+    action
+}
+
+/// 结果区（§3.4 五态 + spec D2b 三场景）。
+fn result_area(ui: &egui::Ui, rect: Rect, state: &UiState, pal: &Palette) -> Option<Action> {
+    let painter = ui.painter();
+    let result_state = state.result_state();
+    if result_state == ResultState::Idle {
+        // 空闲：**不画边框**，只一行 13px 提示（空的高对比卡会被读成「加载失败」）。
+        painter.text(
+            rect.left_center() + Vec2::new(theme::SPACE_S, 0.0),
+            Align2::LEFT_CENTER,
+            state.idle_hint(),
+            pal.text(pal.font_body),
+            pal.text_2,
+        );
+        return None;
+    }
+
+    painter.rect_filled(rect, pal.corner_panel(), pal.bg_inset);
+    if let Some(border) = result_state.border(pal) {
         painter.rect_stroke(
             rect,
-            theme::RADIUS_BUTTON,
-            Stroke::new(1.0, theme::LINE_SUBTLE),
+            pal.corner_panel(),
+            Stroke::new(1.0, border),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let mut action = None;
+    match state.result_content() {
+        Some(content) => {
+            painter.text(
+                Pos2::new(rect.center().x, rect.center().y - pal.font_label * 0.7),
+                Align2::CENTER_CENTER,
+                &content.headline,
+                theme::mono(pal.font_value),
+                pal.text_1,
+            );
+            // 11px 来源标签（摩斯 / 指纹 / 操作台）。
+            painter.text(
+                Pos2::new(rect.center().x, rect.bottom() - theme::SPACE_M),
+                Align2::CENTER_BOTTOM,
+                source_label(state.scene),
+                pal.text(pal.font_label),
+                pal.text_3,
+            );
+            // 12px 状态标签在右下。
+            painter.text(
+                rect.right_bottom() - Vec2::new(theme::SPACE_M, theme::SPACE_M),
+                Align2::RIGHT_BOTTOM,
+                &content.tag,
+                pal.text(pal.font_label + 1.0),
+                pal.text_2,
+            );
+        }
+        None => {
+            // 运行中还没有结果 / 失败原因：居中一行，绝不画假进度。
+            let text = if state.message.is_empty() {
+                state.progress.label()
+            } else {
+                state.message.clone()
+            };
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                text,
+                pal.text(pal.font_body),
+                if result_state == ResultState::Error {
+                    pal.err
+                } else {
+                    pal.text_2
+                },
+            );
+        }
+    }
+
+    match result_state {
+        ResultState::Partial => {
+            painter.text(
+                rect.left_bottom() + Vec2::new(theme::SPACE_M, -theme::SPACE_M),
+                Align2::LEFT_BOTTOM,
+                "识别可能有误，请核对",
+                pal.text(pal.font_label),
+                pal.warn,
+            );
+        }
+        ResultState::Error => {
+            let retry = Rect::from_min_size(
+                Pos2::new(
+                    rect.left() + theme::SPACE_M,
+                    rect.bottom() - theme::SPACE_M - 16.0,
+                ),
+                Vec2::new(theme::SPACE_XL + theme::SPACE_S, 16.0),
+            );
+            if link(ui, retry, "重试", pal.font_label, pal) {
+                action = Some(Action::Start);
+            }
+        }
+        _ => {}
+    }
+    action
+}
+
+/// 结果区来源标签（spec D2b 的三种场景）。
+fn source_label(scene: SceneKind) -> &'static str {
+    match scene {
+        SceneKind::Morse => "摩斯",
+        SceneKind::Fingerprint => "指纹",
+        SceneKind::Console => "操作台",
+        SceneKind::Unknown => "识别结果",
+    }
+}
+
+/// 一格开关（或热键键帽）。
+fn grid_cell(
+    ui: &egui::Ui,
+    rect: Rect,
+    cell: GridCell,
+    label: &str,
+    on: bool,
+    hotkey: &str,
+    pal: &Palette,
+) -> Option<Action> {
+    let painter = ui.painter();
+    if cell == GridCell::Keycap {
+        // 键帽：空心描边块 + 等宽热键名，不可点。
+        painter.rect_stroke(
+            rect,
+            pal.corner_button(),
+            Stroke::new(1.0, pal.line_strong),
             egui::StrokeKind::Inside,
         );
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
-            label,
-            theme::text(theme::FONT_BODY),
-            theme::TEXT_3,
+            hotkey,
+            theme::mono(pal.font_label),
+            pal.text_2,
         );
-        return false;
+        return None;
     }
-    let painter = ui.painter();
-    let hovered = response.hovered();
+
+    let response = clickable(ui, rect, label, Sense::click());
     painter.rect_filled(
         rect,
-        theme::RADIUS_BUTTON,
-        if hovered { theme::BG_RAISED } else { theme::BG_PANEL },
+        pal.corner_button(),
+        if response.hovered() {
+            pal.bg_raised
+        } else {
+            pal.bg_panel
+        },
     );
     painter.rect_stroke(
         rect,
-        theme::RADIUS_BUTTON,
-        theme::stroke_active(if hovered { phase.color() } else { theme::ACCENT }),
+        pal.corner_button(),
+        Stroke::new(1.0, pal.line_subtle),
         egui::StrokeKind::Inside,
     );
     painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
+        rect.left_center() + Vec2::new(theme::SPACE_S + 2.0, 0.0),
+        Align2::LEFT_CENTER,
         label,
-        theme::text(theme::FONT_BODY),
-        theme::TEXT_1,
+        pal.text(pal.font_body),
+        if on { pal.text_1 } else { pal.text_2 },
     );
-    response.clicked()
+    switch(
+        painter,
+        rect.right_center() - Vec2::new(theme::SPACE_M, 0.0),
+        on,
+        pal,
+    );
+    if response.clicked() {
+        return cell.action();
+    }
+    None
 }
 
-/// 右下角 12×12 抓边：按住即进入系统缩放。
-fn resize_grip(ui: &egui::Ui, full: Rect) {
+/// 主按钮：可用态满宽实心 accent；不可用态改文案 + 描边（不静默禁用）。
+fn primary_button(ui: &egui::Ui, rect: Rect, state: &mut UiState, pal: &Palette) -> Option<Action> {
+    let form = state.primary_state();
+    let response = clickable(ui, rect, "primary", Sense::click());
+    let painter = ui.painter();
+    let corner = pal.corner_button();
+    if form.filled() {
+        let fill = if response.is_pointer_button_down_on() {
+            pal.btn_fill_active()
+        } else if response.hovered() {
+            pal.btn_fill_hover()
+        } else {
+            pal.btn_fill()
+        };
+        painter.rect_filled(rect, corner, fill);
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            form.label(),
+            pal.text(pal.font_title),
+            pal.accent_text_on,
+        );
+        // 右侧 30% alpha 的热键提示。
+        painter.text(
+            rect.right_center() - Vec2::new(theme::SPACE_M, 0.0),
+            Align2::RIGHT_CENTER,
+            &state.hotkey,
+            theme::mono(pal.font_label),
+            theme::with_alpha(pal.accent_text_on, 0.30),
+        );
+    } else {
+        painter.rect_filled(rect, corner, pal.bg_raised);
+        painter.rect_stroke(rect, corner, Stroke::new(1.0, pal.line_strong), egui::StrokeKind::Inside);
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            form.label(),
+            pal.text(pal.font_title),
+            pal.text_2,
+        );
+    }
+    if !response.clicked() {
+        return None;
+    }
+    if form == PrimaryState::Running {
+        // 运行态防连点：300ms 内的第二次点击被吞（§3.4 Loading 行）。
+        let now = ui.input(|input| input.time);
+        if !state.cancel_allowed(now) {
+            return None;
+        }
+    }
+    Some(form.action())
+}
+
+/// 状态行：左 12px 文案（一次性警示时改说警示）+ 底部 2px 进度轨。
+fn status_row(ui: &egui::Ui, rect: Rect, state: &mut UiState, pal: &Palette) {
+    let painter = ui.painter();
+    let track = Rect::from_min_size(
+        Pos2::new(rect.left(), rect.bottom() - theme::PROGRESS_TRACK_H),
+        Vec2::new(rect.width(), theme::PROGRESS_TRACK_H),
+    );
+    painter.rect_filled(track, pal.corner_button(), pal.progress_track());
+    let ratio = state.progress.ratio();
+    if ratio > 0.0 {
+        painter.rect_filled(
+            Rect::from_min_size(track.min, Vec2::new(track.width() * ratio, track.height())),
+            pal.corner_button(),
+            pal.progress_fill(),
+        );
+    }
+
+    if let Some(notice) = state.notice.clone() {
+        painter.text(
+            Pos2::new(rect.left(), rect.center().y - theme::PROGRESS_TRACK_H),
+            Align2::LEFT_CENTER,
+            notice.as_str(),
+            pal.text(pal.font_body),
+            pal.warn,
+        );
+        let dismiss = Rect::from_min_size(
+            Pos2::new(
+                rect.right() - theme::NOTICE_BUTTON_W,
+                rect.center().y - 10.0 - theme::PROGRESS_TRACK_H,
+            ),
+            Vec2::new(theme::NOTICE_BUTTON_W, 20.0),
+        );
+        if link(ui, dismiss, "知道了", pal.font_label, pal) {
+            state.dismiss_notice();
+        }
+        return;
+    }
+
+    let text = if state.message.is_empty() {
+        state.status_line()
+    } else {
+        format!("{} · {}", state.status_line(), state.message)
+    };
+    painter.text(
+        Pos2::new(rect.left(), rect.center().y - theme::PROGRESS_TRACK_H),
+        Align2::LEFT_CENTER,
+        text,
+        pal.text(pal.font_label + 1.0),
+        pal.text_2,
+    );
+}
+
+/// 收起态：176×36 悬浮条（状态点 + 场景名 + 迷你进度 + 展开箭头）。
+fn collapsed_strip(ui: &egui::Ui, full: Rect, state: &mut UiState, pal: &Palette) -> Option<Action> {
+    let strip = if pal.dark {
+        full.shrink(theme::SHADOW_EXTENT)
+    } else {
+        full.shrink(1.0)
+    };
+    let mut action = None;
+    let drag = clickable(ui, strip, "collapsed-drag", Sense::click_and_drag());
+    if drag.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    let painter = ui.painter();
+    status_dot(
+        painter,
+        strip.left_center() + Vec2::new(theme::SPACE_M, 0.0),
+        state.phase,
+        state.phase_elapsed,
+        pal,
+    );
+    painter.text(
+        strip.left_center() + Vec2::new(theme::SPACE_XL, 0.0),
+        Align2::LEFT_CENTER,
+        state.scene.label(),
+        pal.text(pal.font_body),
+        pal.text_1,
+    );
+    let mini = Rect::from_min_size(
+        Pos2::new(strip.left() + 104.0, strip.center().y - 1.0),
+        Vec2::new(40.0, 2.0),
+    );
+    painter.rect_filled(mini, pal.corner_button(), pal.progress_track());
+    if state.progress.ratio() > 0.0 {
+        painter.rect_filled(
+            Rect::from_min_size(mini.min, Vec2::new(mini.width() * state.progress.ratio(), 2.0)),
+            pal.corner_button(),
+            pal.progress_fill(),
+        );
+    }
+    let expand = Rect::from_min_size(
+        Pos2::new(strip.right() - theme::SPACE_XL, strip.center().y - theme::SPACE_S),
+        Vec2::splat(theme::SPACE_L),
+    );
+    if icon_button(ui, expand, "expand", "▽", pal) {
+        action = Some(Action::Expand);
+    }
+    action
+}
+
+/// 右下角 12×12 抓边：按住进入系统缩放。
+fn resize_grip(ui: &egui::Ui, full: Rect, pal: &Palette) {
     let grip = Rect::from_min_size(
         Pos2::new(
             full.right() - theme::RESIZE_GRIP - theme::SHADOW_EXTENT,
@@ -470,7 +678,7 @@ fn resize_grip(ui: &egui::Ui, full: Rect) {
                 Pos2::new(grip.right() - offset, grip.bottom() - 1.0),
                 Pos2::new(grip.right() - 1.0, grip.bottom() - offset),
             ],
-            Stroke::new(1.0, theme::LINE_STRONG),
+            Stroke::new(1.0, pal.line_strong),
         );
     }
     if response.drag_started() {
@@ -481,12 +689,14 @@ fn resize_grip(ui: &egui::Ui, full: Rect) {
     }
 }
 
+// ── 校准向导（布局沿用，仅换成 Palette 与主题字号）──────────────────
+
 /// 向导一帧的外部素材（预览纹理由 `delta-app` 截图后上传）。
 pub struct WizardFrame<'a> {
     pub preview: Option<&'a egui::TextureHandle>,
     /// 主显示器物理分辨率（显示用）。
     pub monitor: [u32; 2],
-    /// 已存区域的百分比框（画琥珀虚线）。
+    /// 已存区域的百分比框。
     pub existing: &'a [(String, PctRect)],
 }
 
@@ -506,104 +716,96 @@ pub fn wizard_window(
     ui: &mut egui::Ui,
     wizard: &mut Wizard,
     frame: WizardFrame<'_>,
+    pal: &Palette,
 ) -> Option<WizardAction> {
     let mut action = None;
     if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
         action = Some(WizardAction::Back);
     }
-    {
-        {
-            let full = ui.max_rect();
-            let painter = ui.painter().clone();
-            let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
-            paint_shell(&painter, full, Phase::Idle, 0.0);
+    let full = ui.max_rect();
+    let painter = ui.painter().clone();
+    let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
+    paint_shell(&painter, full, Phase::Idle, 0.0, pal);
 
-            // 步序标题：`3/5 排错复看`
-            painter.text(
-                content.left_top(),
-                Align2::LEFT_TOP,
-                format!("{}/5 {}", wizard.step.index(), wizard.step.title()),
-                theme::text(theme::FONT_TITLE),
-                theme::TEXT_1,
-            );
-            painter.text(
-                content.right_top(),
-                Align2::RIGHT_TOP,
-                format!("{}×{}", frame.monitor[0], frame.monitor[1]),
-                theme::text(theme::FONT_LABEL),
-                theme::TEXT_3,
-            );
+    painter.text(
+        content.left_top(),
+        Align2::LEFT_TOP,
+        format!("{}/5 {}", wizard.step.index(), wizard.step.title()),
+        pal.text(pal.font_title),
+        pal.text_1,
+    );
+    painter.text(
+        content.right_top(),
+        Align2::RIGHT_TOP,
+        format!("{}×{}", frame.monitor[0], frame.monitor[1]),
+        pal.text(pal.font_label),
+        pal.text_3,
+    );
 
-            let stage = Rect::from_min_max(
-                Pos2::new(content.left(), content.top() + theme::SPACE_XXL),
-                Pos2::new(content.right(), content.bottom() - theme::PRIMARY_H - theme::SPACE_XL),
-            );
-            match wizard.step {
-                Step::PickScene => paint_scene_cards(ui, stage, wizard),
-                Step::SelectRegion => {
-                    if let Some(drawn) = paint_region_stage(ui, stage, wizard, &frame) {
-                        action = Some(WizardAction::Drawn(drawn));
-                    }
-                }
-                Step::Review => paint_review(ui, stage, wizard, &frame),
-                Step::TestRun => paint_test_run(ui, stage, wizard),
-                Step::Save => paint_saved(ui, stage, wizard),
-            }
-
-            // 补录模板：复看步顺带填角色名（只此一处用 egui 原生输入框）。
-            if wizard.step == Step::Review && wizard.scene == Some(WizardScene::Recapture) {
-                let field = Rect::from_min_size(
-                    Pos2::new(content.left(), content.top() + theme::SPACE_XXL),
-                    Vec2::new(content.width(), theme::PRIMARY_H),
-                );
-                painter.text(
-                    Pos2::new(field.left(), field.top() - theme::SPACE_XS),
-                    Align2::LEFT_BOTTOM,
-                    "填角色名",
-                    theme::text(theme::FONT_LABEL),
-                    theme::TEXT_2,
-                );
-                let mut buffer = wizard.role_name.clone();
-                let response = ui.put(
-                    field,
-                    egui::TextEdit::singleline(&mut buffer).hint_text("角色名"),
-                );
-                if response.changed() {
-                    wizard.role_name = buffer;
-                }
-            }
-
-            // 底部按钮行
-            let row = Rect::from_min_size(
-                Pos2::new(content.left(), content.bottom() - theme::PRIMARY_H),
-                Vec2::new(content.width(), theme::PRIMARY_H),
-            );
-            if wizard.step.has_redo() {
-                let redo = Rect::from_min_size(row.min, Vec2::new(row.width() * 0.4, row.height()));
-                if secondary_button(ui, redo, "重画一次") {
-                    action = Some(WizardAction::Redo);
-                }
-                let primary = Rect::from_min_size(
-                    Pos2::new(redo.right() + theme::SPACE_S, row.top()),
-                    Vec2::new(row.width() - redo.width() - theme::SPACE_S, row.height()),
-                );
-                let enabled = wizard.can_advance();
-                if primary_button(ui, primary, wizard.step.primary(), enabled, Phase::Running) {
-                    action = Some(WizardAction::Primary);
-                }
-            } else {
-                let enabled = wizard.can_advance();
-                if primary_button(ui, row, wizard.step.primary(), enabled, Phase::Running) {
-                    action = Some(WizardAction::Primary);
-                }
+    let stage = Rect::from_min_max(
+        Pos2::new(content.left(), content.top() + theme::SPACE_XXL),
+        Pos2::new(content.right(), content.bottom() - theme::PRIMARY_H - theme::SPACE_XL),
+    );
+    match wizard.step {
+        Step::PickScene => paint_scene_cards(ui, stage, wizard, pal),
+        Step::SelectRegion => {
+            if let Some(drawn) = paint_region_stage(ui, stage, wizard, &frame, pal) {
+                action = Some(WizardAction::Drawn(drawn));
             }
         }
+        Step::Review => paint_review(ui, stage, wizard, &frame, pal),
+        Step::TestRun => paint_test_run(ui, stage, wizard, pal),
+        Step::Save => paint_saved(ui, stage, pal),
+    }
+
+    // 补录模板：复看步顺带填角色名（只此一处用 egui 原生输入框）。
+    if wizard.step == Step::Review && wizard.scene == Some(WizardScene::Recapture) {
+        let field = Rect::from_min_size(
+            Pos2::new(content.left(), content.top() + theme::SPACE_XXL),
+            Vec2::new(content.width(), theme::PRIMARY_H),
+        );
+        painter.text(
+            Pos2::new(field.left(), field.top() - theme::SPACE_XS),
+            Align2::LEFT_BOTTOM,
+            "填角色名",
+            pal.text(pal.font_label),
+            pal.text_2,
+        );
+        let mut buffer = wizard.role_name.clone();
+        let response = ui.put(
+            field,
+            egui::TextEdit::singleline(&mut buffer).hint_text("角色名"),
+        );
+        if response.changed() {
+            wizard.role_name = buffer;
+        }
+    }
+
+    // 底部按钮行
+    let row = Rect::from_min_size(
+        Pos2::new(content.left(), content.bottom() - theme::PRIMARY_H),
+        Vec2::new(content.width(), theme::PRIMARY_H),
+    );
+    if wizard.step.has_redo() {
+        let redo = Rect::from_min_size(row.min, Vec2::new(row.width() * 0.4, row.height()));
+        if secondary_button(ui, redo, "重画一次", pal) {
+            action = Some(WizardAction::Redo);
+        }
+        let primary = Rect::from_min_size(
+            Pos2::new(redo.right() + theme::SPACE_S, row.top()),
+            Vec2::new(row.width() - redo.width() - theme::SPACE_S, row.height()),
+        );
+        if filled_button(ui, primary, wizard.step.primary(), wizard.can_advance(), pal) {
+            action = Some(WizardAction::Primary);
+        }
+    } else if filled_button(ui, row, wizard.step.primary(), wizard.can_advance(), pal) {
+        action = Some(WizardAction::Primary);
     }
     action
 }
 
 /// 第一步：三张场景卡片 + 补录入口。
-fn paint_scene_cards(ui: &egui::Ui, stage: Rect, wizard: &mut Wizard) {
+fn paint_scene_cards(ui: &egui::Ui, stage: Rect, wizard: &mut Wizard, pal: &Palette) {
     let painter = ui.painter().clone();
     let card_h = (stage.height() - theme::SPACE_S * 3.0) / 4.0;
     for (index, scene) in WizardScene::ALL.iter().enumerate() {
@@ -612,26 +814,26 @@ fn paint_scene_cards(ui: &egui::Ui, stage: Rect, wizard: &mut Wizard) {
             Vec2::new(stage.width(), card_h),
         );
         let response = clickable(ui, card, scene.label(), Sense::click());
-        paint_panel(&painter, card);
+        paint_panel(&painter, card, pal);
         painter.text(
             Pos2::new(card.left() + theme::SPACE_M, card.center().y - theme::SPACE_XS),
             Align2::LEFT_CENTER,
             scene.label(),
-            theme::text(theme::FONT_BODY),
-            theme::TEXT_1,
+            pal.text(pal.font_body),
+            pal.text_1,
         );
         painter.text(
             Pos2::new(card.left() + theme::SPACE_M, card.center().y + theme::SPACE_S),
             Align2::LEFT_CENTER,
             scene.hint(),
-            theme::text(theme::FONT_LABEL),
-            theme::TEXT_3,
+            pal.text(pal.font_label),
+            pal.text_3,
         );
         if response.hovered() {
             painter.rect_stroke(
                 card,
-                theme::RADIUS_PANEL,
-                theme::stroke_active(theme::ACCENT),
+                pal.corner_panel(),
+                Stroke::new(2.0, pal.accent),
                 egui::StrokeKind::Inside,
             );
         }
@@ -641,19 +843,20 @@ fn paint_scene_cards(ui: &egui::Ui, stage: Rect, wizard: &mut Wizard) {
     }
 }
 
-/// 第二步：拖一次即存（松手生效，无确认按钮），已存区域画琥珀虚线框。
+/// 第二步：拖一次即存（松手生效，无确认按钮），已存区域画 accent 虚线框。
 fn paint_region_stage(
     ui: &egui::Ui,
     stage: Rect,
     wizard: &mut Wizard,
     frame: &WizardFrame<'_>,
+    pal: &Palette,
 ) -> Option<PctRect> {
     let painter = ui.painter().clone();
-    painter.rect_filled(stage, theme::RADIUS_PANEL, theme::BG_INSET);
+    painter.rect_filled(stage, pal.corner_panel(), pal.bg_inset);
     painter.rect_stroke(
         stage,
-        theme::RADIUS_PANEL,
-        Stroke::new(1.0, theme::LINE_SUBTLE),
+        pal.corner_panel(),
+        Stroke::new(1.0, pal.line_subtle),
         egui::StrokeKind::Inside,
     );
     if let Some(texture) = frame.preview {
@@ -665,7 +868,7 @@ fn paint_region_stage(
         );
     }
     for (_, rect) in frame.existing {
-        dashed_pct_rect(&painter, stage, *rect, theme::ACCENT);
+        dashed_pct_rect(&painter, stage, *rect, pal.accent);
     }
     if let Some(spec) = wizard.current() {
         painter.text(
@@ -677,8 +880,8 @@ fn paint_region_stage(
                 wizard.cursor + 1,
                 wizard.targets().len()
             ),
-            theme::text(theme::FONT_LABEL),
-            theme::TEXT_1,
+            pal.text(pal.font_label),
+            pal.text_1,
         );
     }
     let response = clickable(ui, stage, "region-drag", Sense::drag());
@@ -695,9 +898,9 @@ fn paint_region_stage(
 }
 
 /// 第三步：回显预览 + 结果文案（「重画一次」/「对，继续」在底部）。
-fn paint_review(ui: &egui::Ui, stage: Rect, wizard: &Wizard, frame: &WizardFrame<'_>) {
+fn paint_review(ui: &egui::Ui, stage: Rect, wizard: &Wizard, frame: &WizardFrame<'_>, pal: &Palette) {
     let painter = ui.painter().clone();
-    painter.rect_filled(stage, theme::RADIUS_PANEL, theme::BG_INSET);
+    painter.rect_filled(stage, pal.corner_panel(), pal.bg_inset);
     if let Some(texture) = frame.preview {
         let target = stage.shrink(theme::SPACE_S);
         painter.image(
@@ -711,81 +914,118 @@ fn paint_review(ui: &egui::Ui, stage: Rect, wizard: &Wizard, frame: &WizardFrame
             stage.center(),
             Align2::CENTER_CENTER,
             "暂无回显",
-            theme::text(theme::FONT_BODY),
-            theme::TEXT_3,
+            pal.text(pal.font_body),
+            pal.text_3,
         );
     }
     painter.text(
         Pos2::new(stage.left(), stage.bottom() - theme::SPACE_M),
         Align2::LEFT_BOTTOM,
         format!("已框 {} 处", wizard.drawn_count()),
-        theme::text(theme::FONT_LABEL),
-        theme::TEXT_2,
+        pal.text(pal.font_label),
+        pal.text_2,
     );
     let _ = ui;
 }
 
 /// 第四步：只读识别结果（不产生任何输入）。
-fn paint_test_run(ui: &egui::Ui, stage: Rect, wizard: &Wizard) {
+fn paint_test_run(ui: &egui::Ui, stage: Rect, wizard: &Wizard, pal: &Palette) {
     let painter = ui.painter().clone();
-    paint_panel(&painter, stage);
+    paint_panel(&painter, stage, pal);
     let (text, color) = match &wizard.verdict {
-        Verdict::Pending => ("还没有试跑".to_owned(), theme::TEXT_3),
-        Verdict::Read(value) => (format!("读到 {value}"), theme::OK),
-        Verdict::Failed(reason) => (format!("没读到 · {reason}"), theme::WARN),
+        Verdict::Pending => ("还没有试跑".to_owned(), pal.text_3),
+        Verdict::Read(value) => (format!("读到 {value}"), pal.ok),
+        Verdict::Failed(reason) => (format!("没读到 · {reason}"), pal.warn),
     };
     painter.text(
         stage.center(),
         Align2::CENTER_CENTER,
         text,
-        theme::mono(theme::FONT_TITLE),
+        theme::mono(pal.font_title),
         color,
     );
     painter.text(
         Pos2::new(stage.center().x, stage.bottom() - theme::SPACE_M),
         Align2::CENTER_BOTTOM,
         "试跑不产生任何输入",
-        theme::text(theme::FONT_LABEL),
-        theme::TEXT_3,
+        pal.text(pal.font_label),
+        pal.text_3,
     );
     let _ = ui;
 }
 
 /// 第五步：保存提示。
-fn paint_saved(ui: &egui::Ui, stage: Rect, wizard: &Wizard) {
+fn paint_saved(ui: &egui::Ui, stage: Rect, pal: &Palette) {
     let painter = ui.painter().clone();
-    paint_panel(&painter, stage);
+    paint_panel(&painter, stage, pal);
     painter.text(
         stage.center(),
         Align2::CENTER_CENTER,
         "已保存 · 换分辨率也能用",
-        theme::text(theme::FONT_BODY),
-        theme::OK,
+        pal.text(pal.font_body),
+        pal.ok,
     );
-    let _ = (ui, wizard);
+    let _ = ui;
 }
 
 /// 次要按钮（描边款）。
-fn secondary_button(ui: &egui::Ui, rect: Rect, label: &str) -> bool {
+fn secondary_button(ui: &egui::Ui, rect: Rect, label: &str, pal: &Palette) -> bool {
     let response = clickable(ui, rect, label, Sense::click());
     let painter = ui.painter();
-    painter.rect_filled(rect, theme::RADIUS_BUTTON, theme::BG_PANEL);
+    painter.rect_filled(rect, pal.corner_button(), pal.bg_panel);
     painter.rect_stroke(
         rect,
-        theme::RADIUS_BUTTON,
-        theme::stroke_normal(),
+        pal.corner_button(),
+        Stroke::new(1.0, pal.line_strong),
         egui::StrokeKind::Inside,
     );
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
-        theme::text(theme::FONT_BODY),
+        pal.text(pal.font_body),
         if response.hovered() {
-            theme::TEXT_1
+            pal.text_1
         } else {
-            theme::TEXT_2
+            pal.text_2
         },
+    );
+    response.clicked()
+}
+
+/// 实心主按钮（向导里的「继续」）。
+fn filled_button(ui: &egui::Ui, rect: Rect, label: &str, enabled: bool, pal: &Palette) -> bool {
+    let response = clickable(ui, rect, label, Sense::click());
+    let painter = ui.painter();
+    if !enabled {
+        painter.rect_filled(rect, pal.corner_button(), pal.bg_raised);
+        painter.rect_stroke(
+            rect,
+            pal.corner_button(),
+            Stroke::new(1.0, pal.line_strong),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            label,
+            pal.text(pal.font_title),
+            pal.text_2,
+        );
+        return false;
+    }
+    let fill = if response.hovered() {
+        pal.btn_fill_hover()
+    } else {
+        pal.btn_fill()
+    };
+    painter.rect_filled(rect, pal.corner_button(), fill);
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        pal.text(pal.font_title),
+        pal.accent_text_on,
     );
     response.clicked()
 }
@@ -812,7 +1052,7 @@ pub fn screen_rect_from_pct(stage: Rect, rect: PctRect) -> Rect {
     )
 }
 
-/// 琥珀虚线框（校准里「已存区域」的标记）。
+/// accent 虚线框（校准里「已存区域」的标记）。
 fn dashed_pct_rect(painter: &egui::Painter, stage: Rect, rect: PctRect, color: Color32) {
     if rect.is_empty() {
         return;
@@ -842,26 +1082,32 @@ fn dashed_pct_rect(painter: &egui::Painter, stage: Rect, rect: PctRect, color: C
     }
 }
 
+// ── 设置浮层 ─────────────────────────────────────────────────────
 
-/// 截图后端的两个选项（spec D1：只两档，默认 WGC；顺序即下拉顺序）。
+/// 截图后端的两个选项（默认 WGC；顺序即下拉顺序）。
 const CAPTURE_BACKENDS: [CaptureBackend; 2] = [CaptureBackend::Wgc, CaptureBackend::BitBlt];
-/// 带副标题的设置行高度（标题 + 灰色小字说明，spec D6）。
+/// 带副标题的设置行高度（标题 + 灰色小字说明）。
 const SETTINGS_ROW_H: f32 = 40.0;
+/// 单行控件高度。
+const SETTINGS_LINE_H: f32 = 28.0;
+/// 行间距。
+const SETTINGS_GAP: f32 = 6.0;
+/// 底部动作条高度。
+const SETTINGS_FOOTER_H: f32 = 36.0;
 /// 测试结果区高度（缩略图 + 一行「宽×高 · 耗时ms」）。
 const CAPTURE_RESULT_H: f32 = 90.0;
-/// 缩略图上限（spec D5 建议 ≤160×90；这里让出一行文字位，取 160×64）。
+/// 缩略图上限。
 const CAPTURE_THUMB_MAX: [f32; 2] = [160.0, 64.0];
 /// 右侧值槽宽度（要放下 `Windows Graphics Capture ▼`）。
 const BACKEND_VALUE_W: f32 = 168.0;
-/// 下拉面板宽度（要放下「兼容模式 · 可能截不到独占全屏」）。
+/// 下拉面板宽度。
 const BACKEND_MENU_W: f32 = 220.0;
 /// 行内小按钮宽度（`抓一帧`）。
 const ROW_BUTTON_W: f32 = 72.0;
+/// 主色预设色相（用户只选色相，明度彩度由 OKLCH 规则算）。
+const ACCENT_HUES: [f32; 8] = [0.0, 30.0, 45.0, 120.0, 180.0, 210.0, 270.0, 330.0];
 
-/// 下拉里每一项的文案。
-///
-/// 兼容档必须自曝风险（spec D1 显式边界：UI 上标注「可能截不到独占全屏」），
-/// 因此它不叫「BitBlt」而叫「兼容模式」。
+/// 下拉里每一项的文案。兼容档必须自曝风险（spec D1）。
 fn backend_label(backend: CaptureBackend) -> &'static str {
     match backend {
         CaptureBackend::Wgc => "Windows Graphics Capture",
@@ -869,105 +1115,127 @@ fn backend_label(backend: CaptureBackend) -> &'static str {
     }
 }
 
-/// 设置面板的行骨架（坐标相对窗口，已扣除面板外边距）。
+/// 设置面板的行骨架（坐标相对**滚动后的内层区**）。
 ///
-/// 高度预算（默认窗口 400×420 → 内容区 376×404）：
-/// 标题 32 + 热键 28 + 8 + 兜底 28 + 8 + 截图方式 40 + 8 + 测试截图 40 + 8 + 结果区 90。
-/// 结果区与配置路径**互斥**（spec D6 允许测试结果临时替换配置文件路径区域），
-/// 因此最小窗口 340×360 下两者也不会同时出现、更不会挤压底部按钮。
+/// 顺序：热键 / 文字兜底 / 主题 / 主色 / F 键监听 / 游戏关键词 / 截图方式 / 测试截图 / 结果或配置路径。
+/// 内容高于视口时由 [`settings_panel`] 内部滚动（主界面不允许滚动）。
 #[derive(Debug, Clone, Copy)]
 struct SettingsRows {
     hotkey: Rect,
     ocr: Rect,
+    theme: Rect,
+    accent: Rect,
+    fkey: Rect,
+    keywords: Rect,
     backend: Rect,
     test: Rect,
     /// 结果区（缩略图 / 失败原因）。
     result: Rect,
     /// 配置路径区；有测试结果时为 `None`（与结果区二选一）。
     config: Option<Rect>,
-    footer: Rect,
 }
 
 fn settings_rows(content: Rect, has_result: bool) -> SettingsRows {
     let row = |top: f32, height: f32| {
         Rect::from_min_size(Pos2::new(content.left(), top), Vec2::new(content.width(), height))
     };
-    let top = content.top();
-    let hotkey = row(top + theme::SPACE_XXL, theme::TOGGLE_H);
-    let ocr = row(hotkey.bottom() + theme::SPACE_S, theme::TOGGLE_H);
-    let backend = row(ocr.bottom() + theme::SPACE_S, SETTINGS_ROW_H);
-    let test = row(backend.bottom() + theme::SPACE_S, SETTINGS_ROW_H);
-    let extra_top = test.bottom() + theme::SPACE_S;
+    let mut top = content.top();
+    let mut next = |height: f32| {
+        let rect = row(top, height);
+        top = rect.bottom() + SETTINGS_GAP;
+        rect
+    };
+    let hotkey = next(SETTINGS_LINE_H);
+    let ocr = next(SETTINGS_LINE_H);
+    let theme_row = next(SETTINGS_LINE_H);
+    let accent = next(SETTINGS_LINE_H);
+    let fkey = next(SETTINGS_LINE_H);
+    let keywords = next(SETTINGS_ROW_H);
+    let backend = next(SETTINGS_ROW_H);
+    let test = next(SETTINGS_ROW_H);
+    let extra_height = if has_result {
+        CAPTURE_RESULT_H
+    } else {
+        SETTINGS_ROW_H
+    };
+    let extra = next(extra_height);
     SettingsRows {
         hotkey,
         ocr,
+        theme: theme_row,
+        accent,
+        fkey,
+        keywords,
         backend,
         test,
-        result: row(extra_top, CAPTURE_RESULT_H),
-        config: (!has_result).then(|| row(extra_top, SETTINGS_ROW_H)),
-        footer: Rect::from_min_size(
-            Pos2::new(content.left(), content.bottom() - theme::PRIMARY_H),
-            Vec2::new(content.width(), theme::PRIMARY_H),
-        ),
+        result: extra,
+        config: (!has_result).then_some(extra),
     }
 }
 
-/// 行内右侧控件槽：固定高度、右对齐，与左侧标题一个水平带。
+/// 设置页滚动区的总高度（含标题留给视口的余量）。
+fn settings_inner_height(has_result: bool) -> f32 {
+    let lines = 5.0 * SETTINGS_LINE_H;
+    let rows = 2.0 * SETTINGS_ROW_H + if has_result { CAPTURE_RESULT_H } else { SETTINGS_ROW_H };
+    let gaps = 8.0 * SETTINGS_GAP;
+    theme::TITLE_BAR_H + theme::SPACE_S + lines + rows + gaps
+}
+
+/// 行内右侧控件槽：固定高度、右对齐。
 fn row_slot(rect: Rect, width: f32) -> Rect {
     Rect::from_min_size(
         Pos2::new(
             rect.right() - theme::SPACE_M - width,
-            rect.center().y - theme::TOGGLE_H / 2.0,
+            rect.center().y - SETTINGS_LINE_H / 2.0,
         ),
-        Vec2::new(width, theme::TOGGLE_H),
+        Vec2::new(width, SETTINGS_LINE_H),
     )
 }
 
-/// 一行设置：左侧标题 + 下方灰色小字说明 + 行底 1px 分隔（spec D6 的行式结构）。
-fn paint_settings_row(painter: &egui::Painter, rect: Rect, title: &str, hint: &str, dim: bool) {
-    let title_color = if dim { theme::TEXT_3 } else { theme::TEXT_1 };
+/// 一行设置：左侧标题 + 下方灰色小字说明 + 行底 1px 分隔。
+fn paint_settings_row(painter: &egui::Painter, rect: Rect, title: &str, hint: &str, dim: bool, pal: &Palette) {
     painter.text(
         Pos2::new(rect.left() + theme::SPACE_M, rect.top() + theme::SPACE_XS),
         Align2::LEFT_TOP,
         title,
-        theme::text(theme::FONT_BODY),
-        title_color,
+        pal.text(pal.font_body),
+        if dim { pal.text_3 } else { pal.text_1 },
     );
     painter.text(
         Pos2::new(
             rect.left() + theme::SPACE_M,
-            rect.top() + theme::SPACE_XS + theme::FONT_TITLE,
+            rect.top() + theme::SPACE_XS + pal.font_title,
         ),
         Align2::LEFT_TOP,
         hint,
-        theme::text(theme::FONT_LABEL),
-        theme::TEXT_3,
+        pal.text(pal.font_label),
+        pal.text_3,
     );
     painter.line_segment(
         [rect.left_bottom(), rect.right_bottom()],
-        Stroke::new(1.0, theme::LINE_SUBTLE),
+        Stroke::new(1.0, pal.line_subtle),
     );
 }
 
-/// 行内小按钮：`enabled == false` 时置灰且不响应点击（运行中禁止切换 / 抓帧）。
-fn row_button(ui: &egui::Ui, rect: Rect, label: &str, enabled: bool) -> bool {
+/// 行内小按钮：`enabled == false` 时置灰且不响应点击。
+fn row_button(ui: &egui::Ui, rect: Rect, label: &str, enabled: bool, pal: &Palette) -> bool {
     if enabled {
-        return secondary_button(ui, rect, label);
+        return secondary_button(ui, rect, label, pal);
     }
     let painter = ui.painter();
-    painter.rect_filled(rect, theme::RADIUS_BUTTON, theme::BG_PANEL);
+    painter.rect_filled(rect, pal.corner_button(), pal.bg_panel);
     painter.rect_stroke(
         rect,
-        theme::RADIUS_BUTTON,
-        Stroke::new(1.0, theme::LINE_SUBTLE),
+        pal.corner_button(),
+        Stroke::new(1.0, pal.line_subtle),
         egui::StrokeKind::Inside,
     );
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
-        theme::text(theme::FONT_LABEL),
-        theme::TEXT_3,
+        pal.text(pal.font_label),
+        pal.text_3,
     );
     false
 }
@@ -979,7 +1247,7 @@ fn fit_inside(area: Rect, width: u32, height: u32) -> Rect {
     Rect::from_center_size(area.center(), source * scale)
 }
 
-/// 设置浮层素材（热键 / 文字兜底 / 截图方式 / 测试截图 / 配置路径）。
+/// 设置浮层素材。
 pub struct SettingsView<'a> {
     pub hotkey: &'a str,
     /// 是否正在捕获新热键（捕获态只显示提示，没有任何文本输入框）。
@@ -988,32 +1256,44 @@ pub struct SettingsView<'a> {
     pub hotkey_conflict: Option<&'a str>,
     pub ocr_enabled: bool,
     pub config_path: &'a str,
-    /// 当前截图后端（spec D1）。
     pub capture_backend: CaptureBackend,
-    /// 运行中 → 截图方式与测试截图都置灰（spec D1 显式边界）。
     pub capture_locked: bool,
-    /// 最近一次测试截图的结果（spec D5：缩略图 + 宽×高 · 耗时）。
     pub capture_test: Option<&'a CaptureTestResult>,
-    /// 最近一次测试截图的失败原因（与结果互斥，失败显示红色文案）。
     pub capture_test_error: Option<&'a str>,
+    /// 当前主题（六套之一）。
+    pub theme_id: ThemeId,
+    /// 自定义主色（`#RRGGBB`）。
+    pub accent_override: Option<&'a str>,
+    /// F 键监听总开关（spec D3 边界 3）。
+    pub f_key_hook: bool,
+    /// 游戏窗口关键词编辑框（逗号分隔，回车/失焦提交）。
+    pub keywords: &'a mut String,
 }
 
 /// 设置浮层动作。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsAction {
     /// 只读检查游戏与场景，不产生任何输入。
     Probe,
     ToggleOcr,
     /// 点热键行 → 进入捕获态。
     EditHotkey,
-    /// 捕获成功 → 提交这一组键（调用方格式化后写配置并热更新）。
+    /// 捕获成功 → 提交这一组键。
     CommitHotkey(KeyChord),
     /// 捕获态下 Esc / 点热键行外 → 只退出捕获，不关面板（D4）。
     CancelHotkey,
-    /// 切换截图后端（写配置 + 下一次抓帧立即生效，spec D1）。
+    /// 切换截图后端。
     SetCaptureBackend(CaptureBackend),
-    /// 点「抓一帧」：调用方在后台线程建临时会话抓一帧（spec D5）。
+    /// 点「抓一帧」。
     TestCapture,
+    /// 换主题（立即生效，不重启）。
+    SetTheme(ThemeId),
+    /// 换主色（`None` = 恢复该主题默认 accent）。
+    SetAccent(Option<String>),
+    /// F 键监听总开关。
+    ToggleFKeyHook,
+    /// 提交关键词原文。
+    CommitKeywords(String),
     Close,
 }
 
@@ -1040,8 +1320,24 @@ fn resolve_capture(ui: &egui::Ui, editing: bool, hotkey_row: Rect) -> Option<Set
     None
 }
 
+/// 滚轮 → 滚动量（设置页内部滚动；主界面永不滚动）。
+fn scroll_offset(ui: &egui::Ui, viewport: Rect, inner_height: f32) -> f32 {
+    let id = ui.make_persistent_id("settings-scroll");
+    let max = (inner_height - viewport.height()).max(0.0);
+    let wheel = ui.input(|input| input.smooth_scroll_delta.y);
+    let current = ui.ctx().data(|data| data.get_temp::<f32>(id).unwrap_or(0.0));
+    // 滚轮向上（正）→ 内容上移 → offset 减小。
+    let updated = (current - wheel).clamp(0.0, max);
+    ui.ctx().data_mut(|data| data.insert_temp(id, updated));
+    updated
+}
+
 /// 设置浮层（覆在主界面上，不新开窗口）。
-pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<SettingsAction> {
+pub fn settings_panel(
+    ui: &mut egui::Ui,
+    view: SettingsView<'_>,
+    pal: &Palette,
+) -> Option<SettingsAction> {
     let mut action = None;
     // D4：捕获态下 Esc 只取消捕获 —— 所以「Esc 关面板」必须先排除捕获态。
     if !view.hotkey_editing && ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -1049,68 +1345,78 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
     }
     let full = ui.max_rect();
     let painter = ui.painter().clone();
-    paint_shell(&painter, full, Phase::Idle, 0.0);
+    paint_shell(&painter, full, Phase::Idle, 0.0, pal);
     let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
     painter.text(
         content.left_top(),
         Align2::LEFT_TOP,
         "设置",
-        theme::text(theme::FONT_TITLE),
-        theme::TEXT_1,
+        pal.text(pal.font_title),
+        pal.text_1,
     );
 
     let has_result = view.capture_test.is_some() || view.capture_test_error.is_some();
-    let rows = settings_rows(content, has_result);
+    let footer = Rect::from_min_size(
+        Pos2::new(content.left(), content.bottom() - SETTINGS_FOOTER_H),
+        Vec2::new(content.width(), SETTINGS_FOOTER_H),
+    );
+    // 滚动区 = 标题下方到动作条上方。
+    let viewport = Rect::from_min_max(
+        Pos2::new(content.left(), content.top() + theme::TITLE_BAR_H),
+        Pos2::new(content.right(), footer.top() - theme::SPACE_S),
+    );
+    let inner_height = settings_inner_height(has_result);
+    let offset = scroll_offset(ui, viewport, inner_height);
+    let inner = Rect::from_min_size(
+        Pos2::new(viewport.left(), viewport.top() - offset),
+        Vec2::new(viewport.width(), inner_height.max(viewport.height())),
+    );
+    let rows = settings_rows(inner, has_result);
+    // 只画视口内的像素，并且只在视口内响应点击（滚出视野的行不该能被点到）。
+    let painter = ui.painter().clone().with_clip_rect(viewport);
+    let hit = |rect: Rect| rect.intersect(viewport);
 
-    // ── 全局热键（点一下即可捕获，捕获态没有任何文本输入框）──────────
-    paint_panel(&painter, rows.hotkey);
+    // ── 全局热键（点一下即可捕获）──────────────────────────────
+    paint_panel(&painter, rows.hotkey, pal);
     painter.text(
         rows.hotkey.left_center() + Vec2::new(theme::SPACE_M, 0.0),
         Align2::LEFT_CENTER,
         "全局热键",
-        theme::text(theme::FONT_BODY),
-        theme::TEXT_2,
+        pal.text(pal.font_body),
+        pal.text_2,
     );
     // 捕获结算先于既有控件：这一帧的按键/取消不会被按钮点击覆盖掉。
     if action.is_none() {
-        action = resolve_capture(ui, view.hotkey_editing, rows.hotkey);
+        action = resolve_capture(ui, view.hotkey_editing, hit(rows.hotkey));
     }
     if view.hotkey_editing {
-        // 捕获态：只提示按键，绝不提供文本输入（spec D3 删自由输入）。
         painter.text(
             rows.hotkey.left_center() + Vec2::new(content.width() * 0.45, 0.0),
             Align2::LEFT_CENTER,
             "请按下新热键…",
-            theme::text(theme::FONT_BODY),
-            theme::ACCENT,
+            pal.text(pal.font_body),
+            pal.accent,
         );
         painter.text(
             rows.hotkey.right_center() - Vec2::new(theme::SPACE_M, 0.0),
             Align2::RIGHT_CENTER,
             "Esc 取消",
-            theme::text(theme::FONT_LABEL),
-            theme::TEXT_3,
+            pal.text(pal.font_label),
+            pal.text_3,
         );
     } else {
-        let response = ui.interact(
-            rows.hotkey,
-            ui.scope_id().with("hotkey-row"),
-            egui::Sense::click(),
-        );
-        // 冲突态：右侧这一格换成红色冲突文案（文案里已含「仍为 F8」，旧键信息不丢）。
-        // 字号用 `FONT_LABEL`：最小宽度 340 下长组合键不会压到左侧「全局热键」。
-        let conflict = view.hotkey_conflict;
-        let (label, font, color) = match (conflict, response.hovered()) {
-            (Some(text), _) => (text.to_owned(), theme::text(theme::FONT_LABEL), theme::ERR),
+        let response = clickable(ui, hit(rows.hotkey), "hotkey-row", Sense::click());
+        let (label, font, color) = match (view.hotkey_conflict, response.hovered()) {
+            (Some(text), _) => (text.to_owned(), pal.text(pal.font_label), pal.err),
             (None, true) => (
                 format!("{} · 点这里改", view.hotkey),
-                theme::mono(theme::FONT_BODY),
-                theme::ACCENT,
+                theme::mono(pal.font_body),
+                pal.accent,
             ),
             (None, false) => (
                 view.hotkey.to_owned(),
-                theme::mono(theme::FONT_BODY),
-                theme::TEXT_1,
+                theme::mono(pal.font_body),
+                pal.text_1,
             ),
         };
         painter.text(
@@ -1126,11 +1432,44 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
     }
 
     // ── 文字兜底开关 ──────────────────────────────────────────
-    if toggle_row(ui, rows.ocr, "文字兜底", view.ocr_enabled, &painter) {
+    if toggle_row(ui, hit(rows.ocr), "文字兜底", view.ocr_enabled, pal) {
         action = Some(SettingsAction::ToggleOcr);
     }
 
-    // ── 截图方式（spec D1 / D6：点开自绘下拉，不引入 ComboBox 的浅色默认外观）──
+    // ── 主题（六套，点一下立即生效）──────────────────────────────
+    paint_theme_row(ui, hit(rows.theme), view.theme_id, pal)
+        .into_iter()
+        .for_each(|theme| action = Some(SettingsAction::SetTheme(theme)));
+
+    // ── 主色（色相预设 + 恢复默认）───────────────────────────────
+    if let Some(produced) = paint_accent_row(ui, hit(rows.accent), &view, pal) {
+        action = Some(produced);
+    }
+
+    // ── F 键监听 ─────────────────────────────────────────────
+    if toggle_row(ui, hit(rows.fkey), "F 键监听", view.f_key_hook, pal) {
+        action = Some(SettingsAction::ToggleFKeyHook);
+    }
+
+    // ── 游戏窗口关键词（逗号分隔，回车/失焦提交）──────────────────
+    paint_settings_row(
+        &painter,
+        rows.keywords,
+        "游戏窗口关键词",
+        "命中才响应 F 键，逗号分隔",
+        false,
+        pal,
+    );
+    let field = row_slot(rows.keywords, content.width() * 0.45);
+    let response = ui.put(
+        field,
+        egui::TextEdit::singleline(&mut *view.keywords).hint_text("三角洲, Delta Force"),
+    );
+    if response.lost_focus() || ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+        action = Some(SettingsAction::CommitKeywords(view.keywords.clone()));
+    }
+
+    // ── 截图方式（自绘下拉，不引入 ComboBox 的默认外观）──────────────
     let locked = view.capture_locked;
     paint_settings_row(
         &painter,
@@ -1142,8 +1481,9 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
             "切换后下一次抓帧立即生效"
         },
         locked,
+        pal,
     );
-    let value_slot = row_slot(rows.backend, BACKEND_VALUE_W);
+    let value_slot = hit(row_slot(rows.backend, BACKEND_VALUE_W));
     let menu_id = ui.make_persistent_id("capture-backend-menu");
     let mut menu_open =
         !locked && ui.ctx().data(|data| data.get_temp::<bool>(menu_id).unwrap_or(false));
@@ -1157,8 +1497,8 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
             value_slot.right_center(),
             Align2::RIGHT_CENTER,
             value_text,
-            theme::text(theme::FONT_BODY),
-            theme::TEXT_3,
+            pal.text(pal.font_body),
+            pal.text_3,
         );
         false
     } else {
@@ -1167,11 +1507,11 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
             value_slot.right_center(),
             Align2::RIGHT_CENTER,
             value_text,
-            theme::text(theme::FONT_BODY),
+            pal.text(pal.font_body),
             if response.hovered() {
-                theme::ACCENT
+                pal.accent
             } else {
-                theme::TEXT_1
+                pal.text_1
             },
         );
         response.clicked()
@@ -1180,16 +1520,16 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
         menu_open = !menu_open;
     }
 
-    // ── 测试截图（spec D5：只在点击时抓一帧，不点不抓）──────────────
+    // ── 测试截图 ─────────────────────────────────────────────
     paint_settings_row(
         &painter,
         rows.test,
         "测试截图",
         "抓一帧验证当前后端能出图",
         locked,
+        pal,
     );
-    let test_button = row_slot(rows.test, ROW_BUTTON_W);
-    if row_button(ui, test_button, "抓一帧", !locked) {
+    if row_button(ui, hit(row_slot(rows.test, ROW_BUTTON_W)), "抓一帧", !locked, pal) {
         action = Some(SettingsAction::TestCapture);
     }
 
@@ -1211,66 +1551,65 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
         );
         painter.rect_stroke(
             thumb,
-            theme::RADIUS_BUTTON,
-            Stroke::new(1.0, theme::LINE_SUBTLE),
+            pal.corner_button(),
+            Stroke::new(1.0, pal.line_subtle),
             egui::StrokeKind::Inside,
         );
         painter.text(
             Pos2::new(rows.result.center().x, rows.result.bottom() - theme::SPACE_XS),
             Align2::CENTER_BOTTOM,
             result.summary(),
-            theme::mono(theme::FONT_LABEL),
-            theme::TEXT_2,
+            theme::mono(pal.font_label),
+            pal.text_2,
         );
     } else if let Some(reason) = view.capture_test_error {
-        // 错误码在被截断时最容易被丢掉，所以交给 egui 自动换行，绝不手写单行文本。
-        let mut error_ui = ui.new_child(egui::UiBuilder::new().max_rect(rows.result));
+        // 错误码在被截断时最容易被丢掉，所以交给 egui 自动换行。
+        let mut error_ui = ui.new_child(egui::UiBuilder::new().max_rect(hit(rows.result)));
         error_ui.add(
             egui::Label::new(
                 egui::RichText::new(reason)
-                    .size(theme::FONT_LABEL)
-                    .color(theme::ERR),
+                    .size(pal.font_label)
+                    .color(pal.err),
             )
             .wrap(),
         );
     }
 
-    // ── 配置路径（有测试结果时让位，spec D6 允许的替换）──────────────
+    // ── 配置路径（有测试结果时让位）──────────────────────────────
     if let Some(config) = rows.config {
         painter.text(
             config.left_top(),
             Align2::LEFT_TOP,
             "配置文件",
-            theme::text(theme::FONT_LABEL),
-            theme::TEXT_3,
+            pal.text(pal.font_label),
+            pal.text_3,
         );
         painter.text(
             Pos2::new(config.left(), config.top() + theme::SPACE_L),
             Align2::LEFT_TOP,
             view.config_path,
-            theme::mono(theme::FONT_LABEL),
-            theme::TEXT_3,
+            theme::mono(pal.font_label),
+            pal.text_3,
         );
     }
 
-    // ── 底部：检查游戏 / 返回 ─────────────────────────────────
-    let footer = rows.footer;
+    // ── 底部动作条（固定，不随滚动）──────────────────────────────
     let probe = Rect::from_min_size(footer.min, Vec2::new(footer.width() * 0.48, footer.height()));
-    if secondary_button(ui, probe, "检查游戏") {
+    if secondary_button(ui, probe, "检查游戏", pal) {
         action = Some(SettingsAction::Probe);
     }
     let back = Rect::from_min_size(
         Pos2::new(probe.right() + theme::SPACE_S, footer.top()),
         Vec2::new(footer.width() - probe.width() - theme::SPACE_S, footer.height()),
     );
-    if primary_button(ui, back, "返回", true, Phase::Idle) {
+    if filled_button(ui, back, "返回", true, pal) {
         action = Some(SettingsAction::Close);
     }
 
     // ── 下拉最后画：压在其它行之上，点击优先级也高于下面的按钮 ──────────
     let mut option_clicked = false;
     if menu_open {
-        let item_height = theme::TOGGLE_H;
+        let item_height = SETTINGS_LINE_H;
         let menu = Rect::from_min_size(
             Pos2::new(
                 value_slot.right() - BACKEND_MENU_W,
@@ -1281,7 +1620,8 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
                 item_height * CAPTURE_BACKENDS.len() as f32 + theme::SPACE_S,
             ),
         );
-        paint_panel(&painter, menu);
+        let menu_painter = ui.painter().with_clip_rect(full);
+        paint_panel(&menu_painter, menu, pal);
         for (index, backend) in CAPTURE_BACKENDS.into_iter().enumerate() {
             let item = Rect::from_min_size(
                 Pos2::new(
@@ -1294,15 +1634,15 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
             let response = clickable(ui, item, &key, Sense::click());
             let selected = backend == view.capture_backend;
             let color = match (selected, response.hovered()) {
-                (true, _) => theme::ACCENT,
-                (false, true) => theme::TEXT_1,
-                (false, false) => theme::TEXT_2,
+                (true, _) => pal.accent,
+                (false, true) => pal.text_1,
+                (false, false) => pal.text_2,
             };
-            painter.text(
+            menu_painter.text(
                 item.left_center() + Vec2::new(theme::SPACE_S, 0.0),
                 Align2::LEFT_CENTER,
                 backend_label(backend),
-                theme::text(theme::FONT_LABEL),
+                pal.text(pal.font_label),
                 color,
             );
             if response.clicked() {
@@ -1322,12 +1662,159 @@ pub fn settings_panel(ui: &mut egui::Ui, view: SettingsView<'_>) -> Option<Setti
     action
 }
 
+/// 开关行（左标签 + 右 28×16 开关轨道）。
+fn toggle_row(ui: &egui::Ui, rect: Rect, label: &str, on: bool, pal: &Palette) -> bool {
+    let response = clickable(ui, rect, label, Sense::click());
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        pal.corner_button(),
+        if response.hovered() {
+            pal.bg_raised
+        } else {
+            pal.bg_panel
+        },
+    );
+    painter.rect_stroke(
+        rect,
+        pal.corner_button(),
+        Stroke::new(1.0, pal.line_subtle),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.left_center() + Vec2::new(theme::SPACE_M, 0.0),
+        Align2::LEFT_CENTER,
+        label,
+        pal.text(pal.font_body),
+        if on { pal.text_1 } else { pal.text_2 },
+    );
+    switch(
+        painter,
+        rect.right_center() - Vec2::new(theme::SPACE_L, 0.0),
+        on,
+        pal,
+    );
+    response.clicked()
+}
+
+/// 主题行：六个名字，选中项用 accent 高亮；返回新选中的主题（没点 = `None`）。
+fn paint_theme_row(ui: &egui::Ui, rect: Rect, current: ThemeId, pal: &Palette) -> Option<ThemeId> {
+    let painter = ui.painter();
+    painter.text(
+        rect.left_center() + Vec2::new(theme::SPACE_M, 0.0),
+        Align2::LEFT_CENTER,
+        "主题",
+        pal.text(pal.font_body),
+        pal.text_2,
+    );
+    let mut chosen = None;
+    let chip_w = 30.0;
+    let start = rect.right() - theme::SPACE_M - chip_w * theme::ALL.len() as f32;
+    for (index, id) in theme::ALL.into_iter().enumerate() {
+        let chip = Rect::from_min_size(
+            Pos2::new(start + chip_w * index as f32, rect.top()),
+            Vec2::new(chip_w, rect.height()),
+        );
+        let response = clickable(ui, chip, &format!("theme-{}", id.token()), Sense::click());
+        let selected = id == current;
+        let color = match (selected, response.hovered()) {
+            (true, _) => pal.accent,
+            (false, true) => pal.text_1,
+            (false, false) => pal.text_3,
+        };
+        painter.text(
+            chip.center(),
+            Align2::CENTER_CENTER,
+            id.label(),
+            pal.text(pal.font_label),
+            color,
+        );
+        if selected {
+            painter.rect_stroke(
+                chip.shrink2(Vec2::new(2.0, 2.0)),
+                pal.corner_button(),
+                Stroke::new(1.0, pal.accent),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if response.clicked() && !selected {
+            chosen = Some(id);
+        }
+    }
+    chosen
+}
+
+/// 主色行：8 个色相预设 + 「恢复默认」。改动即时预览（下一帧就用新色板重绘）。
+fn paint_accent_row(
+    ui: &egui::Ui,
+    rect: Rect,
+    view: &SettingsView<'_>,
+    pal: &Palette,
+) -> Option<SettingsAction> {
+    let painter = ui.painter();
+    painter.text(
+        rect.left_center() + Vec2::new(theme::SPACE_M, 0.0),
+        Align2::LEFT_CENTER,
+        "主色",
+        pal.text(pal.font_body),
+        pal.text_2,
+    );
+    let dot = 14.0;
+    let step = dot + 8.0;
+    let reset_w = 5.0 * pal.font_label;
+    let start = rect.right() - theme::SPACE_M - reset_w - step * ACCENT_HUES.len() as f32;
+    let current = view.accent_override.and_then(theme::parse_hex);
+    let base = *theme::palette(view.theme_id);
+    let mut action = None;
+    for (index, hue) in ACCENT_HUES.into_iter().enumerate() {
+        let center = Pos2::new(
+            start + step * index as f32 + dot / 2.0,
+            rect.center().y,
+        );
+        let swatch = Rect::from_center_size(center, Vec2::splat(dot));
+        let response = clickable(ui, swatch, &format!("accent-hue-{}", hue as u32), Sense::click());
+        let color = base.with_accent(hue).accent;
+        painter.circle_filled(center, dot / 2.0, color);
+        if current.is_some_and(|selected| selected == color) {
+            painter.circle_stroke(center, dot / 2.0 + 2.0, Stroke::new(1.0, pal.text_1));
+        }
+        // 悬停放大视觉反馈（不改变布局）。
+        if response.hovered() {
+            painter.circle_stroke(center, dot / 2.0 + 3.0, Stroke::new(1.0, pal.accent));
+        }
+        if response.clicked() {
+            action = Some(SettingsAction::SetAccent(Some(theme::to_hex(color))));
+        }
+    }
+    let reset = Rect::from_min_size(
+        Pos2::new(
+            rect.right() - theme::SPACE_M - reset_w,
+            rect.center().y - rect.height() / 2.0,
+        ),
+        Vec2::new(reset_w, rect.height()),
+    );
+    if link(ui, reset, "恢复默认", pal.font_label, pal) {
+        action = Some(SettingsAction::SetAccent(None));
+    }
+    action
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::Toggles;
 
     fn stage() -> Rect {
         Rect::from_min_size(Pos2::new(100.0, 200.0), Vec2::new(400.0, 300.0))
+    }
+
+    fn content_for(size: [f32; 2]) -> Rect {
+        Rect::from_min_size(Pos2::ZERO, Vec2::new(size[0], size[1]))
+            .shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S))
+    }
+
+    fn pal() -> Palette {
+        *theme::palette(ThemeId::default())
     }
 
     #[test]
@@ -1346,18 +1833,131 @@ mod tests {
         assert!((back.h - original.h).abs() < 1e-4);
     }
 
+    /// L-A 分段必须在 400×420 与最小 340×360 下都放得下：六格开关全区可见、
+    /// 结果区不压主按钮、所有区段都在内容区内。
+    #[test]
+    fn main_rows_match_the_l_a_segments_on_both_window_sizes() {
+        for size in [theme::WINDOW_SIZE, theme::WINDOW_MIN] {
+            let content = content_for(size);
+            let rows = main_rows(content);
+            for (name, rect) in [
+                ("标题条", rows.title),
+                ("结果区", rows.result),
+                ("主按钮", rows.primary),
+                ("状态行", rows.status),
+                ("底部", rows.footer),
+            ] {
+                assert!(
+                    content.contains_rect(rect),
+                    "{size:?} 下「{name}」溢出：{rect:?}"
+                );
+            }
+            for (index, cell) in rows.grid.iter().enumerate() {
+                assert!(
+                    content.contains_rect(*cell),
+                    "{size:?} 下第 {index} 格开关溢出：{cell:?}"
+                );
+                assert!(cell.height() >= theme::SWITCH_H + 8.0, "开关行被压扁");
+            }
+            // 纵向不允许互相压。
+            assert!(rows.title.bottom() <= rows.result.top());
+            assert!(rows.result.bottom() <= rows.grid[0].top());
+            assert!(
+                rows.grid[5].bottom() <= rows.primary.top(),
+                "{size:?} 下开关网格压到主按钮"
+            );
+            assert!(rows.primary.bottom() <= rows.status.top(), "结果区压到底部区段");
+            assert!(rows.status.bottom() <= rows.footer.top());
+            // 两列不得重叠，且两列宽度相同。
+            assert!((rows.grid[0].width() - rows.grid[1].width()).abs() < 0.01);
+            assert!(rows.grid[0].right() <= rows.grid[1].left());
+        }
+    }
+
+    /// 400×420 下分段落在 §3.1 表格的标称位置（允许 ±2px：富余空间补给了结果区）。
+    #[test]
+    fn nominal_segments_land_on_the_spec_table() {
+        let content = content_for(theme::WINDOW_SIZE);
+        let rows = main_rows(content);
+        let y = |rect: Rect| rect.top() - content.top();
+        assert!((y(rows.title) - 0.0).abs() < 0.01);
+        assert!((y(rows.result) - 40.0).abs() < 0.01, "结果区应在 48（内容内 40）");
+        assert!((y(rows.primary) - 284.0).abs() < 0.01, "主按钮应在 276（内容内 284）");
+        assert!((rows.result.height() - 112.0).abs() < 0.01, "富余高度补给结果区");
+    }
+
+    #[test]
+    fn pct_rect_is_clamped_inside_the_preview() {
+        let drawn = Rect::from_min_size(Pos2::new(80.0, 150.0), Vec2::new(600.0, 500.0));
+        let clamped = pct_rect_from_screen(stage(), drawn);
+        assert_eq!(clamped.x, 0.0);
+        assert_eq!(clamped.y, 0.0);
+        assert!(clamped.x + clamped.w <= 1.0 + 1e-6);
+        assert!(clamped.y + clamped.h <= 1.0 + 1e-6);
+    }
+
+    #[test]
+    fn result_area_labels_cover_the_three_scenarios() {
+        assert_eq!(source_label(SceneKind::Morse), "摩斯");
+        assert_eq!(source_label(SceneKind::Fingerprint), "指纹");
+        assert_eq!(source_label(SceneKind::Console), "操作台");
+        assert_eq!(source_label(SceneKind::Unknown), "识别结果");
+    }
+
+    /// 设置页的行骨架在两种窗口尺寸下都不越出滚动内容区（滚动由面板负责）。
+    #[test]
+    fn settings_rows_stay_inside_the_scroll_area() {
+        for has_result in [false, true] {
+            let inner_height = settings_inner_height(has_result);
+            let inner = Rect::from_min_size(Pos2::ZERO, Vec2::new(376.0, inner_height));
+            let rows = settings_rows(inner, has_result);
+            for (name, rect) in [
+                ("热键", rows.hotkey),
+                ("兜底", rows.ocr),
+                ("主题", rows.theme),
+                ("主色", rows.accent),
+                ("F 键监听", rows.fkey),
+                ("关键词", rows.keywords),
+                ("截图方式", rows.backend),
+                ("测试截图", rows.test),
+                ("结果区", rows.result),
+            ] {
+                assert!(
+                    inner.contains_rect(rect),
+                    "has_result={has_result} 时「{name}」溢出滚动区：{rect:?}"
+                );
+            }
+            assert_eq!(rows.config.is_some(), !has_result);
+            // 相邻行不重叠。
+            assert!(rows.theme.bottom() <= rows.accent.top());
+            assert!(rows.fkey.bottom() <= rows.keywords.top());
+        }
+    }
+
+    #[test]
+    fn settings_scrolls_only_when_the_content_is_taller_than_the_viewport() {
+        // 400×420：有测试结果时内容高于视口 → 必须能滚（主界面不滚，设置页允许）。
+        let content = content_for(theme::WINDOW_SIZE);
+        let viewport = content.height() - theme::TITLE_BAR_H - SETTINGS_FOOTER_H - theme::SPACE_S;
+        assert!(
+            settings_inner_height(true) > viewport,
+            "带结果时设置页内容应高于视口，滚动条才有意义"
+        );
+        // 最小窗口下必然要滚。
+        let content = content_for(theme::WINDOW_MIN);
+        let viewport = content.height() - theme::TITLE_BAR_H - SETTINGS_FOOTER_H - theme::SPACE_S;
+        assert!(settings_inner_height(false) > viewport);
+    }
+
     /// 在一帧里跑一次设置浮层，返回它给出的动作。
-    fn panel_action(
-        events: Vec<egui::Event>,
-        hotkey_editing: bool,
-        hotkey_conflict: Option<&str>,
-    ) -> Option<SettingsAction> {
+    fn panel_action(events: Vec<egui::Event>, hotkey_editing: bool) -> Option<SettingsAction> {
         let ctx = egui::Context::default();
         let mut action = None;
         let input = egui::RawInput {
             events,
             ..egui::RawInput::default()
         };
+        let mut keywords = "三角洲, Delta Force".to_owned();
         ctx.run_ui(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 action = settings_panel(
@@ -1365,84 +1965,25 @@ mod tests {
                     SettingsView {
                         hotkey: "F8",
                         hotkey_editing,
-                        hotkey_conflict,
+                        hotkey_conflict: None,
                         ocr_enabled: true,
                         config_path: "C:/cfg.toml",
                         capture_backend: CaptureBackend::Wgc,
                         capture_locked: false,
                         capture_test: None,
                         capture_test_error: None,
+                        theme_id: ThemeId::default(),
+                        accent_override: None,
+                        f_key_hook: true,
+                        keywords: &mut keywords,
                     },
+                    &pal(),
                 );
             });
         })
-        // 无后端可上传纹理：显式清空，别让 epaint 把「未消费的 delta」当成泄漏。
         .textures_delta
         .clear();
         action
-    }
-
-    /// 在 400×420 画布上跑三帧并在 `pos` 完成一次点击。
-    ///
-    /// 三帧是 egui 的点击语义决定的：第一帧登记控件矩形，第二帧按下、第三帧松开才成点击。
-    /// 用无内边距的 `Frame::NONE`：行骨架按 `ui.max_rect()` 计算，画面区必须与
-    /// `settings_rows` 的入参完全一致，测试的计算位置才和真实点击位置对齐。
-    fn click_action(pos: Pos2, capture_locked: bool) -> Option<SettingsAction> {
-        let ctx = egui::Context::default();
-        let full = Rect::from_min_size(
-            Pos2::ZERO,
-            Vec2::new(theme::WINDOW_SIZE[0], theme::WINDOW_SIZE[1]),
-        );
-        let press = |pressed: bool| egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: egui::Modifiers::default(),
-        };
-        let mut action = None;
-        let frame = |events: Vec<egui::Event>, action: &mut Option<SettingsAction>| {
-            let input = egui::RawInput {
-                screen_rect: Some(full),
-                events,
-                ..egui::RawInput::default()
-            };
-            ctx.run_ui(input, |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let produced = settings_panel(
-                            ui,
-                            SettingsView {
-                                hotkey: "F8",
-                                hotkey_editing: false,
-                                hotkey_conflict: None,
-                                ocr_enabled: true,
-                                config_path: "C:/cfg.toml",
-                                capture_backend: CaptureBackend::Wgc,
-                                capture_locked,
-                                capture_test: None,
-                                capture_test_error: None,
-                            },
-                        );
-                        if produced.is_some() {
-                            *action = produced;
-                        }
-                    });
-            })
-            .textures_delta
-            .clear();
-        };
-        frame(Vec::new(), &mut action);
-        frame(vec![egui::Event::PointerMoved(pos), press(true)], &mut action);
-        frame(vec![press(false)], &mut action);
-        action
-    }
-
-    /// 面板行骨架（与 `settings_panel` 同一个函数算出来，测试位置才可信）。
-    fn rows_for(size: [f32; 2], has_result: bool) -> SettingsRows {
-        let full = Rect::from_min_size(Pos2::ZERO, Vec2::new(size[0], size[1]));
-        let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
-        settings_rows(content, has_result)
     }
 
     fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
@@ -1457,153 +1998,42 @@ mod tests {
 
     #[test]
     fn escape_while_capturing_cancels_without_closing_the_panel() {
-        // D4：捕获态下 Esc 只能退出捕获，绝不能落到「关闭设置面板」。
         let action = panel_action(
             vec![key_event(egui::Key::Escape, egui::Modifiers::default())],
             true,
-            None,
         );
         assert_eq!(action, Some(SettingsAction::CancelHotkey));
 
-        // 非捕获态下 Esc 仍然是「关面板」，语义没被改坏。
         let action = panel_action(
             vec![key_event(egui::Key::Escape, egui::Modifiers::default())],
             false,
-            None,
         );
         assert_eq!(action, Some(SettingsAction::Close));
     }
 
     #[test]
-    fn capturing_a_key_commits_the_chord_and_unsupported_keys_keep_waiting() {
-        let action = panel_action(
-            vec![key_event(egui::Key::F9, egui::Modifiers::default())],
-            true,
-            None,
-        );
-        match action {
+    fn capturing_a_key_commits_the_chord_and_rejects_plain_f() {
+        match panel_action(vec![key_event(egui::Key::F9, egui::Modifiers::default())], true) {
             Some(SettingsAction::CommitHotkey(chord)) => {
                 assert_eq!(chord.main_name(), "F9");
                 assert_eq!(chord.modifiers(), 0);
             }
             other => panic!("按 F9 必须提交 F9，实际 {other:?}"),
         }
-
-        // 不可捕获的键不提交也不取消；纯修饰键同理。
+        // 无修饰的 F 会被全局独占 → 捕获阶段拒绝，继续等待（不提交、不取消）。
+        assert_eq!(
+            panel_action(vec![key_event(egui::Key::F, egui::Modifiers::default())], true),
+            None,
+            "F 不得被捕获成全局热键"
+        );
+        // 不可捕获的键与纯修饰键同理。
         assert_eq!(
             panel_action(
                 vec![key_event(egui::Key::Questionmark, egui::Modifiers::default())],
-                true,
-                None
+                true
             ),
-            None,
-            "按 ? 必须继续等待"
+            None
         );
-        assert_eq!(
-            panel_action(
-                vec![egui::Event::ModifiersChanged(egui::Modifiers {
-                    ctrl: true,
-                    ..egui::Modifiers::default()
-                })],
-                true,
-                None
-            ),
-            None,
-            "只按 Ctrl 不构成热键"
-        );
-    }
-
-    #[test]
-    fn panel_renders_a_conflict_line_without_taking_the_click() {
-        // 冲突提示只影响绘制；此时点热键行仍是「进入捕获」，语义不变。
-        assert_eq!(panel_action(Vec::new(), false, Some("热键冲突 · 仍为 F8")), None);
-    }
-
-    #[test]
-    fn pct_rect_is_clamped_inside_the_preview() {
-        // 拖框越出预览区时，百分比不得超出 [0,1]（否则 Config 校验会整份拒绝）。
-        let drawn = Rect::from_min_size(Pos2::new(80.0, 150.0), Vec2::new(600.0, 500.0));
-        let clamped = pct_rect_from_screen(stage(), drawn);
-        assert_eq!(clamped.x, 0.0);
-        assert_eq!(clamped.y, 0.0);
-        assert!(clamped.x + clamped.w <= 1.0 + 1e-6);
-        assert!(clamped.y + clamped.h <= 1.0 + 1e-6);
-    }
-
-    #[test]
-    fn notice_button_stays_inside_the_result_slot() {
-        // 进度区实测可用 100px，但按 spec 的 PROGRESS_H=64 这个最紧的高度兜底：
-        // 警示条只能借用这块区域，绝不能把下方元素挤出窗口。
-        let slot = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(376.0, theme::PROGRESS_H));
-        let button = notice_button_rect(slot);
-        assert!(slot.contains_rect(button), "「知道了」必须完整落在结果区内");
-        let text_room = button.left() - slot.left() - theme::SPACE_M;
-        assert!(
-            text_room >= 9.0 * theme::FONT_BODY,
-            "文案位被按钮侵占：只剩 {text_room}px"
-        );
-    }
-
-    #[test]
-    fn settings_rows_fit_the_window_with_and_without_a_test_result() {
-        for size in [theme::WINDOW_SIZE, theme::WINDOW_MIN] {
-            for has_result in [false, true] {
-                let full = Rect::from_min_size(Pos2::ZERO, Vec2::new(size[0], size[1]));
-                let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
-                let rows = rows_for(size, has_result);
-                for (name, rect) in [
-                    ("热键", rows.hotkey),
-                    ("兜底", rows.ocr),
-                    ("截图方式", rows.backend),
-                    ("测试截图", rows.test),
-                    ("结果区", rows.result),
-                    ("底部按钮", rows.footer),
-                ] {
-                    assert!(
-                        content.contains_rect(rect),
-                        "{size:?} 下「{name}」溢出内容区：{rect:?}"
-                    );
-                }
-                assert!(
-                    !rows.result.intersects(rows.footer),
-                    "{size:?} 下结果区挤压底部按钮"
-                );
-                // 结果区与配置路径互斥：两者不能同时消失，也绝不能重叠。
-                assert_eq!(rows.config.is_some(), !has_result);
-                if let Some(config) = rows.config {
-                    assert!(content.contains_rect(config), "{size:?} 下配置路径溢出");
-                    assert!(
-                        !config.intersects(rows.footer),
-                        "{size:?} 下配置路径挤压底部按钮"
-                    );
-                }
-                // 两行新控件（截图方式 / 测试截图）必须放得下标题 + 副标题。
-                for rect in [rows.backend, rows.test] {
-                    assert!(rect.height() >= theme::FONT_TITLE + theme::FONT_BODY + theme::SPACE_XS);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn clicking_the_test_row_asks_for_one_capture() {
-        let rows = rows_for(theme::WINDOW_SIZE, false);
-        let button = row_slot(rows.test, ROW_BUTTON_W);
-        assert_eq!(
-            click_action(button.center(), false),
-            Some(SettingsAction::TestCapture),
-            "点「抓一帧」必须只发一个抓帧请求"
-        );
-    }
-
-    #[test]
-    fn capture_rows_are_dead_while_a_task_runs() {
-        // 运行中（D1）：截图方式与测试截图都不可点 —— 点击不该产生任何动作。
-        let rows = rows_for(theme::WINDOW_SIZE, false);
-        let button = row_slot(rows.test, ROW_BUTTON_W);
-        assert_eq!(click_action(button.center(), true), None, "运行中禁止抓帧");
-        let value = row_slot(rows.backend, BACKEND_VALUE_W);
-        assert_eq!(click_action(value.center(), true), None, "运行中禁止切换后端");
     }
 
     #[test]
@@ -1612,30 +2042,130 @@ mod tests {
             assert!(!backend_label(backend).is_empty());
         }
         assert_eq!(CAPTURE_BACKENDS, [CaptureBackend::Wgc, CaptureBackend::BitBlt]);
-        // 兼容档必须在 UI 上自曝「可能截不到独占全屏」（spec D1 显式边界）。
         assert!(backend_label(CaptureBackend::BitBlt).contains("截不到独占全屏"));
-        assert_eq!(
-            CAPTURE_BACKENDS.len(),
-            2,
-            "只有两档；新增档位必须同时补文案与配置解析"
-        );
     }
 
     #[test]
     fn thumbnail_fits_inside_its_box_without_stretching() {
-        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(CAPTURE_THUMB_MAX[0], CAPTURE_THUMB_MAX[1]));
+        let area = Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(CAPTURE_THUMB_MAX[0], CAPTURE_THUMB_MAX[1]),
+        );
         let fitted = fit_inside(area, 1920, 1080);
         assert!(area.contains_rect(fitted), "缩略图不得越出结果区");
         let ratio = fitted.width() / fitted.height();
         assert!((ratio - 16.0 / 9.0).abs() < 0.05, "长宽比被拉伸：{ratio}");
     }
 
+    /// 五态 + 按钮谓词在渲染路径上的关键分支（不启动 GUI，只跑状态推导）。
+    #[test]
+    fn idle_state_draws_no_empty_card_and_button_copy_changes() {
+        let mut state = UiState::default();
+        assert_eq!(state.result_state(), ResultState::Idle);
+        state.missing = vec!["摩斯区域 #1".to_owned()];
+        assert_eq!(state.primary_state(), PrimaryState::NeedsCalibration);
+        state.missing.clear();
+        state.toggles = Toggles {
+            morse: false,
+            fingerprint: false,
+            console: false,
+        };
+        assert_eq!(state.primary_state(), PrimaryState::NoFlow);
+        state.result = Some(crate::state::morse_result("427", true));
+        assert_eq!(
+            state.result_content().map(|content| content.headline.as_str()),
+            Some("4 2 7"),
+            "结果区必须能拿到渲染文本"
+        );
+    }
+
+    /// 无头跑一帧主界面与设置页：五态 × 两种窗口尺寸 × 收起态都必须画得出来。
+    ///
+    /// 这不是实机验证（不建窗口、不注入任何输入），只是把「画一帧会不会 panic」这条
+    /// 底线钉住 —— 与设置页既有用例同一个套路。
+    #[test]
+    fn main_window_and_settings_render_every_phase_at_both_sizes() {
+        let phases = [
+            Phase::Idle,
+            Phase::Running,
+            Phase::Success,
+            Phase::Unrecognized,
+            Phase::TimedOut,
+        ];
+        for size in [theme::WINDOW_SIZE, theme::WINDOW_MIN] {
+            let full = Rect::from_min_size(Pos2::ZERO, Vec2::new(size[0], size[1]));
+            for phase in phases {
+                for collapsed in [false, true] {
+                    let ctx = egui::Context::default();
+                    let mut state = UiState {
+                        phase,
+                        collapsed,
+                        ..UiState::default()
+                    };
+                    state.set_result(crate::state::morse_result("427", true));
+                    let input = egui::RawInput {
+                        screen_rect: Some(full),
+                        ..egui::RawInput::default()
+                    };
+                    ctx.run_ui(input, |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                let _ = main_window(ui, &mut state, &pal());
+                            });
+                    })
+                    .textures_delta
+                    .clear();
+                }
+            }
+
+            // 设置页：六套主题 × 有无测试结果（滚动必须自己兜住，不 panic）。
+            for theme_id in theme::ALL {
+                for has_result in [false, true] {
+                    let ctx = egui::Context::default();
+                    let mut keywords = "三角洲, Delta Force".to_owned();
+                    let input = egui::RawInput {
+                        screen_rect: Some(full),
+                        ..egui::RawInput::default()
+                    };
+                    ctx.run_ui(input, |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                let _ = settings_panel(
+                                    ui,
+                                    SettingsView {
+                                        hotkey: "F8",
+                                        hotkey_editing: false,
+                                        hotkey_conflict: None,
+                                        ocr_enabled: true,
+                                        config_path: "C:/cfg.toml",
+                                        capture_backend: CaptureBackend::Wgc,
+                                        capture_locked: false,
+                                        capture_test: None,
+                                        capture_test_error: has_result.then_some("WGC 初始化失败：0x80070005"),
+                                        theme_id,
+                                        accent_override: Some("#B23A2A"),
+                                        f_key_hook: true,
+                                        keywords: &mut keywords,
+                                    },
+                                    &*theme::palette(theme_id),
+                                );
+                            });
+                    })
+                    .textures_delta
+                    .clear();
+                }
+            }
+        }
+    }
+
     #[test]
     fn with_alpha_keeps_rgb_and_scales_alpha() {
-        let half = with_alpha(theme::ACCENT, 0.5);
+        let accent = pal().accent;
+        let half = theme::with_alpha(accent, 0.5);
         let [r, g, b, a] = half.to_srgba_unmultiplied();
-        let [er, eg, eb, _] = theme::ACCENT.to_srgba_unmultiplied();
-        // Color32 内部是预乘存储，回读会有 ±1 的取整误差。
+        let [er, eg, eb, _] = accent.to_srgba_unmultiplied();
         for (actual, expected) in [(r, er), (g, eg), (b, eb)] {
             assert!(
                 (i32::from(actual) - i32::from(expected)).abs() <= 2,

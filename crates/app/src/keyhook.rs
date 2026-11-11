@@ -200,7 +200,14 @@ fn hook_thread(keywords: Vec<String>, sink: GameKeySink, ready: mpsc::Sender<Res
             return;
         }
     };
-    let _ = ready.send(Ok(unsafe { GetCurrentThreadId() }));
+    // 反手一票：`install` 的 2s 超时分支会丢弃接收端，此时 `send` 必然失败 ——
+    // 立刻自行拆干净（卸钩子 + 清槽位），否则线程稍后装成功也没人拿得到 `KeyHook` 句柄，
+    // 局面变成「界面显示关、钩子仍在投递」，而且此后每次 install 都报"已经装过了"。
+    if ready.send(Ok(unsafe { GetCurrentThreadId() })).is_err() {
+        unsafe { UnhookWindowsHookEx(hook) }.ok();
+        clear_slot();
+        return;
+    }
 
     loop {
         let got = unsafe { GetMessageW(&mut message, None, 0, 0) };
