@@ -210,13 +210,16 @@
 | 纵向区段 | y 区间 | 高 | 内容 |
 | :--- | :--- | :--- | :--- |
 | 标题条 | 8–40 | 32 | 状态点 (7px) + 状态文字 15px + 右侧 `□ △ ×` 三个 16px 图标按钮 |
-| 结果区 | 48–144 | 96 | 单卡。有结果：mono 26 居中 + 下方 11px 来源标签；空闲：**不画边框**，只一行 13px `就绪 · 按 F8 开始` |
-| 开关网格 | 156–264 | 108 | 2 列 × 3 行，列宽 178，行高 32：标签 13px 左 + 28×16 开关轨道右 |
-| 主按钮 | 276–320 | 44 | 满宽 **实心 accent 填充** + `accent_text_on` 文字 15px + 右侧 30% alpha 的 `F8` |
-| 状态行 | 328–360 | 32 | 左 12px 文案；底部 2px 进度轨（`progress_track` + `progress_fill`） |
-| 底部文字链 | 368–396 | 28 | 左 `校准向导`、右 `设置`，11px `text_3` |
+| 结果区 | 48–160 | **112** | 单卡。有结果：mono 26 居中 + 下方 11px 来源标签；空闲：**不画边框**，只一行 13px `就绪 · 按 F8 开始` |
+| 开关网格 | 172–280 | 108 | 2 列 × 3 行，列宽 178，行高 32：标签 13px 左 + 28×16 开关轨道右 |
+| 主按钮 | 292–336 | 44 | 满宽 **实心 accent 填充** + `accent_text_on` 文字 15px + 右侧 30% alpha 的 `F8` |
+| 状态行 | 344–376 | 32 | 左 12px 文案；底部 2px 进度轨（`progress_track` + `progress_fill`） |
+| 底部文字链 | 384–412 | 28 | 左 `校准向导`、右 `设置`，11px `text_3` |
 
-合计 404 = 420 − 上下 8px 边距，**零空盒子**。开关由圆形指示灯改为 28×16 轨道 + 12px 滑块，开态轨道实心 accent、滑块深色；「开/关」二字删除（状态由滑块位置表达，符合开关的既有认知）。
+合计 420 = 8(上边距) + 32 + 8 + **112** + 12 + 108 + 12 + 44 + 8 + 32 + 8 + 28 + 8(下边距)，**零余量、零空盒子**。
+（注：草案曾把结果区定为 96，那个版本各区段只占 404、窗口底部空 16px。落地时把这 16px 全部并入结果区，让密码能以 26px 等宽字居中显示——**以本表实测值为准**。）
+
+开关由圆形指示灯改为 28×16 轨道 + 12px 滑块，开态轨道实心 accent、滑块深色；「开/关」二字删除（状态由滑块位置表达，符合开关的既有认知）。
 
 **适配**：Ember（暖色需要网格给出的秩序感）、Paper、Nightwatch。
 
@@ -315,9 +318,9 @@ impl Palette {
 }
 ```
 
-2. **运行时切主题**：**以自有 `Palette` 为准，`Context::set_visuals` 只做兜底**。理由：现有 UI 100% 自绘（`view.rs` 全部走 `painter`），`Visuals` 只影响内嵌原生控件（文本编辑框、滚动条、tooltip）。做法是每帧 `let pal = Palette::of(state.theme_id, state.accent_hue);` 显式传下去；仅在 `theme_id`/`accent_hue` **变化的帧**调用一次 `ctx.set_visuals(visuals_from(&pal))`。`set_fonts` 只在启动时调一次，绝不随主题变。**不需要重启**，`egui` 立即模式天然支持。
+2. **运行时切主题**：**以自有 `Palette` 为准，`Context::set_visuals` 只做兜底**。理由：现有 UI 100% 自绘（`view.rs` 全部走 `painter`），`Visuals` 只影响内嵌原生控件（文本编辑框、滚动条、tooltip）。做法是每帧 `let pal = theme::resolve(state.theme_id, state.accent_override.as_deref())` 显式传下去；仅在 `theme_id`/`accent_override` **变化的帧**调用一次 `ctx.set_visuals(visuals_from(&pal))`。`set_fonts` 只在启动时调一次，绝不随主题变。**不需要重启**，`egui` 立即模式天然支持。
 3. **落地顺序**：`theme::install()` 拆成 `install_fonts(ctx)`（一次）+ `apply_visuals(ctx, &pal)`（可重入）。
-4. **配置持久化**：`crates/config` 增加 `theme_id: ThemeId`、`accent_hue: Option<f32>`（`None` = 用该主题的默认 accent）。缺字段时用 `#[serde(default)]` 回落到 `Ember`，老配置文件不炸。
+4. **配置持久化**：`crates/config` 增加 `theme_id: ThemeId`、`accent_override: Option<String>`（存 `#RRGGBB`；`None` = 用该主题默认 accent。**注意**：审定稿写的是 `accent_hue: Option<f32>`，落地改为字符串是为免去自定义类型的序列化分支，语义等价）。缺字段时 `#[serde(default)]` 回落到 **`Frost`**（用户拍板默认浅色，早期草案写的 `Ember` 已废弃），老配置文件不炸。
 5. **40+ 处引用的迁移结论：一次性机械替换，不做访问器。**
    - 现状：`theme::` 共 251 处，其中**颜色类约 90 处**（`ACCENT` 15、`TEXT_3` 17、`TEXT_1` 14、`TEXT_2` 8、`LINE_SUBTLE` 7、`BG_PANEL` 6、`BG_INSET` 5、`WARN` 4、`OK` 3、`ERR` 3、`LINE_STRONG` 3、`BG_RAISED` 3、`SHADOW` 1、`HIGHLIGHT` 1），其余 161 处是尺寸/字号/圆角。
    - 不做全局访问器的硬理由：访问器需要 `thread_local` 或 `static Mutex`，会让 21 个自绘函数获得**隐藏全局状态**，直接破坏现有 `view.rs` 里那批纯函数单测（`fn stage()/fn rows_for()/...` 都是无副作用构造）。显式 `pal: &Palette` 参数才是可测的。

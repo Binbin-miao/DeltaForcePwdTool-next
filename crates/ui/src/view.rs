@@ -1437,12 +1437,12 @@ pub fn settings_panel(
     }
 
     // ── 主题（六套，点一下立即生效）──────────────────────────────
-    paint_theme_row(ui, hit(rows.theme), view.theme_id, pal)
+    paint_theme_row(ui, rows.theme, viewport, view.theme_id, pal)
         .into_iter()
         .for_each(|theme| action = Some(SettingsAction::SetTheme(theme)));
 
     // ── 主色（色相预设 + 恢复默认）───────────────────────────────
-    if let Some(produced) = paint_accent_row(ui, hit(rows.accent), &view, pal) {
+    if let Some(produced) = paint_accent_row(ui, rows.accent, viewport, &view, pal) {
         action = Some(produced);
     }
 
@@ -1483,7 +1483,10 @@ pub fn settings_panel(
         locked,
         pal,
     );
-    let value_slot = hit(row_slot(rows.backend, BACKEND_VALUE_W));
+    // 绘制用未裁剪的原始矩形（滚出视口时由 painter 的 clip 负责裁掉），
+    // 命中判定才用 viewport 裁剪——否则整行会跟着裁剪边界跑位。
+    let value_slot = row_slot(rows.backend, BACKEND_VALUE_W);
+    let value_hit = value_slot.intersect(viewport);
     let menu_id = ui.make_persistent_id("capture-backend-menu");
     let mut menu_open =
         !locked && ui.ctx().data(|data| data.get_temp::<bool>(menu_id).unwrap_or(false));
@@ -1502,7 +1505,7 @@ pub fn settings_panel(
         );
         false
     } else {
-        let response = clickable(ui, value_slot, "capture-backend-value", Sense::click());
+        let response = clickable(ui, value_hit, "capture-backend-value", Sense::click());
         painter.text(
             value_slot.right_center(),
             Align2::RIGHT_CENTER,
@@ -1698,7 +1701,13 @@ fn toggle_row(ui: &egui::Ui, rect: Rect, label: &str, on: bool, pal: &Palette) -
 }
 
 /// 主题行：六个名字，选中项用 accent 高亮；返回新选中的主题（没点 = `None`）。
-fn paint_theme_row(ui: &egui::Ui, rect: Rect, current: ThemeId, pal: &Palette) -> Option<ThemeId> {
+fn paint_theme_row(
+    ui: &egui::Ui,
+    rect: Rect,
+    viewport: Rect,
+    current: ThemeId,
+    pal: &Palette,
+) -> Option<ThemeId> {
     let painter = ui.painter();
     painter.text(
         rect.left_center() + Vec2::new(theme::SPACE_M, 0.0),
@@ -1715,7 +1724,13 @@ fn paint_theme_row(ui: &egui::Ui, rect: Rect, current: ThemeId, pal: &Palette) -
             Pos2::new(start + chip_w * index as f32, rect.top()),
             Vec2::new(chip_w, rect.height()),
         );
-        let response = clickable(ui, chip, &format!("theme-{}", id.token()), Sense::click());
+        // 绘制用原始 chip（越界由 painter clip 处理），命中才与视口求交。
+        let response = clickable(
+            ui,
+            chip.intersect(viewport),
+            &format!("theme-{}", id.token()),
+            Sense::click(),
+        );
         let selected = id == current;
         let color = match (selected, response.hovered()) {
             (true, _) => pal.accent,
@@ -1748,6 +1763,7 @@ fn paint_theme_row(ui: &egui::Ui, rect: Rect, current: ThemeId, pal: &Palette) -
 fn paint_accent_row(
     ui: &egui::Ui,
     rect: Rect,
+    viewport: Rect,
     view: &SettingsView<'_>,
     pal: &Palette,
 ) -> Option<SettingsAction> {
@@ -1772,7 +1788,12 @@ fn paint_accent_row(
             rect.center().y,
         );
         let swatch = Rect::from_center_size(center, Vec2::splat(dot));
-        let response = clickable(ui, swatch, &format!("accent-hue-{}", hue as u32), Sense::click());
+        let response = clickable(
+            ui,
+            swatch.intersect(viewport),
+            &format!("accent-hue-{}", hue as u32),
+            Sense::click(),
+        );
         let color = base.with_accent(hue).accent;
         painter.circle_filled(center, dot / 2.0, color);
         if current.is_some_and(|selected| selected == color) {

@@ -490,8 +490,10 @@ impl DeltaApp {
         let commands = self.worker.commands.clone();
         let hook = match KeyHook::install(keywords, sink) {
             Ok(hook) => hook,
+            // 装不上也必须退回「关」：只打日志会让界面继续显示「开」而实际没在监听，
+            // 用户按 F 毫无反应却以为功能正常（与热键改键同一条「不留假状态」纪律）。
             Err(reason) => {
-                eprintln!("[keyhook] {reason}");
+                self.abandon_key_hook(&format!("安装失败：{reason}"));
                 return;
             }
         };
@@ -510,16 +512,24 @@ impl DeltaApp {
             Err(error) => {
                 // 钩子装上了但没人转发 → 「界面说开、按 F 毫无反应」的假状态。
                 // 当场卸掉钩子（`Drop` → Unhook + 清槽位），并把配置/界面一并退回「关」。
-                eprintln!("[keyhook] 事件转发线程启动失败：{error}");
                 drop(hook);
-                self.key_hook = None;
-                if let Ok(mut config) = self.config.lock() {
-                    config.f_key_hook_enabled = false;
-                }
-                self.state.set_f_key_hook(false);
-                self.state.notice = Some(NOTICE_KEY_HOOK_FAILED.to_owned());
+                self.abandon_key_hook(&format!("事件转发线程启动失败：{error}"));
             }
         }
+    }
+
+    /// 钩子没装成时把三处状态一并退回「关」：句柄、内存配置、界面，并给出可见提示。
+    ///
+    /// 不落盘：磁盘上仍留着用户的「开」，下次启动会重新尝试安装——
+    /// 若环境一直不允许，每次启动都会显形一次「F 键监听装不上」，而不是悄悄失效。
+    fn abandon_key_hook(&mut self, reason: &str) {
+        eprintln!("[keyhook] {reason}");
+        self.key_hook = None;
+        if let Ok(mut config) = self.config.lock() {
+            config.f_key_hook_enabled = false;
+        }
+        self.state.set_f_key_hook(false);
+        self.state.notice = Some(NOTICE_KEY_HOOK_FAILED.to_owned());
     }
 
     /// 开关落盘：失败必须显形（内存里已生效，但重启后会丢）。
