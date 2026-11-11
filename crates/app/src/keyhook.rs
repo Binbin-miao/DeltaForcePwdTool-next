@@ -250,6 +250,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "向真实桌面注入 F 键，默认跳过；需要时 cargo test -p delta-app --lib -- --ignored"]
     fn hook_lifecycle_reports_f_keeps_passing_it_and_stops_when_uninstalled() {
         // 钩子是进程级单例：装/卸/重装的完整生命周期只在这一个用例里跑，
         // 否则两个用例会互相抢全局槽位。
