@@ -63,6 +63,8 @@ pub struct DeltaApp {
     key_hook: Option<KeyHook>,
     /// 上一帧灌进 egui 的主题（只在变化的帧调一次 `apply_visuals`）。
     applied_theme: Option<(ThemeId, Option<String>)>,
+    /// 是否已把 egui 的唤醒把手交给后台（只在首帧交一次）。
+    wake_handed: bool,
 }
 
 /// 「测试截图」从后台线程回传的东西（纹理上传只能留到 UI 线程做）。
@@ -94,6 +96,7 @@ impl DeltaApp {
             capture_probe: None,
             key_hook: None,
             applied_theme: None,
+            wake_handed: false,
         };
         // 配置说开着就当场装上（装不上只留痕，绝不因为钩子失败而不给启动）。
         app.sync_key_hook();
@@ -176,6 +179,15 @@ impl DeltaApp {
                     // `state.hotkey` 保持旧值 —— 这正是「假保存」的反面。
                     self.state
                         .show_hotkey_conflict(conflict_copy(kept.as_deref()), now);
+                }
+                UiEvent::MasterToggled { enabled } => {
+                    // 事件只当「该刷新了」的信号：它排队期间按钮可能又翻过一次，
+                    // 真值一律回配置里读，免得标题栏、配置、磁盘三者各说一套。
+                    let actual = match self.config.lock() {
+                        Ok(config) => config.master_enabled,
+                        Err(_) => enabled,
+                    };
+                    self.apply_master(actual);
                 }
             }
             ctx.request_repaint();
@@ -407,13 +419,24 @@ impl DeltaApp {
     ///
     /// 与 F 键钩子开关的分工：那个只管 F 键这一路入口，这个管全部入口，
     /// 而且**不卸载钩子**（钩子还要负责在重新打开后立刻可用）。
+    ///
+    /// 取值一律回配置里翻（而不是翻界面里的副本）：同一个开关还有一条热键入口，
+    /// 它随时可能在后台翻过一次，界面里的副本未必是最新的。
     fn toggle_master(&mut self) {
-        let wanted = !self.state.master_enabled;
-        if let Ok(mut config) = self.config.lock() {
-            config.master_enabled = wanted;
-        }
-        self.state.master_enabled = wanted;
-        self.state.notice = Some(if wanted {
+        let wanted = match self.config.lock() {
+            Ok(mut config) => {
+                config.master_enabled = !config.master_enabled;
+                config.master_enabled
+            }
+            Err(_) => return,
+        };
+        self.apply_master(wanted);
+    }
+
+    /// 把「识别总开关」的新状态摊到界面 + 磁盘上（两条入口共用的收尾）。
+    fn apply_master(&mut self, enabled: bool) {
+        self.state.master_enabled = enabled;
+        self.state.notice = Some(if enabled {
             "识别已开启".to_owned()
         } else {
             "识别已暂停：热键不再触发".to_owned()
@@ -830,6 +853,12 @@ impl DeltaApp {
 impl eframe::App for DeltaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // 把「叫醒界面」的把手交给后台一次性：热键在窗口没有焦点时按下，
+        // 没有它，后台改完状态（尤其总开关）界面要等下一次碰巧重绘才显示。
+        if !self.wake_handed {
+            self.worker.wake_with(ctx.clone());
+            self.wake_handed = true;
+        }
         self.state.phase_elapsed = self.phase_started.elapsed().as_secs_f64();
         self.drain_events(&ctx);
 
@@ -855,6 +884,7 @@ impl eframe::App for DeltaApp {
             let hotkey_morse = self.state.hotkey_morse.clone();
             let hotkey_fingerprint = self.state.hotkey_fingerprint.clone();
             let hotkey_console = self.state.hotkey_console.clone();
+            let hotkey_master = self.state.hotkey_master.clone();
             let hotkey_editing = self.state.hotkey_editing;
             let capture_locked = !self.state.capture_switchable();
             let capture_test = self.state.capture_test.clone();
@@ -871,6 +901,7 @@ impl eframe::App for DeltaApp {
                 delta_ui::view::SettingsView {
                     master_enabled: self.state.master_enabled,
                     hotkey: &hotkey_text,
+                    hotkey_master: &hotkey_master,
                     hotkey_morse: &hotkey_morse,
                     hotkey_fingerprint: &hotkey_fingerprint,
                     hotkey_console: &hotkey_console,
@@ -1125,6 +1156,7 @@ fn initial_state(config: &Config, monitor: MonitorInfo) -> UiState {
         hotkey_morse: config.hotkeys.morse.clone(),
         hotkey_fingerprint: config.hotkeys.fingerprint.clone(),
         hotkey_console: config.hotkeys.console.clone(),
+        hotkey_master: config.hotkeys.master.clone(),
         hotkey_slot: delta_config::HotkeySlot::Scene,
         game_title_keywords: config.game_title_keywords.clone(),
         keywords_buffer: config.game_title_keywords.join(", "),

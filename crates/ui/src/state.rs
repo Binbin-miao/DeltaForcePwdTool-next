@@ -617,6 +617,8 @@ pub struct UiState {
     pub hotkey_morse: String,
     pub hotkey_fingerprint: String,
     pub hotkey_console: String,
+    /// 识别总开关的翻转键（默认 `F9`；关着的时候它照样有效）。
+    pub hotkey_master: String,
     /// 正在捕获的槽位（只在 `hotkey_editing` 为真时有效）。
     pub hotkey_slot: delta_config::HotkeySlot,
     /// 游戏前台窗口标题关键词（spec D3 边界 5；设置页可增删）。
@@ -744,6 +746,7 @@ impl Default for UiState {
             hotkey_morse: "F5".to_owned(),
             hotkey_fingerprint: "F6".to_owned(),
             hotkey_console: "F7".to_owned(),
+            hotkey_master: "F9".to_owned(),
             hotkey_slot: delta_config::HotkeySlot::Scene,
             game_title_keywords: keywords.clone(),
             keywords_buffer: keywords.join(", "),
@@ -759,6 +762,7 @@ impl UiState {
     /// 按槽位写热键显示名（只由热键线程的成功回执调用）。
     pub fn set_hotkey_name(&mut self, slot: delta_config::HotkeySlot, name: String) {
         match slot {
+            delta_config::HotkeySlot::Master => self.hotkey_master = name,
             delta_config::HotkeySlot::Scene => self.hotkey = name,
             delta_config::HotkeySlot::Morse => self.hotkey_morse = name,
             delta_config::HotkeySlot::Fingerprint => self.hotkey_fingerprint = name,

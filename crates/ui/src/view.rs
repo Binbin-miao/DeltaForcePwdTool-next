@@ -241,7 +241,7 @@ fn main_rows(content: Rect) -> MainRows {
 /// 关掉后 `run_once` 在入口直接返回，**连截图都不抓**（不只是不注入）。
 /// 放在标题栏而不是设置页，是因为这个开关的用途就是「临时别动」——
 /// 对枪、跑图、看录像时需要一秒关掉，翻设置页太慢。
-fn master_toggle(ui: &egui::Ui, rect: Rect, on: bool, pal: &Palette) -> bool {
+fn master_toggle(ui: &egui::Ui, rect: Rect, on: bool, hotkey: &str, pal: &Palette) -> bool {
     let (fill, text_color, label) = if on {
         (pal.ok, pal.bg_panel, "识别中")
     } else {
@@ -265,7 +265,14 @@ fn master_toggle(ui: &egui::Ui, rect: Rect, on: bool, pal: &Palette) -> bool {
         pal.text(pal.font_label),
         text_color,
     );
-    clickable(ui, rect, "master-toggle", Sense::click()).clicked()
+    // 胶囊只有 66px 宽，塞不下键名 —— 所以键名走悬停提示：既告诉用户「这个能点」，
+    // 也告诉他有热键可用（不然「识别中」看起来只是个状态徽标）。
+    clickable(ui, rect, "master-toggle", Sense::click())
+        .on_hover_text(format!(
+            "点这里{} · 热键 {hotkey}",
+            if on { "暂停识别" } else { "恢复识别" }
+        ))
+        .clicked()
 }
 
 fn main_layout(ui: &egui::Ui, full: Rect, state: &mut UiState, pal: &Palette) -> Option<Action> {
@@ -317,7 +324,7 @@ fn main_layout(ui: &egui::Ui, full: Rect, state: &mut UiState, pal: &Palette) ->
         ),
         Vec2::new(master_w, theme::MASTER_TOGGLE_H),
     );
-    if master_toggle(ui, master, state.master_enabled, pal) {
+    if master_toggle(ui, master, state.master_enabled, &state.hotkey_master, pal) {
         action = Some(Action::ToggleMaster);
     }
     let (quit, collapse, pin) = (icon_at(1.0), icon_at(2.0), icon_at(3.0));
@@ -1165,6 +1172,8 @@ fn backend_label(backend: CaptureBackend) -> &'static str {
 #[derive(Debug, Clone, Copy)]
 struct SettingsRows {
     master: Rect,
+    /// 总开关热键（紧跟总开关行：开关和它的快捷键摆在上下相邻两行）。
+    master_key: Rect,
     hotkey: Rect,
     morse: Rect,
     fingerprint: Rect,
@@ -1193,6 +1202,7 @@ fn settings_rows(content: Rect, has_result: bool) -> SettingsRows {
         rect
     };
     let master = next(SETTINGS_LINE_H);
+    let master_key = next(SETTINGS_LINE_H);
     let hotkey = next(SETTINGS_LINE_H);
     let morse = next(SETTINGS_LINE_H);
     let fingerprint = next(SETTINGS_LINE_H);
@@ -1212,6 +1222,7 @@ fn settings_rows(content: Rect, has_result: bool) -> SettingsRows {
     let extra = next(extra_height);
     SettingsRows {
         master,
+        master_key,
         hotkey,
         morse,
         fingerprint,
@@ -1230,9 +1241,10 @@ fn settings_rows(content: Rect, has_result: bool) -> SettingsRows {
 
 /// 设置页滚动区的总高度（含标题留给视口的余量）。
 fn settings_inner_height(has_result: bool) -> f32 {
-    let lines = 9.0 * SETTINGS_LINE_H;
+    // 10 行单行控件：总开关 + 总开关热键 + 四个热键 + 兜底 + 主题 + 主色 + F 键监听。
+    let lines = 10.0 * SETTINGS_LINE_H;
     let rows = 2.0 * SETTINGS_ROW_H + if has_result { CAPTURE_RESULT_H } else { SETTINGS_ROW_H };
-    let gaps = 12.0 * SETTINGS_GAP;
+    let gaps = 13.0 * SETTINGS_GAP;
     theme::TITLE_BAR_H + theme::SPACE_S + lines + rows + gaps
 }
 
@@ -1306,6 +1318,8 @@ fn fit_inside(area: Rect, width: u32, height: u32) -> Rect {
 pub struct SettingsView<'a> {
     /// 识别总开关：关掉后任何热键都不再触发识别。
     pub master_enabled: bool,
+    /// 翻转识别总开关的键（关着的时候它照样有效）。
+    pub hotkey_master: &'a str,
     pub hotkey: &'a str,
     /// 三个强制入口的热键名（与 `hotkey` 同一套捕获机制）。
     pub hotkey_morse: &'a str,
@@ -1446,6 +1460,27 @@ fn resolve_capture(ui: &egui::Ui, editing: bool, hotkey_row: Rect) -> Option<Set
     None
 }
 
+/// 捕获态的收口：编辑态下点面板上任何控件，只允许「取消捕获」，不许顺手改别的设置。
+///
+/// 没有这一步，先算出的 `CancelHotkey` 会被后面 `ToggleOcr`/`SetTheme`/… 覆盖：
+/// 开关被悄悄翻转，而捕获态还挂着，用户既不知道为什么状态变了，也退不出捕获。
+fn settle_capture(editing: bool, action: Option<SettingsAction>) -> Option<SettingsAction> {
+    if !editing {
+        return action;
+    }
+    match action {
+        // 捕获本身的四个动作 + 关面板 + 只读检查：都是用户明确的意图，原样放行。
+        None
+        | Some(SettingsAction::EditHotkey(_))
+        | Some(SettingsAction::CommitHotkey(_))
+        | Some(SettingsAction::CancelHotkey)
+        | Some(SettingsAction::Close)
+        | Some(SettingsAction::Probe) => action,
+        // 其余一律降级成取消捕获（fail-closed）：新增控件默认也不会绕过捕获态。
+        Some(_) => Some(SettingsAction::CancelHotkey),
+    }
+}
+
 /// 滚轮 → 滚动量（设置页内部滚动；主界面永不滚动）。
 fn scroll_offset(ui: &egui::Ui, viewport: Rect, inner_height: f32) -> f32 {
     let id = ui.make_persistent_id("settings-scroll");
@@ -1517,8 +1552,14 @@ pub fn settings_panel(
         action = Some(SettingsAction::ToggleMaster);
     }
 
-    // ── 四个热键（各自点一下即可捕获）────────────────────────────
+    // ── 五个热键（各自点一下即可捕获）────────────────────────────
     let hotkey_rows = [
+        HotkeyRow {
+            rect: rows.master_key,
+            title: "总开关热键",
+            key: view.hotkey_master,
+            slot: delta_config::HotkeySlot::Master,
+        },
         HotkeyRow {
             rect: rows.hotkey,
             title: "全局热键",
@@ -1789,7 +1830,7 @@ pub fn settings_panel(
         menu_open = false;
     }
     ui.ctx().data_mut(|data| data.insert_temp(menu_id, menu_open));
-    action
+    settle_capture(view.hotkey_editing, action)
 }
 
 /// 开关行（左标签 + 右 28×16 开关轨道）。
@@ -2052,6 +2093,56 @@ mod tests {
         assert_eq!(source_label(SceneKind::Unknown), "识别结果");
     }
 
+    /// 捕获态下点面板控件只能「取消捕获」（D4）：开关不许被顺手翻掉，捕获态不许挂着。
+    #[test]
+    fn settle_capture_only_cancels_when_a_control_is_clicked_while_editing() {
+        let chord = KeyChord::capture(egui::Key::F9, egui::Modifiers::NONE).expect("F9 可捕获");
+        // 捕获本身的动作 + 关面板 + 只读检查：用户明确意图，原样放行。
+        let kept = [
+            None,
+            Some(SettingsAction::EditHotkey(delta_config::HotkeySlot::Morse)),
+            Some(SettingsAction::CommitHotkey(chord)),
+            Some(SettingsAction::CancelHotkey),
+            Some(SettingsAction::Close),
+            Some(SettingsAction::Probe),
+        ];
+        for action in kept {
+            assert_eq!(
+                settle_capture(true, action.clone()),
+                action,
+                "捕获态下这是明确意图，不该被降级：{action:?}"
+            );
+            assert_eq!(
+                settle_capture(false, action.clone()),
+                action,
+                "非编辑态一律原样：{action:?}"
+            );
+        }
+        // 其余控件：编辑态下一律降级为「取消捕获」，非编辑态保持原样。
+        let controls = [
+            SettingsAction::ToggleMaster,
+            SettingsAction::ToggleOcr,
+            SettingsAction::ToggleFKeyHook,
+            SettingsAction::SetTheme(ThemeId::default()),
+            SettingsAction::SetAccent(None),
+            SettingsAction::SetCaptureBackend(CaptureBackend::Wgc),
+            SettingsAction::TestCapture,
+            SettingsAction::CommitKeywords("三角洲".to_owned()),
+        ];
+        for control in controls {
+            assert_eq!(
+                settle_capture(true, Some(control.clone())),
+                Some(SettingsAction::CancelHotkey),
+                "捕获态下控件动作必须降级：{control:?}"
+            );
+            assert_eq!(
+                settle_capture(false, Some(control.clone())),
+                Some(control),
+                "非编辑态不该被动过"
+            );
+        }
+    }
+
     /// 设置页的行骨架在两种窗口尺寸下都不越出滚动内容区（滚动由面板负责）。
     #[test]
     fn settings_rows_stay_inside_the_scroll_area() {
@@ -2060,6 +2151,8 @@ mod tests {
             let inner = Rect::from_min_size(Pos2::ZERO, Vec2::new(376.0, inner_height));
             let rows = settings_rows(inner, has_result);
             for (name, rect) in [
+                ("总开关", rows.master),
+                ("总开关热键", rows.master_key),
                 ("热键", rows.hotkey),
                 ("兜底", rows.ocr),
                 ("主题", rows.theme),
@@ -2077,6 +2170,8 @@ mod tests {
             }
             assert_eq!(rows.config.is_some(), !has_result);
             // 相邻行不重叠。
+            assert!(rows.master.bottom() <= rows.master_key.top());
+            assert!(rows.master_key.bottom() <= rows.hotkey.top());
             assert!(rows.theme.bottom() <= rows.accent.top());
             assert!(rows.fkey.bottom() <= rows.keywords.top());
         }
@@ -2112,6 +2207,7 @@ mod tests {
                     ui,
                     SettingsView {
                         master_enabled: true,
+                        hotkey_master: "F9",
                         hotkey: "F8",
                         hotkey_morse: "F5",
                         hotkey_fingerprint: "F6",
@@ -2289,6 +2385,7 @@ mod tests {
                                     ui,
                                     SettingsView {
                                         master_enabled: true,
+                                        hotkey_master: "F9",
                                         hotkey: "F8",
                                         hotkey_morse: "F5",
                                         hotkey_fingerprint: "F6",

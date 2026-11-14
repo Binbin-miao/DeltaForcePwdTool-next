@@ -18,6 +18,9 @@ use crate::platform;
 /// 热键等待切片：既保证热键响应，也保证线程能及时看到退出标志。
 const HOTKEY_POLL: Duration = Duration::from_millis(200);
 
+/// 总开关关掉时给用户的唯一一句解释（检查入口与识别入口共用，防两处文案漂移）。
+const NOTICE_MASTER_PAUSED: &str = "识别已暂停（设置里可重新打开）";
+
 /// 后台 → UI 的事件。
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -55,6 +58,11 @@ pub enum UiEvent {
         wanted: String,
         kept: Option<String>,
     },
+    /// 识别总开关被热键翻转（`enabled` = 翻转后的新状态）。
+    ///
+    /// 界面收到后只做两件事：把标题栏胶囊切过去 + 把新状态落盘 —— 识别是否真的停，
+    /// 早在配置里定过了（`run_once` 入口读它）。
+    MasterToggled { enabled: bool },
 }
 
 /// UI → 后台的命令。
@@ -66,9 +74,16 @@ pub enum Cmd {
     Force(SceneKind),
     /// 只读检查：找窗 + 场景判别，不产生任何输入。
     Probe,
+    /// 翻转识别总开关（不发起任何识别）。
+    ToggleMaster,
     /// 请求取消（在流程边界生效）。
     Cancel,
 }
+
+/// 唤醒界面的回调：后台在改完状态后调一次，让界面立刻画一帧。
+///
+/// 用回调而不是直接持有 `egui::Context`：后台不必认识 UI 框架，测试也能换成计数器。
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 /// 后台句柄。
 pub struct Worker {
@@ -76,6 +91,11 @@ pub struct Worker {
     pub commands: mpsc::Sender<Cmd>,
     /// 改键通道：把新热键名送进热键泵线程，实现「改完立刻生效」。
     hotkey_tx: mpsc::Sender<(delta_config::HotkeySlot, String)>,
+    /// 唤醒界面的把手（首帧由 UI 线程注入）。
+    ///
+    /// 少了它，后台改完状态只能等界面「下一次碰巧跑一帧」——egui 空闲时不重绘，
+    /// 用户按 `F9` 关掉识别，标题栏还挂着「识别中」，看着就像按键没用。
+    waker: Arc<Mutex<Option<Waker>>>,
     shutdown: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
 }
@@ -88,6 +108,22 @@ impl Worker {
     /// 请求改键：只重绑被指定的槽位。
     pub fn set_hotkey(&self, slot: delta_config::HotkeySlot, name: String) -> bool {
         self.hotkey_tx.send((slot, name)).is_ok()
+    }
+
+    /// 交出唤醒把手：UI 线程首帧调用一次；重复调用只是覆盖同一个 `Context`，无副作用。
+    pub fn wake_with(&self, ctx: egui::Context) {
+        if let Ok(mut slot) = self.waker.lock() {
+            *slot = Some(Arc::new(move || ctx.request_repaint()));
+        }
+    }
+}
+
+/// 请界面立刻画一帧（把手还没注入时什么也不做，不至于因此卡住后台）。
+fn wake(waker: &Mutex<Option<Waker>>) {
+    if let Ok(slot) = waker.lock() {
+        if let Some(call) = slot.as_ref() {
+            call();
+        }
     }
 }
 
@@ -104,9 +140,10 @@ impl Worker {
         let (commands, command_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
+        let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
 
-        // 四个热键：一键识别（自动判别）+ 三个强制键（对齐上游 F5/F6，另加操作台 F7）。
-        // 四个都能在设置里改；改键消息带槽位，泵只重绑被改的那一个。
+        // 五个热键：一键识别（自动判别）+ 三个强制键（对齐上游 F5/F6，另加操作台 F7）
+        // + 识别总开关（F9）。五个都能在设置里改；改键消息带槽位，泵只重绑被改的那一个。
         let bindings: Vec<(delta_config::HotkeySlot, String)> = {
             let keys = match config.lock() {
                 Ok(cfg) => cfg.hotkeys.clone(),
@@ -123,6 +160,9 @@ impl Worker {
             let trigger = commands.clone();
             let stop = shutdown.clone();
             let notify = event_tx.clone();
+            let cancel = cancel.clone();
+            let config = config.clone();
+            let waker = waker.clone();
             std::thread::Builder::new()
                 .name("delta-hotkey".to_owned())
                 .spawn(move || {
@@ -134,13 +174,30 @@ impl Worker {
                     let mut routes: Vec<(u32, Cmd)> = Vec::new();
                     // 每个槽当前在案的 `(注册 id, 实际 Hotkey, 键名)`；改键失败靠它回滚（D2），
                     // 所以不能只记名字，也不能事后重新解析。
-                    let mut bound: [Option<(u32, Hotkey, String)>; 4] =
-                        [None, None, None, None];
+                    let mut bound: [Option<(u32, Hotkey, String)>; 5] =
+                        [None, None, None, None, None];
                     for (slot, name) in &bindings {
                         let hotkey = platform::startup_hotkey(name);
-                        if let Ok(id) = hotkeys.register(hotkey) {
-                            bound[slot.index()] = Some((id, hotkey, name.clone()));
-                            routes.push((id, cmd_for(*slot)));
+                        match hotkeys.register(hotkey) {
+                            Ok(id) => {
+                                bound[slot.index()] = Some((id, hotkey, name.clone()));
+                                routes.push((id, cmd_for(*slot)));
+                            }
+                            // 缺少这个键不代表程序不可用（主按钮还在），但**必须留痕**：
+                            // 尤其是总开关键 —— 按了没反应却查不到原因是最难报的一类故障。
+                            // eprintln 在 release 下没人看得见，所以同时走「改键失败」那条
+                            // 界面提示通路（`kept: None` = 启动就没注册上，显示名保持旧值）。
+                            Err(error) => {
+                                eprintln!(
+                                    "[hotkey] {} 的 {} 注册不上（{error}），本会话没有这个键",
+                                    slot.label(),
+                                    name
+                                );
+                                let _ = notify.send(UiEvent::HotkeyConflict {
+                                    wanted: name.clone(),
+                                    kept: None,
+                                });
+                            }
                         }
                     }
                     while !stop.load(Ordering::Relaxed) {
@@ -178,7 +235,13 @@ impl Worker {
                         }
                         if let Some(event) = hotkeys.next_event(HOTKEY_POLL) {
                             if let Some((_, cmd)) = routes.iter().find(|(id, _)| *id == event.id) {
-                                if trigger.send(*cmd).is_err() {
+                                // 总开关就地翻转，不排进执行器队列：那一队是按顺序跑的，
+                                // 正跑着一轮识别时排进去要等它结束（最多 15 秒），
+                                // 「对枪时按一下就能停」等不起。
+                                if *cmd == Cmd::ToggleMaster {
+                                    toggle_master(&config, &notify, &cancel);
+                                    wake(&waker);
+                                } else if trigger.send(*cmd).is_err() {
                                     break;
                                 }
                             }
@@ -190,6 +253,7 @@ impl Worker {
         {
             let stop = shutdown.clone();
             let cancel = cancel.clone();
+            let waker = waker.clone();
             std::thread::Builder::new()
                 .name("delta-executor".to_owned())
                 .spawn(move || {
@@ -197,8 +261,14 @@ impl Worker {
                         if stop.load(Ordering::Relaxed) {
                             break;
                         }
+                        // 先把界面叫醒再干活：热键是在窗口没有焦点时按下的，
+                        // 不主动要一帧，「已开始识别」要等到用户下次碰窗口才显示得出来。
+                        wake(&waker);
                         match command {
                             Cmd::Cancel => cancel.store(true, Ordering::SeqCst),
+                            // 正常路径在热键泵里就地翻转（见泵内注释）；这里是第二条通路：
+                            // 谁把 ToggleMaster 塞进队列，也一样按同一份实现生效。
+                            Cmd::ToggleMaster => toggle_master(&config, &event_tx, &cancel),
                             Cmd::Probe => {
                                 cancel.store(false, Ordering::SeqCst);
                                 probe(&config, monitor, &event_tx);
@@ -221,6 +291,7 @@ impl Worker {
             events,
             commands,
             hotkey_tx,
+            waker,
             shutdown,
             cancel,
         }
@@ -235,11 +306,37 @@ impl Worker {
 /// 槽位 → 该键按下后派发的命令。
 fn cmd_for(slot: delta_config::HotkeySlot) -> Cmd {
     match slot {
+        // 总开关是唯一一个「不发起识别」的槽位：它只翻转放行权。
+        delta_config::HotkeySlot::Master => Cmd::ToggleMaster,
         delta_config::HotkeySlot::Scene => Cmd::Trigger,
         delta_config::HotkeySlot::Morse => Cmd::Force(SceneKind::Morse),
         delta_config::HotkeySlot::Fingerprint => Cmd::Force(SceneKind::Fingerprint),
         delta_config::HotkeySlot::Console => Cmd::Force(SceneKind::Console),
     }
+}
+
+/// 翻转识别总开关：**配置是唯一真相**，界面只是它的镜子。
+///
+/// 读-改-写必须在同一把锁里完成 —— 标题栏按钮和热键可能同时来翻同一个开关，
+/// 先读后写会互相覆盖成一个谁都没按过的状态。
+///
+/// 关掉时顺手置 `cancel`：当前这一轮在下一个流程边界收手，不再往下点键
+/// （用户拍板：「立刻中断」）。开启时**不**清 `cancel` —— 那是别人的请求，
+/// 不该被这个键顺手撤销；真正的清零点在每个新任务入口。
+fn toggle_master(config: &Mutex<Config>, notify: &mpsc::Sender<UiEvent>, cancel: &AtomicBool) {
+    let enabled = match config.lock() {
+        Ok(mut config) => {
+            let wanted = !config.master_enabled;
+            config.master_enabled = wanted;
+            wanted
+        }
+        // 锁中毒 = 配置内容已不可信：宁可什么都不做，也不在不确定的状态下继续放行识别。
+        Err(_) => return,
+    };
+    if !enabled {
+        cancel.store(true, Ordering::SeqCst);
+    }
+    let _ = notify.send(UiEvent::MasterToggled { enabled });
 }
 
 /// 取当前配置快照（锁内只做 clone，不做耗时操作）。
@@ -297,7 +394,7 @@ fn probe(config: &Arc<Mutex<Config>>, monitor: MonitorInfo, tx: &mpsc::Sender<Ui
     let snapshot = snapshot(config);
     if !snapshot.master_enabled {
         // 总开关关掉：热键还能按下，但这里直接返回 —— 不截图、不注入、不弹流程。
-        let _ = tx.send(UiEvent::Rejected("识别已暂停（设置里可重新打开）".to_owned()));
+        let _ = tx.send(UiEvent::Rejected(NOTICE_MASTER_PAUSED.to_owned()));
         return;
     }
     if let Err(reason) = platform::focus_game_window() {
@@ -361,6 +458,14 @@ fn run_once(
 ) {
     let _ = tx.send(UiEvent::Started);
     let snapshot = snapshot(config);
+
+    // 总开关闸门必须排在**所有**副作用之前：不激活游戏窗口、不建采集会话、不抓帧、不注入。
+    // 少了它，关掉总开关后按 F8/F5/F6/F7 仍会完整跑一轮并真的去动键盘
+    // （用户拍板：「关掉就别动我的键盘」）。
+    if !snapshot.master_enabled {
+        let _ = tx.send(UiEvent::Rejected(NOTICE_MASTER_PAUSED.to_owned()));
+        return;
+    }
 
     if let Err(reason) = platform::focus_game_window() {
         let _ = tx.send(UiEvent::Rejected(reason));
@@ -924,6 +1029,132 @@ mod tests {
         let config = Config::default();
         assert!(!config.validate().is_empty());
         assert!(config.try_px_view().is_err());
+    }
+
+    /// 总开关热键：一次按下 = 配置翻转 + 界面收到新状态 + 关掉时立刻中断当前这一轮。
+    #[test]
+    fn master_toggle_flips_the_config_and_cancels_the_running_round() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc::channel;
+
+        let config = Arc::new(Mutex::new(Config::default()));
+        let cancel = AtomicBool::new(false);
+
+        // 关：配置真翻过去 + 立刻请求中断 + 通知界面。
+        let (tx, rx) = channel();
+        assert!(config.lock().expect("锁").master_enabled, "默认开");
+        toggle_master(&config, &tx, &cancel);
+        assert!(!config.lock().expect("锁").master_enabled, "配置必须真翻过去");
+        assert!(cancel.load(Ordering::SeqCst), "关掉时必须请求中断当前这一轮");
+        assert!(
+            matches!(rx.try_recv(), Ok(UiEvent::MasterToggled { enabled: false })),
+            "界面必须收到「已关」"
+        );
+
+        // 开：状态翻回来、界面收到「已开」，但**不**顺手撤销别人请求的中断。
+        let (tx, rx) = channel();
+        toggle_master(&config, &tx, &cancel);
+        assert!(config.lock().expect("锁").master_enabled);
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "开启不该撤销中断请求（清零点在任务入口）"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(UiEvent::MasterToggled { enabled: true })),
+            "界面必须收到「已开」"
+        );
+    }
+
+    /// 总开关关掉后，**真实识别入口**也必须一个输入事件都不产生（spec §5.3 t1 / B3 真实路径）。
+    ///
+    /// 只断言那一条 `NOTICE_MASTER_PAUSED`：它只能由闸门在 `focus_game_window()` 与
+    /// `try_px_view()` **之前**发出，所以文案对上即证明没激活游戏窗口、没建采集会话、没抓帧。
+    #[test]
+    fn paused_master_makes_run_once_stop_before_touching_the_game_window() {
+        use std::sync::mpsc::channel;
+
+        let config = Arc::new(Mutex::new(Config::default()));
+        config.lock().expect("锁").master_enabled = false;
+        let cancel = AtomicBool::new(false);
+        let (tx, rx) = channel();
+
+        run_once(
+            &config,
+            MonitorInfo::new(1280, 720).expect("合法显示器"),
+            &tx,
+            &cancel,
+            None,
+        );
+
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert_eq!(
+            events.len(),
+            2,
+            "关掉时只许发「开始」+「已暂停」，多一条就意味着跑了识别：{events:?}"
+        );
+        assert!(matches!(events[0], UiEvent::Started), "先报开始");
+        assert!(
+            matches!(&events[1], UiEvent::Rejected(notice) if notice == NOTICE_MASTER_PAUSED),
+            "必须是总开关闸门的文案，实际：{:?}",
+            events[1]
+        );
+        assert!(
+            !cancel.load(Ordering::SeqCst),
+            "闸门是只读放行判断，不该动别人的取消位"
+        );
+    }
+
+    /// 只读检查入口与识别入口共用同一道闸门与同一句文案（防两处文案漂移）。
+    #[test]
+    fn paused_master_gate_uses_the_same_notice_for_probe_and_run_once() {
+        use std::sync::mpsc::channel;
+
+        let config = Arc::new(Mutex::new(Config::default()));
+        config.lock().expect("锁").master_enabled = false;
+        let (tx, rx) = channel();
+
+        probe(
+            &config,
+            MonitorInfo::new(1280, 720).expect("合法显示器"),
+            &tx,
+        );
+
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert_eq!(events.len(), 2, "关掉时检查入口也不许抓图：{events:?}");
+        assert!(
+            matches!(&events[1], UiEvent::Rejected(notice) if notice == NOTICE_MASTER_PAUSED),
+            "检查入口文案必须与识别入口同源，实际：{:?}",
+            events[1]
+        );
+    }
+
+    /// 总开关槽位必须派发翻转命令，而不是任何一个识别命令。
+    #[test]
+    fn master_slot_maps_to_the_toggle_command() {
+        assert_eq!(cmd_for(delta_config::HotkeySlot::Master), Cmd::ToggleMaster);
+        assert_ne!(cmd_for(delta_config::HotkeySlot::Scene), Cmd::ToggleMaster);
+    }
+
+    /// 唤醒把手没注入时不能崩；注入后必须真的调一次。
+    ///
+    /// 这条守的是实测踩到的坑：热键在窗口没焦点时按下，egui 空闲不重绘，
+    /// 后台改完状态界面还挂着旧显示 —— 用户看到的结论就是「这个键没用」。
+    #[test]
+    fn wake_calls_the_injected_waker_only_after_injection() {
+        use std::sync::atomic::AtomicUsize;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let slot: Mutex<Option<Waker>> = Mutex::new(None);
+
+        wake(&slot);
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "还没注入把手时不该有动作");
+
+        let counter = hits.clone();
+        *slot.lock().expect("锁") = Some(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        wake(&slot);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "注入后每次唤醒必须真的调一次");
     }
 
     #[test]

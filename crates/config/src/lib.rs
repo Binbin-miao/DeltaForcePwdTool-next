@@ -581,11 +581,17 @@ pub struct Hotkeys {
     pub fingerprint: String,
     /// 强制跑操作台。
     pub console: String,
+    /// 识别总开关的翻转键（默认 `F9`）。
+    ///
+    /// 与上面四个的分工：那四个**发起**识别，这个只**开关**识别 ——
+    /// 而且关着的时候它照样有效，否则关掉就再也按不回来了。
+    pub master: String,
 }
 
-/// 四个可独立改键的槽位（设置页逐个可点）。
+/// 五个可独立改键的槽位（设置页逐个可点）。
 ///
-/// 与 [`Hotkeys`] 的字段一一对应；`Scene` 是「一键识别」，其余三个是强制入口。
+/// 与 [`Hotkeys`] 的字段一一对应；`Scene` 是「一键识别」，其余三个是强制入口，
+/// `Master` 是识别总开关的翻转键（唯一一个**不发起**识别的槽位）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HotkeySlot {
     /// 一键识别（自动判别场景）。
@@ -596,25 +602,35 @@ pub enum HotkeySlot {
     Fingerprint,
     /// 强制操作台。
     Console,
+    /// 翻转识别总开关。
+    Master,
 }
 
 impl HotkeySlot {
-    /// 按设置页显示顺序排列。
-    pub const ALL: [Self; 4] = [Self::Scene, Self::Morse, Self::Fingerprint, Self::Console];
+    /// 按设置页显示顺序排列（`Master` 紧跟总开关行、排在四个识别键之前）。
+    pub const ALL: [Self; 5] = [
+        Self::Master,
+        Self::Scene,
+        Self::Morse,
+        Self::Fingerprint,
+        Self::Console,
+    ];
 
     /// 数组下标（`ALL` 的位置）。
     pub fn index(self) -> usize {
         match self {
-            Self::Scene => 0,
-            Self::Morse => 1,
-            Self::Fingerprint => 2,
-            Self::Console => 3,
+            Self::Master => 0,
+            Self::Scene => 1,
+            Self::Morse => 2,
+            Self::Fingerprint => 3,
+            Self::Console => 4,
         }
     }
 
     /// 设置页左侧标题。
     pub fn label(self) -> &'static str {
         match self {
+            Self::Master => "总开关热键",
             Self::Scene => "全局热键",
             Self::Morse => "摩斯热键",
             Self::Fingerprint => "指纹热键",
@@ -625,6 +641,7 @@ impl HotkeySlot {
     /// 读当前键名。
     pub fn read(self, keys: &Hotkeys) -> &str {
         match self {
+            Self::Master => &keys.master,
             Self::Scene => &keys.scene,
             Self::Morse => &keys.morse,
             Self::Fingerprint => &keys.fingerprint,
@@ -635,6 +652,7 @@ impl HotkeySlot {
     /// 写回键名。
     pub fn write(self, keys: &mut Hotkeys, value: String) {
         match self {
+            Self::Master => keys.master = value,
             Self::Scene => keys.scene = value,
             Self::Morse => keys.morse = value,
             Self::Fingerprint => keys.fingerprint = value,
@@ -651,6 +669,8 @@ impl Default for Hotkeys {
             morse: "F5".to_owned(),
             fingerprint: "F6".to_owned(),
             console: "F7".to_owned(),
+            // 总开关翻转键：紧挨 F5~F8，游戏里通常空着。
+            master: "F9".to_owned(),
         }
     }
 }
@@ -864,13 +884,14 @@ pub fn single_key_rejection(hotkey: &str) -> Option<&'static str> {
 }
 
 impl Hotkeys {
-    /// 四个字段（按配置顺序），供逐一校验。
-    pub fn fields(&self) -> [(&'static str, &str); 4] {
+    /// 五个字段（按配置顺序），供逐一校验。
+    pub fn fields(&self) -> [(&'static str, &str); 5] {
         [
             ("hotkeys.scene", &self.scene),
             ("hotkeys.morse", &self.morse),
             ("hotkeys.fingerprint", &self.fingerprint),
             ("hotkeys.console", &self.console),
+            ("hotkeys.master", &self.master),
         ]
     }
 }
@@ -1291,14 +1312,67 @@ mod tests {
     }
 
     #[test]
+    fn master_hotkey_defaults_to_f9_and_survives_old_configs() {
+        // 老配置没有这个字段时必须是 F9，不能是空串（空串注册不上 = 功能静默消失）。
+        assert_eq!(Config::default().hotkeys.master, "F9");
+        let legacy: Config = serde_json::from_str(r#"{"hotkeys":{"scene":"F8"}}"#).expect("老配置合法");
+        assert_eq!(legacy.hotkeys.master, "F9", "缺字段必须回落 F9");
+
+        // 改过之后必须原样回得来（跨启动保持）。
+        let custom: Config =
+            serde_json::from_str(r#"{"hotkeys":{"master":"Ctrl+Alt+M"}}"#).expect("可读");
+        assert_eq!(custom.hotkeys.master, "Ctrl+Alt+M");
+        let dumped = serde_json::to_string(&custom).expect("序列化");
+        assert!(dumped.contains("\"master\":\"Ctrl+Alt+M\""), "{dumped}");
+        assert_eq!(
+            serde_json::from_str::<Config>(&dumped)
+                .expect("反序列化")
+                .hotkeys
+                .master,
+            "Ctrl+Alt+M"
+        );
+    }
+
+    #[test]
+    fn every_hotkey_slot_owns_one_index_and_one_field() {
+        // 槽位下标直接当数组下标用（热键泵的 `bound[]`）：重复就是串键，越界就是崩。
+        let mut seen = [false; 5];
+        let mut names = Vec::new();
+        for slot in HotkeySlot::ALL {
+            let index = slot.index();
+            assert!(index < 5, "{slot:?} 下标越界");
+            assert!(!seen[index], "{slot:?} 的下标与别的槽位撞了");
+            seen[index] = true;
+            // 写进去的必须从这个槽读得回来（读写指向同一字段）。
+            let mut keys = Hotkeys::default();
+            let marker = format!("{slot:?}-测试键");
+            HotkeySlot::write(slot, &mut keys, marker.clone());
+            assert_eq!(HotkeySlot::read(slot, &keys), marker, "{slot:?} 读写不是同一个字段");
+            names.push(slot.read(&Hotkeys::default()).to_owned());
+        }
+        assert!(seen.iter().all(|hit| *hit), "ALL 必须覆盖全部五个槽位");
+        assert_eq!(
+            Hotkeys::default().fields().len(),
+            HotkeySlot::ALL.len(),
+            "校验列表漏一项 = 某个键永远不被校验"
+        );
+        // 五个默认键互不相同：同一个键注册两次只会成功一个。
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "默认键位重复：{names:?}");
+    }
+
+    #[test]
     fn legacy_hotkey_fields_are_ignored_not_fatal() {
-        // 四个键都能配（对齐上游 F5/F6，另加操作台）；未知字段静默忽略（前向兼容）。
-        let json = r#"{"hotkeys":{"scene":"F7","morse":"F9","fingerprint":"F10","console":"F11","future":"X1"}}"#;
+        // 五个键都能配（对齐上游 F5/F6，另加操作台与总开关）；未知字段静默忽略（前向兼容）。
+        let json = r#"{"hotkeys":{"scene":"F7","morse":"F9","fingerprint":"F10","console":"F11","master":"F12","future":"X1"}}"#;
         let config: Config = serde_json::from_str(json).expect("配置必须仍能解析");
         assert_eq!(config.hotkeys.scene, "F7");
         assert_eq!(config.hotkeys.morse, "F9");
         assert_eq!(config.hotkeys.fingerprint, "F10");
         assert_eq!(config.hotkeys.console, "F11");
+        assert_eq!(config.hotkeys.master, "F12");
     }
 
     #[test]
