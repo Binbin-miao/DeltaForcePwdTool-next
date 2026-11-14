@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! begin(at)   绝对定位到起点 → LEFTDOWN
-//! step(dx,dy) 相对 MOVE 分步，每子步 ≤20px
+//! step(dx,dy) 相对 MOVE 分步，每子步 ≤20px（Live 每 4 子步让出 1ms）
 //! end()       LEFTUP
 //! Drop        兜底 LEFTUP（异常路径不得把鼠标键卡死）
 //! ```
@@ -10,14 +10,38 @@
 //! 拖动全程**不使用** `SetCursorPos`（会和相对移动打架），也不使用
 //! `MOUSEEVENTF_ABSOLUTE` 做位移 —— 绝对定位只出现在 `begin` 的归位那一步。
 //!
-//! `shortcut:` 子步之间**不再 sleep**（原为每子步 2ms）。步长 ≤20px 的硬约束不变；
-//! 8 个子步 ≈ 8 条 MOVE，系统的输入队列（约 200Hz 合并）吃得下。若某台机器
-//! 出现「拖不到位」，升级路径是「每 4 个子步 sleep 1ms」，而不是加大步长。
+//! `shortcut:` 步长 ≤20px 的硬约束不变；升级路径是**每 4 个子步 sleep 1ms，而不是加大步长**
+//! （原为每子步 2ms，实测部分游戏的输入队列会把密集 MOVE 合并掉 ⇒ 拖不到位）。
+//! `Sink::Record`（测试/录制）**零 sleep** —— 它不碰系统光标，也就没有队列可丢。
+
+use std::time::Duration;
 
 use delta_geom::PxPoint;
 
 use crate::inject::{screen_size, split_steps, Injected, RecordHandle, Sink};
 use crate::InputError;
+
+/// 每这么多个子步让出 1ms（**仅 [`Sink::Live`]**，见模块头）。
+const YIELD_EVERY_SUBSTEPS: usize = 4;
+
+/// `Sink::Live` 分支实际让出过的次数（测试观察口，见 B6）。
+#[cfg(test)]
+static YIELDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `Sink::Live` 让出过的次数。
+///
+/// 用它取代「计时断言」：机器负载下 `Instant` 差值是 flaky 的，计数器不会。
+#[cfg(test)]
+pub(crate) fn yield_count() -> usize {
+    YIELDS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 让出 1ms 给系统输入队列；同时记账，供 B6 断言「录制路径一次都没让」。
+fn yield_once() {
+    #[cfg(test)]
+    YIELDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(1));
+}
 
 /// 保持左键按下状态的拖动手柄。
 ///
@@ -66,18 +90,28 @@ impl Drag {
         Ok(())
     }
 
-    /// 相对位移一步。内部拆成 ≤20px 的子步，子步之间**不等待**。
+    /// 相对位移一步。内部拆成 ≤20px 的子步；真实注入每 4 个子步让出 1ms。
     pub fn step(&mut self, dx: i32, dy: i32) -> Result<(), InputError> {
         if !self.pressed {
             return Err(InputError::NotPressed);
         }
-        for (step_x, step_y) in split_steps(dx, dy) {
+        for (index, (step_x, step_y)) in split_steps(dx, dy).into_iter().enumerate() {
+            if self.yields_at(index) {
+                yield_once();
+            }
             self.sink.emit(Injected::Move {
                 dx: step_x,
                 dy: step_y,
             })?;
         }
         Ok(())
+    }
+
+    /// 第 `index` 个子步**之前**是否让出 1ms。
+    ///
+    /// 只有真实注入需要让：录制路径不碰系统光标，sleep 只会让测试变慢。
+    fn yields_at(&self, index: usize) -> bool {
+        matches!(self.sink, Sink::Live) && index > 0 && index.is_multiple_of(YIELD_EVERY_SUBSTEPS)
     }
 
     /// 抬起左键。
@@ -224,5 +258,37 @@ mod tests {
         drag.step(0, 0).expect("空步");
         assert_eq!(log.len(), before, "零位移不得产生事件");
         assert!(drag.is_pressed());
+    }
+
+    #[test]
+    fn drag_recording_path_never_yields() {
+        // B6：录制路径零 sleep。用计数器断言而不是计时 —— 机器负载下计时断言必 flaky。
+        let before = yield_count();
+        let (mut drag, log) = Drag::recording();
+        drag.begin(PxPoint::ZERO).expect("begin");
+        // 1000px = 50 个子步：若录制路径也会让出，这里必然被记账。
+        drag.step(1000, -1000).expect("step");
+        drag.end().expect("end");
+        assert!(log.len() > YIELD_EVERY_SUBSTEPS, "前提：子步数必须跨过让出点");
+        assert_eq!(yield_count() - before, 0, "录制路径一个 sleep 都不许有");
+    }
+
+    #[test]
+    fn only_the_live_path_yields_and_only_every_fourth_substep() {
+        let live = Drag {
+            sink: Sink::Live,
+            pressed: true,
+        };
+        assert!(!live.yields_at(0), "第一个子步之前不该等");
+        assert!(!live.yields_at(1));
+        assert!(!live.yields_at(3));
+        assert!(live.yields_at(YIELD_EVERY_SUBSTEPS), "第 4 个子步之前让出一次");
+        assert!(live.yields_at(YIELD_EVERY_SUBSTEPS * 2));
+
+        let (recording, _log) = Drag::recording();
+        assert!(
+            !(1..=YIELD_EVERY_SUBSTEPS * 3).any(|index| recording.yields_at(index)),
+            "录制路径任何子步都不许让出"
+        );
     }
 }

@@ -8,7 +8,7 @@
 //! - [`is_green_glow`]：游戏里的亮绿色（高亮带、锁定条、成功圆钮）
 //! - [`is_red_glow`]：整条高亮带变红（大保险按错的唯一信号）
 //! - [`is_white`]：任务保险的白色游标与目标方块、信号线台的白竖线
-//! - [`is_yellow_or_green_glow`]：黄键台的亮键与进度勾选
+//! - [`is_yellow_glow`]：黄键台待点按键的纯黄/琥珀高亮（排除已经变绿的完成态）
 
 use delta_capture::Frame;
 use delta_geom::PxRect;
@@ -81,18 +81,21 @@ pub(crate) fn is_white([b, g, r]: [u8; 3]) -> bool {
     r > 170 && g > 170 && b > 170
 }
 
-/// 黄/绿高亮（黄键台的亮键、进度勾选）。
+/// 纯黄/琥珀高亮（黄键台里**还没点**的亮键）。
+///
+/// 显式排除已激活变绿的按钮（[`is_check_green`]）：点亮的键会转成绿勾，
+/// 若把绿也算成「还亮着」，ack 判据永远认为没吃下，同一颗键会被反复点。
 ///
 /// `r + g > 3b` 必须在 **u16** 上比较：u8 里 `r+g` 会饱和到 255，只要 `b ≥ 86`
 /// 两边就都是 255，亮黄键（240,200,105）会被判成「不是高亮」→ 亮键漏检。
 /// `b` 的上限取 120 而非 115：米黄/琥珀旋钮实测 B≈120，115 会把它漏掉。
-pub(crate) fn is_yellow_or_green_glow(color: [u8; 3]) -> bool {
+pub(crate) fn is_yellow_glow(color: [u8; 3]) -> bool {
     let [b, g, r] = color;
-    let is_yellow = r > 140
+    !is_check_green(color)
+        && r > 140
         && g > 120
         && b <= 120
-        && (u16::from(r) + u16::from(g)) > u16::from(b) * 3;
-    is_green_glow(color) || is_yellow
+        && (u16::from(r) + u16::from(g)) > u16::from(b) * 3
 }
 
 /// 绿 ✓（进度格「已完成」的标志）：绿分量明显压过红蓝。
@@ -296,12 +299,15 @@ mod tests {
     }
 
     #[test]
-    fn yellow_glow_survives_large_red_green_sums() {
+    fn yellow_glow_distinguishes_pending_yellow_from_activated_green() {
         // 谓词入参是 [B, G, R]。
         // u8 里 r+g 会饱和到 255，亮黄键（240,200,105）以前判不出来。
-        assert!(is_yellow_or_green_glow([105, 200, 240]), "亮黄键必须判成高亮");
-        assert!(is_yellow_or_green_glow([120, 200, 230]), "米黄旋钮也会命中（靠暗键阵拦截）");
-        assert!(!is_yellow_or_green_glow([255, 255, 255]), "纯白不是高亮");
+        assert!(is_yellow_glow([105, 200, 240]), "亮黄键必须判成高亮");
+        assert!(is_yellow_glow([120, 200, 230]), "米黄旋钮也会命中（靠暗键阵拦截）");
+        assert!(!is_yellow_glow([255, 255, 255]), "纯白不是高亮");
+        // 点完变绿的键：必须不再算「待点黄键」，但仍要能被绿勾判据认出来。
+        assert!(!is_yellow_glow([60, 220, 60]), "已变绿的完成态不算待点黄键");
+        assert!(is_check_green([60, 220, 60]), "已变绿按键必须命中绿勾判据");
     }
 
     #[test]

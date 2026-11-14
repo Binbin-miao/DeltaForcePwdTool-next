@@ -31,6 +31,7 @@
 //! 失败即放行：模板目录不存在 / 为空 / 全是没登记的文件名 → [`UiVerdict::Gray`]，
 //! **绝不允许因为模板缺失而拒绝识别**（那会把工具变成永久失效）。
 
+use std::cell::Cell;
 use std::path::Path;
 
 use delta_capture::Frame;
@@ -54,10 +55,19 @@ pub const MIN_MARGIN: f32 = 0.05;
 pub const NOT_UNLOCK_SCREEN: &str = "这不是解锁界面";
 
 /// 模板文件名 → 场景。新增解锁界面 = 这张表加一行 + 往 `images/ui/` 放一张图。
-const SCENE_OF_TEMPLATE: [(&str, Scene); 3] = [
+///
+/// **后 3 项当前永不生效**：`images/ui/` 目前只有 `morse.png` / `keys.png` / `line.png`，
+/// 而 [`UiGuard::load`] 只遍历目录里**真实存在**的文件 ⇒ 表里有、盘上没有的键不会被匹配到。
+/// 它们属于**预留位**：一旦有人放进同名 PNG（例如把 `fingerprint.png` 拷进 `images/ui/`），
+/// 这个界面就会路由到 `Scene::Fingerprint` —— **这是预期行为，不是 bug**，不需要改代码。
+/// （`timing` / `pins` 是 AZ3 操作台内的两种玩法，都归 `Scene::Console`。）
+const SCENE_OF_TEMPLATE: [(&str, Scene); 6] = [
     ("morse", Scene::Morse),
     ("keys", Scene::Console),
     ("line", Scene::Console),
+    ("timing", Scene::Console),
+    ("pins", Scene::Console),
+    ("fingerprint", Scene::Fingerprint),
 ];
 
 /// 模板文件名对应的场景（`None` = 没登记，跳过该文件，绝不 panic）。
@@ -140,6 +150,8 @@ impl UiGuard {
     /// 判定这一帧是哪个解锁界面。
     ///
     /// 只读：不写盘、不改内部状态（读路径零副作用）。
+    /// 日志**只在结论变化时**打一行（见 [`should_log`]）：本函数落在 40ms 轮询里，
+    /// 逐帧打印会让一次 F8 刷 30 行。
     pub fn verdict(&self, frame: &Frame) -> UiVerdict {
         let Some(thumb) = thumbnail(frame) else {
             return UiVerdict::Gray;
@@ -147,16 +159,11 @@ impl UiGuard {
         let Some((name, best, second)) = self.best_of(&thumb) else {
             return UiVerdict::Gray;
         };
-        eprintln!("[ui_guard] best={best:.3} second={second:.3} hit={name}");
-        if best < MAX_REJECT_NCC {
-            return UiVerdict::Reject(NOT_UNLOCK_SCREEN);
+        let verdict = judge(name, best, second);
+        if should_log(LogSignature::of(verdict, name)) {
+            eprintln!("{}", log_line(name, best, second));
         }
-        match scene_of(name) {
-            Some(scene) if best >= MIN_TARGET_NCC && best - second >= MIN_MARGIN => {
-                UiVerdict::Target(scene)
-            }
-            _ => UiVerdict::Gray,
-        }
+        verdict
     }
 
     /// 打分最高且登记过场景的模板：`(名字, 最高分, 次高分)`。
@@ -179,6 +186,77 @@ impl UiGuard {
         }
         top.map(|(name, best)| (name, best, runner_up))
     }
+}
+
+/// 分数 → 结论（纯函数：不碰帧、不碰盘、不打印）。
+fn judge(name: &str, best: f32, second: f32) -> UiVerdict {
+    if best < MAX_REJECT_NCC {
+        return UiVerdict::Reject(NOT_UNLOCK_SCREEN);
+    }
+    match scene_of(name) {
+        Some(scene) if best >= MIN_TARGET_NCC && best - second >= MIN_MARGIN => {
+            UiVerdict::Target(scene)
+        }
+        _ => UiVerdict::Gray,
+    }
+}
+
+/// 一行标定日志（`verdict` 打印的就是这一行，测试直接数它）。
+fn log_line(name: &str, best: f32, second: f32) -> String {
+    format!("[ui_guard] best={best:.3} second={second:.3} hit={name}")
+}
+
+/// 一次判定的日志签名：**类别** + 命中名（只在 `Target` 时才算数）。
+///
+/// `Reject` / `Gray` 下的「最高分模板名」不是结论而是噪声（分数都在 0.3 以下来回抖），
+/// 把它算进签名会让灰带里的抖动反复触发打印。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogSignature {
+    /// `UiVerdict` 的类别：`Reject` = 0、`Gray` = 1、`Target` = 2。
+    class: u8,
+    /// 命中名哈希（非 `Target` 时为 0）。
+    name: u32,
+}
+
+impl LogSignature {
+    fn of(verdict: UiVerdict, name: &str) -> Self {
+        let class = match verdict {
+            UiVerdict::Reject(_) => 0,
+            UiVerdict::Gray => 1,
+            UiVerdict::Target(_) => 2,
+        };
+        Self {
+            class,
+            name: if class == 2 { hash_name(name) } else { 0 },
+        }
+    }
+}
+
+/// 名字的稳定哈希（只为比较，不落盘）。
+fn hash_name(name: &str) -> u32 {
+    name.bytes().fold(2166136261u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16777619)
+    })
+}
+
+thread_local! {
+    /// 本线程上一次**已打印**的结论签名。轮询线程里它就是「上一帧的结论」。
+    static LAST_LOG: Cell<Option<LogSignature>> = const { Cell::new(None) };
+}
+
+/// 结论变化才放行打印（`true` = 这次该打）。
+///
+/// 一次 F8 ≈ 30 次轮询，而结论只会经历「不像 → 灰带 → 命中」两三次跃迁，
+/// 因此 stderr 行数与**结论跃迁次数**同阶，与轮询次数无关 —— 这是刷屏的解药，
+/// 也是标定数据的来源：切换瞬间前后两个结论都留在日志里。
+fn should_log(signature: LogSignature) -> bool {
+    LAST_LOG.with(|slot| {
+        if slot.get() == Some(signature) {
+            return false;
+        }
+        slot.set(Some(signature));
+        true
+    })
 }
 
 /// 整帧 ROI → 像素矩形 `(x0, y0, x1, y1)`，右下开区间。
@@ -399,6 +477,16 @@ mod tests {
     }
 
     #[test]
+    fn reserved_template_names_route_to_their_scenes() {
+        // 预留位：盘上没有这几张图，但映射必须先写好 —— 放进同名 PNG 即生效，不必改代码。
+        assert_eq!(scene_of("fingerprint"), Some(Scene::Fingerprint));
+        assert_eq!(scene_of("timing"), Some(Scene::Console));
+        assert_eq!(scene_of("pins"), Some(Scene::Console));
+        assert_eq!(scene_of("keys"), Some(Scene::Console));
+        assert_eq!(scene_of("没有登记的名字"), None, "未登记的名字必须安全跳过");
+    }
+
+    #[test]
     fn a_library_of_only_unknown_names_disables_the_gate() {
         let guard = UiGuard {
             entries: vec![("unknown".to_owned(), template_of("morse"))],
@@ -509,5 +597,107 @@ mod tests {
             recheck(UiVerdict::Reject(NOT_UNLOCK_SCREEN), UiVerdict::Gray),
             Recheck::Downgrade
         );
+    }
+
+    // ── 轮询日志门控（一次 F8 的 stderr 行数必须与轮询次数脱钩）──
+
+    /// 清空本线程的「上一帧结论」，让每条门控测试都从干净状态开始。
+    fn reset_log_gate() {
+        LAST_LOG.with(|slot| slot.set(None));
+    }
+
+    /// 过一遍门控并把**真正会打出去的行**收集起来（与 `verdict` 同源：同签名、同格式）。
+    fn collect_lines(trajectory: &[(UiVerdict, &str, f32, f32)]) -> Vec<String> {
+        reset_log_gate();
+        trajectory
+            .iter()
+            .filter(|(verdict, name, _, _)| should_log(LogSignature::of(*verdict, name)))
+            .map(|(_, name, best, second)| log_line(name, *best, *second))
+            .collect()
+    }
+
+    #[test]
+    fn one_press_never_prints_more_than_five_lines() {
+        // 一次 F8 ≈ 30 次轮询（40ms × 1.2s 预算）。模拟真实轨迹：
+        // 淡入期不像（Reject）→ 灰带（Gray）→ 命中 morse（Target）→ 复核期间界面切到 keys。
+        // 全程 30 帧，门控后落地行数必须 ≤ 5（修复前是 30 行）。
+        let mut trajectory: Vec<(UiVerdict, &str, f32, f32)> = Vec::new();
+        for index in 0..12 {
+            // 淡入期：最高分在 0.02~0.12 抖，最高分模板名在 morse/keys 之间乱跳。
+            let name = if index % 2 == 0 { "morse" } else { "keys" };
+            trajectory.push((
+                UiVerdict::Reject(NOT_UNLOCK_SCREEN),
+                name,
+                0.02 + index as f32 * 0.008,
+                0.0,
+            ));
+        }
+        for index in 0..6 {
+            let name = if index % 2 == 0 { "keys" } else { "line" };
+            trajectory.push((UiVerdict::Gray, name, 0.31 + index as f32 * 0.05, 0.20));
+        }
+        for index in 0..10 {
+            trajectory.push((
+                UiVerdict::Target(Scene::Morse),
+                "morse",
+                0.80 + index as f32 * 0.02,
+                0.05,
+            ));
+        }
+        for index in 0..2 {
+            trajectory.push((
+                UiVerdict::Target(Scene::Console),
+                "keys",
+                0.90 + index as f32 * 0.02,
+                0.05,
+            ));
+        }
+        assert_eq!(trajectory.len(), 30, "30 次轮询 = 一次 F8 的真实量级");
+
+        let lines = collect_lines(&trajectory);
+        assert!(
+            lines.len() <= 5,
+            "一次 F8 的 stderr 必须 ≤ 5 行，实际 {} 行：{lines:#?}",
+            lines.len()
+        );
+        assert!(
+            lines.len() >= 2,
+            "结论跃迁不能全被吞掉，至少要留下前后两个结论：{lines:#?}"
+        );
+        // 可诊断性：第一行是「不像」（低分），最后一行是命中 keys（高分）。
+        assert!(
+            lines[0].contains("best=0.020") && lines[0].contains("hit=morse"),
+            "第一行必须是最初的「不像」：{}",
+            lines[0]
+        );
+        let last = lines.last().expect("至少两行");
+        assert!(
+            last.contains("hit=keys") && last.contains("best=0.9"),
+            "最后一行必须是切换后的命中：{last}"
+        );
+    }
+
+    #[test]
+    fn a_stable_conclusion_is_printed_exactly_once() {
+        // 结论不变就不打：同一结论连打 30 帧只留 1 行，标定数据照样在。
+        let stable: Vec<(UiVerdict, &str, f32, f32)> = (0..30)
+            .map(|_| (UiVerdict::Target(Scene::Morse), "morse", 0.95, 0.04))
+            .collect();
+        let lines = collect_lines(&stable);
+        assert_eq!(lines.len(), 1, "结论没变就必须只打一行：{lines:#?}");
+        assert!(lines[0].contains("hit=morse"));
+    }
+
+    #[test]
+    fn a_verdict_class_change_always_leaves_a_line() {
+        // 三个类别之间互相跃迁，每一类都必须留下证据（否则「切换瞬间看不见」）。
+        let lines = collect_lines(&[
+            (UiVerdict::Reject(NOT_UNLOCK_SCREEN), "morse", 0.05, 0.0),
+            (UiVerdict::Gray, "morse", 0.42, 0.30),
+            (UiVerdict::Target(Scene::Morse), "morse", 0.88, 0.05),
+            (UiVerdict::Gray, "morse", 0.42, 0.30),
+            (UiVerdict::Reject(NOT_UNLOCK_SCREEN), "morse", 0.05, 0.0),
+        ]);
+        assert_eq!(lines.len(), 5, "每一次类别跃迁都要留一行：{lines:#?}");
     }
 }

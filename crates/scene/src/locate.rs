@@ -44,16 +44,26 @@ const MIN_FRAME_SIDE: u32 = 160;
 /// 结果坐标乘回 `scale`。阈值只维护一套，且下采样本身还让定位更快。
 pub const REFERENCE_HEIGHT: u32 = 720;
 
+/// 帧相对 720p 世界的缩放比（**唯一定义处**，[`normalize_frame`] 与 ready 闸共用）。
+///
+/// 帧高已 ≤720（含 0）时恒为 1.0：这类帧不做任何缩放，坐标就是 720p 世界坐标。
+fn scale_of(frame: &Frame) -> f32 {
+    if frame.h <= REFERENCE_HEIGHT {
+        return 1.0;
+    }
+    frame.h as f32 / REFERENCE_HEIGHT as f32
+}
+
 /// 等比缩放到 [`REFERENCE_HEIGHT`]，返回 `(缩放后帧, 原图/缩放 比例)`。
 ///
 /// 幂等：帧高已 ≤ 720 时原样返回、`scale = 1.0`。比例恒 ≥ 1，调用方用
 /// `x * scale` 把缩放世界坐标换回原图坐标。
 pub fn normalize_frame(frame: &Frame) -> (Frame, f32) {
     let target_h = REFERENCE_HEIGHT;
-    if frame.h <= target_h || frame.h == 0 {
+    let scale = scale_of(frame);
+    if scale <= 1.0 {
         return (frame.clone(), 1.0);
     }
-    let scale = frame.h as f32 / target_h as f32;
     let target_w = ((frame.w as f32) / scale).round().max(1.0) as u32;
     let Some(data) = downscale_bgra(frame, target_w, target_h) else {
         // 缓冲不自洽（不该发生）：宁可不动，也不要喂一张半成品给定位。
@@ -215,8 +225,38 @@ const KEY_SCREEN_SIZE: (f32, f32) = (0.5, 2.0);
 /// 屏幕与键阵左缘的最大间距（占键阵宽度的比例）：屏幕就贴在键阵左边。
 const KEY_SCREEN_GAP: f32 = 0.5;
 
-/// 进度框（屏幕内浅色细边框）的亮度区间。
-const KEY_BOX_LUMA: (u8, u8) = (150, 230);
+/// 「帧被下采样过」的判定线：`normalize_frame` 的 `scale > SCALE_LOOSE` 才算。
+///
+/// 720p 实机（`scale == 1.0`）与 1080p 实机（`scale == 1.5`）必须用**两套**阈值：
+/// 盒式下采样把细边框与绿勾平均进背景，亮度差只剩原生的一半，用 720p 的严阈值
+/// 会把整行读成「不可辨」；反过来把严阈值放宽到全局（105）又会让 720p 的背景
+/// 也判成「可读」—— 那是「进度恒 1/5 超时」的根因。所以阈值只能是 `scale` 的函数。
+const SCALE_LOOSE: f32 = 1.15;
+
+/// 进度框（屏幕内浅色细边框）的亮度区间，**随缩放二选一**。
+///
+/// `(150, 230)` 是 720p 实测标定值，变更须重新标定；`(105, 235)` 只给下采样帧用。
+/// 这是唯一允许出现这两个数字的地方 —— `find_progress_boxes` 与百分比行兜底
+/// 必须共用同一套，绝不允许一处松一处严。
+fn box_luma(scale: f32) -> (u8, u8) {
+    if scale > SCALE_LOOSE {
+        (105, 235)
+    } else {
+        (150, 230)
+    }
+}
+
+/// 空槽「有边」的亮度差下限，**随缩放二选一**。
+///
+/// 720p 实测 12（槽内深灰 + 浅色细边，纯背景两者一样亮）；下采样后边缘被均值柔化，
+/// 差值掉到 8 才读得到空槽。
+fn ring_delta(scale: f32) -> i32 {
+    if scale > SCALE_LOOSE {
+        8
+    } else {
+        12
+    }
+}
 /// 进度框的宽高比区间。
 ///
 /// 实机实测（1080p 截屏）5 个输入格是**近方形**：70×77px ⇒ 0.91。
@@ -251,8 +291,6 @@ const SLOT_CHECK_PIXELS: u32 = 6;
 const PROGRESS_MIN_READABLE: usize = 3;
 /// 空槽判据：深灰空槽 `V < 90`（spec §0③）。
 const SLOT_DARK_V: u8 = 90;
-/// 空槽的「有边」亮度差：槽内深灰 + 浅色细边，纯背景两者一样亮。
-const SLOT_RING_DELTA: i32 = 12;
 
 /// 绿 ✓ 判据：绿分量明显压过红蓝（`#3ddc4a` 一族）。
 fn is_check_green([b, g, r]: [u8; 3]) -> bool {
@@ -938,6 +976,16 @@ impl Masked {
         }
     }
 
+    /// 该轮廓（换算回帧坐标后）里是否真有绿 ✓。
+    ///
+    /// 判据**只许复用** [`green_pixels`]/[`is_check_green`] 那一套，下限也是
+    /// [`SLOT_CHECK_PIXELS`] —— 进度格的「已勾选」定义只此一份，绝不许这里另写一套阈值。
+    fn has_check_green(&self, frame: &Frame, block: &Contour) -> bool {
+        let rect = self.to_frame(block.region, 1);
+        clip_to(frame.w, frame.h, rect)
+            .is_some_and(|bounds| green_pixels(frame, bounds) >= SLOT_CHECK_PIXELS)
+    }
+
     fn column_counts(&self) -> Vec<u32> {
         (0..self.binary.width())
             .map(|x| {
@@ -1184,7 +1232,9 @@ pub fn locate_keys(frame: &Frame) -> Result<LocatedKeys, LocateError> {
     }
     let screen = find_key_screen(&gray, keys.grid).ok_or(LocateError::Screen)?;
     // 进度格里有「绿 ✓」判据 ⇒ 彩色帧必须一起带下去（灰度图上判绿恒假）。
-    let progress = readable_progress(frame, &gray, screen);
+    // `scale` 也一起带下去：它是**唯一**来源（`normalize_frame` 刚刚算出来的），
+    // 下游的亮度阈值全靠它二选一，任何函数都不许自己再归一化一次。
+    let progress = readable_progress(frame, &gray, screen, scale);
     Ok(LocatedKeys {
         grid: scale_rect(keys.grid, scale),
         cells: keys
@@ -1224,7 +1274,10 @@ fn is_lit_key([b, g, r]: [u8; 3]) -> bool {
     delta * 100 >= max * 45 && b <= r.min(g)
 }
 
-/// 16 颗键里「亮键」像素的总数（**720p 世界**，因为 [`READY_LIT_MIN_PX`] 是 720p 口径）。
+/// 16 颗键里「亮键」像素的总数。
+///
+/// `frame` 与 `cells` 必须**同一坐标口径**：720p 帧配 720p 口径的 [`READY_LIT_MIN_PX`]，
+/// 原图帧配 [`ready_lit_min_px`]（面积随 `scale²` 放大，见 [`keys_ready`]）。
 pub fn lit_key_pixels(frame: &Frame, cells: &[PxRect]) -> u32 {
     let mut total = 0u32;
     for cell in cells {
@@ -1239,14 +1292,29 @@ pub fn lit_key_pixels(frame: &Frame, cells: &[PxRect]) -> u32 {
     total
 }
 
-/// 黄键台 ready：**面板可定位 且 亮键像素 ≥ [`READY_LIT_MIN_PX`]**，两条同时成立才算。
+/// ready 闸的亮键像素下限：按 `scale²` 放大（[`READY_LIT_MIN_PX`] 是 **720p 口径**）。
+///
+/// 面积是二维量：1080p 下同一块区域像素多 2.25 倍，阈值不跟着放大就等于白送 2.25 倍余量。
+fn ready_lit_min_px(scale: f32) -> u32 {
+    if scale <= 1.0 {
+        return READY_LIT_MIN_PX;
+    }
+    (READY_LIT_MIN_PX as f32 * scale * scale).round() as u32
+}
+
+/// 黄键台 ready：**面板可定位 且 亮键像素 ≥ [`ready_lit_min_px`]**，两条同时成立才算。
 ///
 /// 只判「可定位」会把 0.4–1.8s 那段「面板已出现、一颗键都没亮」的空窗当成可以动手，
 /// 于是点了个寂寞；只判亮键则会被别的界面上的黄绿光骗到。
+///
+/// **必须在原帧上判**：`locate_keys` 内部自己归一化一次并把坐标乘回原图，所以
+/// `keys.cells` 是**原图坐标**、亮键像素也必须是原图口径。旧实现先 `normalize_frame` 拿
+/// `small` 再喂给 `locate_keys_state(&small)`，等于在 720p 世界**再归一化一次**
+/// （`h <= 720 ⇒ scale` 塌成 `1.0`）—— 缩放感知的阈值在最需要它的这条闸上永远不生效。
 pub fn keys_ready(frame: &Frame) -> Locate<()> {
-    let (small, _) = normalize_frame(frame);
-    match locate_keys_state(&small) {
-        Locate::Found(keys) if lit_key_pixels(&small, &keys.cells) >= READY_LIT_MIN_PX => {
+    let scale = scale_of(frame);
+    match locate_keys_state(frame) {
+        Locate::Found(keys) if lit_key_pixels(frame, &keys.cells) >= ready_lit_min_px(scale) => {
             Locate::Found(())
         }
         // 面板已在、亮键还没长齐：这段必须继续等（spec B2），不许判失败。
@@ -1579,12 +1647,13 @@ fn overlaps_vertically(rect: PxRect, grid: PxRect) -> bool {
 ///
 /// 返回 `< 3` 个格子 = 读不到进度（调用方据此退化，不猜）。
 /// 颜色判据（绿 ✓）必须用彩色 `frame`：灰度图里 `r == g == b`，判绿恒假。
-fn readable_progress(frame: &Frame, gray: &GrayImage, screen: PxRect) -> Vec<PxRect> {
-    let adaptive = find_progress_boxes(gray, screen);
+/// `scale` 是产生 `frame` 的缩放比，只喂阈值，**不在这里重新算**。
+fn readable_progress(frame: &Frame, gray: &GrayImage, screen: PxRect, scale: f32) -> Vec<PxRect> {
+    let adaptive = find_progress_boxes(frame, gray, screen, box_luma(scale));
     if adaptive.len() >= PROGRESS_MIN_READABLE {
         return adaptive;
     }
-    let spec = spec_progress_slots(frame, gray);
+    let spec = spec_progress_slots(frame, gray, scale);
     if spec.len() >= PROGRESS_MIN_READABLE {
         return spec;
     }
@@ -1595,11 +1664,70 @@ fn readable_progress(frame: &Frame, gray: &GrayImage, screen: PxRect) -> Vec<PxR
 ///
 /// 「可辨」= 里面有绿 ✓，或者是一圈浅色细边的深灰空槽。纯背景两块都不满足，
 /// 因此整片同色区域不会被误当成进度行（那会凭空报出 `0/5` 的假进度）。
-fn spec_progress_slots(frame: &Frame, gray: &GrayImage) -> Vec<PxRect> {
-    (0..KEY_PROGRESS_MAX)
-        .map(|index| spec_slot_rect(gray.w, gray.h, index))
-        .filter(|slot| slot_readable(frame, gray, *slot))
-        .collect()
+///
+/// `scale <= SCALE_LOOSE`（720p / 未下采样）时**逐字节走原路径**：整行只读一次、
+/// 不试任何偏移。下采样世界里整行可能整体错位 1~2px，才需要 [`SPEC_DY_SCAN`] 那三个候选。
+fn spec_progress_slots(frame: &Frame, gray: &GrayImage, scale: f32) -> Vec<PxRect> {
+    if scale <= SCALE_LOOSE {
+        return row_at(frame, gray, 0, scale).slots;
+    }
+    best_row(
+        SPEC_DY_SCAN
+            .iter()
+            .map(|&dy| row_at(frame, gray, dy, scale))
+            .collect(),
+    )
+}
+
+/// 尝试的纵向偏移：下采样后整行可能整体偏 1~2px。
+///
+/// 范围必须窄：松阈值下每个偏移都能读出 4~5 格，候选越多越容易靠「格数」选错一格。
+const SPEC_DY_SCAN: [i32; 3] = [0, -2, 2];
+
+/// 某个 `dy` 偏移读出来的进度行。
+struct RowReading {
+    dy: i32,
+    slots: Vec<PxRect>,
+    /// 各格「边框 − 槽内 − 阈值」的余量之和：真槽与背景的区分量。
+    margin: i32,
+}
+
+/// 在第 `dy` 行上班读一次。
+fn row_at(frame: &Frame, gray: &GrayImage, dy: i32, scale: f32) -> RowReading {
+    let mut slots = Vec::new();
+    let mut margin = 0;
+    for index in 0..KEY_PROGRESS_MAX {
+        let mut slot = spec_slot_rect(gray.w, gray.h, index);
+        slot.y += dy;
+        if let Some(evidence) = slot_evidence(frame, gray, slot, scale) {
+            slots.push(slot);
+            margin += evidence;
+        }
+    }
+    RowReading { dy, slots, margin }
+}
+
+/// 从偏移候选里选出该用哪一行。
+///
+/// 规则：格数多的赢；**但「多出来的格」必须真的有对比度** —— 若最强的偏移总余量还不如
+/// `dy = 0`，说明多出的那一格是把背景当成了槽（错位），此时宁可少读一格也不许选错位。
+/// 同格数、同余量时取 `|dy|` 最小的（并列优先 `dy = 0`，顺序稳定）。
+fn best_row(readings: Vec<RowReading>) -> Vec<PxRect> {
+    let strength = |reading: &RowReading| (reading.slots.len(), reading.margin, -reading.dy.abs());
+    let Some(chosen) = (0..readings.len()).max_by_key(|&index| strength(&readings[index])) else {
+        return Vec::new();
+    };
+    let Some(anchor) = readings.iter().position(|reading| reading.dy == 0) else {
+        return readings[chosen].slots.clone();
+    };
+    // 多读出一格、总对比度却更低 ⇒ 那一格是背景不是槽，退回 dy = 0 的读数。
+    let misaligned = readings[chosen].dy != 0 && readings[chosen].margin < readings[anchor].margin;
+    let winner = if misaligned { anchor } else { chosen };
+    readings
+        .into_iter()
+        .nth(winner)
+        .map(|reading| reading.slots)
+        .unwrap_or_default()
 }
 
 /// 实测百分比行上的第 `index` 个进度格（720p 世界，1280 宽时单格 28×20px、格距 56px）。
@@ -1616,18 +1744,20 @@ pub(crate) fn spec_slot_rect(w: u32, h: u32, index: usize) -> PxRect {
     }
 }
 
-/// 一个格子是否「可辨」：有绿 ✓，或是带浅色细边的深灰空槽。
-fn slot_readable(frame: &Frame, gray: &GrayImage, slot: PxRect) -> bool {
-    let (x0, y0, x1, y1) = match clip_to(gray.w, gray.h, slot) {
-        Some(clipped) => clipped,
-        None => return false,
-    };
+/// 格子「可辨」的证据量：`Some(余量)` = 可辨，`None` = 不可辨。
+///
+/// 余量 = 边框平均亮度 − 槽内平均亮度 − [`ring_delta`]，负值记 0；绿 ✓ 格没有「边框余量」
+/// 这个概念，按刚好够可辨（= 阈值本身）记，这样它不会凭余量压过真正的空槽。
+fn slot_evidence(frame: &Frame, gray: &GrayImage, slot: PxRect, scale: f32) -> Option<i32> {
+    let (x0, y0, x1, y1) = clip_to(gray.w, gray.h, slot)?;
+    let threshold = ring_delta(scale);
     if green_pixels(frame, (x0, y0, x1, y1)) >= SLOT_CHECK_PIXELS {
-        return true;
+        return Some(threshold);
     }
     // 空格子：外圈（边）比内圈（槽）亮 ⇒ 这是一个有边框的空槽，而不是背景。
     let (inner, ring) = slot_ring_contrast(gray, (x0, y0, x1, y1));
-    ring - inner >= SLOT_RING_DELTA && inner < i32::from(SLOT_DARK_V)
+    let margin = ring - inner - threshold;
+    (margin >= 0 && inner < i32::from(SLOT_DARK_V)).then_some(margin)
 }
 
 /// 矩形内绿 ✓ 的像素数（**必须读 BGRA**：灰度图三通道相等，判绿恒假）。
@@ -1694,16 +1824,26 @@ fn percent_rect_of(w: u32, h: u32, pct: (f32, f32, f32, f32)) -> PxRect {
 /// 屏幕内排成一行、最多 [`KEY_PROGRESS_MAX`] 个浅色细边框矩形。
 ///
 /// 少于 3 个不算失败：进度判据会退化（见 `flow_az3::keys`），绝不猜进度。
-fn find_progress_boxes(gray: &GrayImage, screen: PxRect) -> Vec<PxRect> {    let Some(mask) = gray_mask(gray, screen, |luma| {
-        within_u8(KEY_BOX_LUMA, luma)
-    }) else {
+/// `luma` 由 [`box_luma`] 按缩放给出 —— 阈值只有那一个来源，这里不许写死数字。
+/// `frame`（彩色）只为判绿 ✓：灰度图三通道相等，判绿恒假（见 [`green_pixels`]）。
+fn find_progress_boxes(
+    frame: &Frame,
+    gray: &GrayImage,
+    screen: PxRect,
+    luma: (u8, u8),
+) -> Vec<PxRect> {
+    let Some(mask) = gray_mask(gray, screen, |value| within_u8(luma, value)) else {
         return Vec::new();
     };
     let boxes: Vec<PxRect> = external_contours(&mask.binary)
         .into_iter()
         .filter(|block| within(KEY_BOX_ASPECT, block.aspect()))
         .filter(|block| box_sized(block.region, mask.binary.width(), mask.binary.height()))
-        .filter(|block| within(KEY_BOX_FILL, fill_of(block)))
+        // 有绿 ✓ 的格一律放行：下采样后的松散亮度带（105..235）会把「实心绿勾」的
+        // 内腔（luma ≈145）也吃进掩码，整格连成一个实心域，填充率上限就把它判死。
+        // 但这一格**确实有勾**，不能因为形状被判死。
+        // 只有填充率上限被免掉：宽高比与尺寸两条在上一步已经过了，绿色墙面照样进不来。
+        .filter(|block| mask.has_check_green(frame, block) || within(KEY_BOX_FILL, fill_of(block)))
         .map(|block| mask.to_frame(block.region, 1))
         .collect();
     largest_row(boxes)
@@ -2427,10 +2567,10 @@ mod keys_tests {
             canvas.rect(inset(slot, 2), CHECK);
         }
         let frame = canvas.frame();
-        let slots = spec_progress_slots(&frame, &frame.luma());
+        let slots = spec_progress_slots(&frame, &frame.luma(), 1.0);
         assert_eq!(slots.len(), KEY_PROGRESS_MAX, "{slots:?}");
         let blank = Canvas::new(MACHINE).frame();
-        assert_eq!(spec_progress_slots(&blank, &blank.luma()), Vec::new(),
+        assert_eq!(spec_progress_slots(&blank, &blank.luma(), 1.0), Vec::new(),
             "整片同色背景不是进度行，绝不能报出假进度");
     }
 
@@ -2446,12 +2586,12 @@ mod keys_tests {
 
         let colour_frame = colour.frame();
         assert!(
-            slot_readable(&colour_frame, &colour_frame.luma(), slot),
+            slot_evidence(&colour_frame, &colour_frame.luma(), slot, 1.0).is_some(),
             "彩色帧里的绿 ✓ 必须算作已勾选"
         );
         let grey_frame = grey.frame();
         assert!(
-            !slot_readable(&grey_frame, &grey_frame.luma(), slot),
+            slot_evidence(&grey_frame, &grey_frame.luma(), slot, 1.0).is_none(),
             "三通道相等的灰块不是绿 ✓，不许当成已勾选"
         );
     }
@@ -2491,6 +2631,273 @@ mod keys_tests {
         assert_eq!(first.h, 20, "单格 2.78% × 720 = 20px");
         // 百分比行必须落在整帧左半侧（屏幕里），不能跑到右侧模块键区。
         assert!(first.x < 640 && first.right() < 640);
+    }
+
+    // ── t5：缩放感知阈值 ──
+
+    #[test]
+    fn scale_dependent_thresholds_keep_the_720p_values() {
+        // B10：原生 720p 必须逐字节走原路径 —— 两个阈值一个数都不能变。
+        assert_eq!(box_luma(1.0), (150, 230), "720p 进度框亮度带");
+        assert_eq!(ring_delta(1.0), 12, "720p 空槽边框亮度差");
+        // 下采样帧换松阈值（边缘被均值糊掉）。
+        assert_eq!(box_luma(1.5), (105, 235), "1080p 进度框亮度带");
+        assert_eq!(ring_delta(1.5), 8, "1080p 空槽边框亮度差");
+        // 分界线本身：等于 1.15 仍算「原生」，超过才算下采样。
+        assert_eq!(box_luma(SCALE_LOOSE), (150, 230));
+        assert_eq!(ring_delta(SCALE_LOOSE), 12);
+        assert_eq!(box_luma(SCALE_LOOSE + 0.01), (105, 235));
+    }
+
+    /// 1080p 版黄键台：把 640×360 夹具的几何按 1.5 倍画进 1920×1080（100% 脱敏）。
+    ///
+    /// 面板只占左上角，其余是台面底色 —— 归一化到 720p 世界后，面板几何与夹具**完全重合**，
+    /// 因此「1080p 与 720p 该看到同一台机器」这件事是逐像素可比的。
+    ///
+    /// 已勾选的绿勾画成**居中字形块**而不是铺满内腔：铺满时整块（含边框）会连成一个实心
+    /// 连通域，被「细边框填充率 ≤0.70」挡掉 —— 这在松散亮度带（105..235，绿勾亮度 ≈145
+    /// 落在带内）下尤其致命。实机的 ✓ 本来就是字形，不是实心块。
+    fn hd_frame(lit: &[usize], checked: usize, ring_thickness: i32) -> Frame {
+        let (w, h) = (1920u32, 1080u32);
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for pixel in data.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&[MACHINE[2], MACHINE[1], MACHINE[0], 255]);
+        }
+        let scale = |value: i32| (value as f32 * 1.5).round() as i32;
+        let hd = |rect: PxRect| PxRect {
+            x: scale(rect.x),
+            y: scale(rect.y),
+            w: scale(rect.w),
+            h: scale(rect.h),
+        };
+        let mut shapes: Vec<(PxRect, [u8; 3])> = vec![(hd(SCREEN), PANEL)];
+        for stage in 0..BOX_X.len() {
+            let rect = hd(box_rect(stage));
+            if stage < checked {
+                let glyph = inset(rect, rect.w / 3);
+                shapes.push((glyph, CHECK));
+            }
+            let thickness = ring_thickness;
+            shapes.push((
+                PxRect {
+                    w: thickness,
+                    ..rect
+                },
+                BORDER,
+            ));
+            shapes.push((
+                PxRect {
+                    x: rect.right() - thickness,
+                    w: thickness,
+                    ..rect
+                },
+                BORDER,
+            ));
+            shapes.push((
+                PxRect {
+                    h: thickness,
+                    ..rect
+                },
+                BORDER,
+            ));
+            shapes.push((
+                PxRect {
+                    y: rect.bottom() - thickness,
+                    h: thickness,
+                    ..rect
+                },
+                BORDER,
+            ));
+        }
+        for index in 0..16 {
+            let rect = hd(key_rect(index));
+            shapes.push((rect, KEY));
+            if lit.contains(&index) {
+                shapes.push((inset(rect, rect.w / 4), GLOW));
+            }
+        }
+        for (rect, rgb) in shapes {
+            for y in rect.y.max(0)..rect.bottom().min(h as i32) {
+                for x in rect.x.max(0)..rect.right().min(w as i32) {
+                    let index = ((y as u32 * w + x as u32) * 4) as usize;
+                    data[index] = rgb[2];
+                    data[index + 1] = rgb[1];
+                    data[index + 2] = rgb[0];
+                    data[index + 3] = 255;
+                }
+            }
+        }
+        Frame::new(w, h, data, std::time::Instant::now()).expect("合法 1080p 帧")
+    }
+
+    #[test]
+    fn a_1080p_frame_still_locates_the_whole_panel_and_five_boxes() {
+        // B11：1920×1080（scale = 1.5）必须一次定位成功、5 个进度格不少。
+        // 细边框在盒式下采样后被均值糊掉，只有松阈值（105..235）读得到 ——
+        // 严阈值那一版只能找到 0 个框，整行退化成「读不到进度」。
+        let frame = hd_frame(&[5], 2, 3);
+        let keys = locate_keys(&frame).expect("1080p 黄键台必须定位成功");
+        assert_eq!(keys.cells.len(), KEY_GRID_SIDE * KEY_GRID_SIDE, "16 颗键");
+        assert_eq!(
+            keys.progress.len(),
+            KEY_PROGRESS_MAX,
+            "1080p 下采样后 5 个进度格必须全部识别：{:?}",
+            keys.progress
+        );
+        // 坐标必须乘回原图：第 0 颗键的中心 = 720p 世界的 1.5 倍。
+        let (cx, cy) = key_center(0);
+        let cell = keys.cells[0];
+        assert_eq!(
+            (cell.x + cell.w / 2, cell.y + cell.h / 2),
+            (
+                (cx as f32 * 1.5).round() as i32,
+                (cy as f32 * 1.5).round() as i32
+            ),
+            "点击落点必须回到原图坐标"
+        );
+    }
+
+    /// 1080p 帧，把第 `stage` 个进度格的**内腔**涂成实心块 `rgb`（与细边框连成一体）。
+    ///
+    /// 实机上的 ✓ 是字形，但**实心勾**也会出现（勾填满内腔、连成一整块）；
+    /// 松散亮度带（105..235）下这种格子的填充率是 1.0，必须靠「有绿」放行。
+    fn hd_frame_with_solid(stage: usize, rgb: [u8; 3]) -> Frame {
+        let mut frame = hd_frame(&[], 0, 3);
+        let rect = inset(scale_rect(box_rect(stage), 1.5), 3);
+        for y in rect.y.max(0)..rect.bottom().min(frame.h as i32) {
+            for x in rect.x.max(0)..rect.right().min(frame.w as i32) {
+                let index = ((y as u32 * frame.w + x as u32) * 4) as usize;
+                frame.data[index..index + 4].copy_from_slice(&[rgb[2], rgb[1], rgb[0], 255]);
+            }
+        }
+        frame
+    }
+
+    /// 该帧里第 `stage` 个进度格的中心（原图坐标）。
+    fn progress_centre(stage: usize) -> (i32, i32) {
+        let rect = scale_rect(box_rect(stage), 1.5);
+        (rect.x + rect.w / 2, rect.y + rect.h / 2)
+    }
+
+    #[test]
+    fn a_solid_green_check_box_is_still_a_progress_box_in_1080p() {
+        // 1080p 松散亮度带把实心绿内腔（luma ≈145）也吃进掩码 ⇒ 整格成实心域（填充率 1.0）。
+        // 这一格确实有勾，不许因为形状被判死。
+        let frame = hd_frame_with_solid(1, CHECK);
+        let keys = locate_keys(&frame).expect("实心绿勾不影响定位");
+        assert_eq!(
+            keys.progress.len(),
+            KEY_PROGRESS_MAX,
+            "实心绿勾的那一格必须仍算进度格：{:?}",
+            keys.progress
+        );
+        let found = keys
+            .progress
+            .iter()
+            .any(|rect| (rect.x + rect.w / 2, rect.y + rect.h / 2) == progress_centre(1));
+        assert!(found, "放行的必须是第 1 格本身：{:?}", keys.progress);
+    }
+
+    #[test]
+    fn a_solid_grey_block_without_a_check_is_still_dropped() {
+        // 反证：同一条放行只认绿。实心浅灰块（无绿）填充率同样 1.0，必须照旧被丢弃。
+        let frame = hd_frame_with_solid(1, BORDER);
+        let keys = locate_keys(&frame).expect("灰块不影响其余几何");
+        assert_eq!(
+            keys.progress.len(),
+            KEY_PROGRESS_MAX - 1,
+            "无勾的实心灰块不许被当成进度格：{:?}",
+            keys.progress
+        );
+        let centre = progress_centre(1);
+        assert!(
+            !keys
+                .progress
+                .iter()
+                .any(|rect| (rect.x + rect.w / 2, rect.y + rect.h / 2) == centre),
+            "第 1 格必须缺席：{:?}",
+            keys.progress
+        );
+    }
+
+    #[test]
+    fn the_green_allowance_cannot_fire_on_the_720p_path() {
+        // 720p 带宽 (150,230) 本来就不含绿内腔（CHECK luma ≈142）⇒ 实心绿块连掩码都进不去，
+        // 「有绿就放行」在 720p 上无从触发。同一帧换松散带宽才捡得回来 ——
+        // 差异只在带宽，不在放行本身。
+        let mut canvas = Canvas::new(MACHINE);
+        canvas.rect(SCREEN, PANEL);
+        canvas.rect(box_rect(0), CHECK); // 只有实心绿块，没有浅色细边框
+        let frame = canvas.frame();
+        let gray = frame.luma();
+        assert!(
+            find_progress_boxes(&frame, &gray, SCREEN, box_luma(1.0)).is_empty(),
+            "720p 带宽下绿块不进掩码 ⇒ 放行是 no-op"
+        );
+        assert_eq!(
+            find_progress_boxes(&frame, &gray, SCREEN, box_luma(1.5)).len(),
+            1,
+            "换成松散带宽后同一块绿会被放行 —— 证明放行只在 1080p 世界生效"
+        );
+    }
+
+    #[test]
+    fn keys_ready_scales_the_lit_pixel_threshold_with_the_frame_height() {
+        // ready 闸必须在**原帧**上判：亮键像素与阈值同乘 scale²，判据才不会随分辨率漂移。
+        // 一颗亮键（1080p ≈ 990px）远不够，16 颗（≈15840px）才够。
+        assert_eq!(
+            keys_ready(&hd_frame(&[5], 0, 3)).state_name(),
+            "NotYet",
+            "单颗亮键不够"
+        );
+        let all: Vec<usize> = (0..16).collect();
+        assert!(
+            keys_ready(&hd_frame(&all, 0, 3)).is_found(),
+            "16 颗全亮必须判就绪（阈值按 scale² 放大后才成立）"
+        );
+        // 720p 一侧保持原判据（3000px 中线）。
+        assert_eq!(keys_ready(&panel(&[5], 0).frame()).state_name(), "NotYet");
+        assert!(keys_ready(&panel(&all, 0).frame()).is_found());
+    }
+
+    #[test]
+    fn a_misaligned_row_never_wins_on_thin_contrast() {
+        // B13：错位多读出一格、但那几格几乎没有对比度 ⇒ 必须回退 dy = 0，宁可少读一格。
+        let slot = |x: i32| PxRect { x, y: 0, w: 10, h: 10 };
+        let readings = vec![
+            RowReading {
+                dy: 0,
+                slots: (0..4).map(slot).collect(),
+                margin: 120,
+            },
+            RowReading {
+                dy: -2,
+                slots: (0..5).map(slot).collect(),
+                margin: 9,
+            },
+        ];
+        let chosen = best_row(readings);
+        assert_eq!(chosen.len(), 4, "不许假装读到 5 格：{chosen:?}");
+    }
+
+    #[test]
+    fn a_shifted_row_with_real_contrast_still_wins() {
+        // 反面：真槽整体下移 2px 时，5 格 + 更高总余量必须赢（否则 1080p 永远读不到完整进度行）。
+        let slot = |x: i32| PxRect { x, y: 0, w: 10, h: 10 };
+        let readings = vec![
+            RowReading {
+                dy: 0,
+                slots: (0..4).map(slot).collect(),
+                margin: 40,
+            },
+            RowReading {
+                dy: -2,
+                slots: (0..5).map(slot).collect(),
+                margin: 250,
+            },
+        ];
+        let chosen = best_row(readings);
+        assert_eq!(chosen.len(), 5, "真槽错位时必须跟着走：{chosen:?}");
     }
 }
 

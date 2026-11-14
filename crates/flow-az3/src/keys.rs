@@ -5,9 +5,11 @@
 //!
 //! 闭环（全部判据都来自实测录像，见 `.scratch/az3-fix-batch/spec.md`）：
 //! 1. 每帧整帧抓**一次**，`locate_keys` 量出 16 颗键的**实测矩形**与屏幕里的进度格；
-//! 2. **同一帧亮着的模块按钮全都要点**（用户拍板：不要求顺序、点过的记 `clicked`）；
-//! 3. 点完等 [`CLICK_ACK_TIMEOUT_MS`]：进度推进 / 亮光熄灭视为吃下，连续 2 轮无效判 `dead`；
-//! 4. 左侧进度格读到 **5 个 ✓** → Done。
+//! 2. **同一帧亮着黄光的模块按钮全都要点**（用户拍板：不要求顺序、点过的记 `clicked`）；
+//!    黄（待点）与绿（已激活）必须是两个谓词：点完变绿就该立刻收手，不许重复点；
+//! 3. 点完等 [`CLICK_ACK_TIMEOUT_MS`]：进度推进 / 黄光熄灭（变暗或变绿）视为吃下，连续 2 轮无效判 `dead`；
+//! 4. 进度**回退**（`checked < peak_checked`）= 游戏换了新一局 / 点了无效键把状态清掉 ⇒ 清账本重来；
+//! 5. 左侧进度格读到 **5 个 ✓** → Done。
 //!
 //! **靶点只有一类可以点**：[`KeyTarget::ModuleButton`]。屏幕内那 5 格是**只读**进度指示器，
 //! 永远不发点击（[`KeyTarget::ProgressBox`]）—— 旧实现在屏幕格里挑最亮的去点，
@@ -45,10 +47,12 @@ const DEAD_STRIKES: u8 = 2;
 const LOCATE_FAIL_LIMIT: u32 = 6;
 /// 少于这么多个进度格就读不到进度（退化判据）。
 const MIN_PROGRESS_BOXES: usize = 3;
+/// 退化模式下最多允许「盘面被重置」几次（防死循环兜底，spec §3 t2）。
+const MAX_DEGENERATE_RESETS: u8 = 3;
 /// 定位失败时给用户的下一步动作。
 const POSE_HINT: &str = "（请正对按键面板，让屏幕和 4×4 按键都进入画面）";
 /// 进度格读不到时的收尾说明（这台机器可能真的读不出来）。
-const PROGRESS_NOTE: &str = "；退化判据：进度格未识别，本条结论依据「亮光熄灭」";
+const PROGRESS_NOTE: &str = "；退化判据：进度格未识别，本条结论依据「黄光熄灭」";
 
 /// 靶点分类：**只有 [`KeyTarget::ModuleButton`] 允许发点击**，[`KeyTarget::ProgressBox`] 只读。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,21 +123,25 @@ pub fn run(
     )
 }
 
-/// 一次任务的账本：把「点过哪些格 / 进度基准 / 定位连败」从主循环里挪出来。
+/// 一次任务的账本：把「点过哪些格 / 进度峰值 / 定位连败」从主循环里挪出来。
 #[derive(Default)]
 struct State {
     clicked: [bool; CELLS],
     dead: [bool; CELLS],
-    /// 同一颗键「点了还亮且进度不动」的轮数（到 [`DEAD_STRIKES`] 判死）。
+    /// 同一颗键「点了还亮着且进度不动」的轮数（到 [`DEAD_STRIKES`] 判死）。
     strikes: [u8; CELLS],
     /// 本轮已点、还没得到游戏回应的键。
     pending: Vec<usize>,
     baseline: usize,
+    /// 本局见过的最高进度。`None` = 还没读到过进度读数（与「读到 0」不是一回事）。
+    peak_checked: Option<usize>,
     /// 本帧读到的进度；`None` = 进度格不足，处于退化判据。
     checked: Option<usize>,
     click_ms: u64,
     clicks: usize,
     locate_misses: u32,
+    /// 退化模式下已经「清账本重来」过几次。
+    degenerate_resets: u8,
 }
 
 impl State {
@@ -157,21 +165,31 @@ impl State {
 
         let checked = self.checked_in(frame, &located, crate::scaled_area(MIN_CHECK_PIXELS, scale));
         self.checked = checked;
-        if checked.is_some_and(|checked| checked >= TOTAL_STAGES) {
-            let summary = format!("黄键台 {TOTAL_STAGES}/{TOTAL_STAGES} 完成");
-            return Some(done(pointer.event_count(), &summary, self.clicks));
+        if let Some(current) = checked {
+            if self.peak_checked.is_some_and(|peak| current < peak) {
+                // 进度回退 = 新一局 / 状态被清：留着旧账本会让新一局「一个键都不点」等到超时。
+                self.reset_board_marks(current);
+            } else {
+                self.peak_checked = Some(current);
+            }
+            if current >= TOTAL_STAGES {
+                let summary = format!("黄键台 {TOTAL_STAGES}/{TOTAL_STAGES} 完成");
+                return Some(done(pointer.event_count(), &summary, self.clicks));
+            }
         }
 
-        // 上一轮点击还没有结论 → 本帧先别再点。
-        let lit = lit_cells(frame, &located.cells, min_glow);
-        if self.waiting(checked, &lit, clock.now_ms()) {
+        // 上一轮点击还没有结论 → 本帧先别再点（只认「还在发黄光」的键，已变绿算吃下）。
+        let yellow_lit = yellow_lit_cells(frame, &located.cells, min_glow);
+        if self.waiting(checked, &yellow_lit, clock.now_ms()) {
             return None;
         }
 
-        let targets = pick_lit_targets(frame, &located, &self.clicked, &self.dead, min_glow);
+        let targets = pick_yellow_targets(frame, &located, &self.clicked, &self.dead, min_glow);
         if targets.is_empty() {
-            return self.on_no_target(checked, pointer.event_count());
+            let reset_candidate = has_unspent_yellow(&yellow_lit, &located, &self.dead);
+            return self.on_no_target(checked, reset_candidate, pointer.event_count());
         }
+
         for (index, at) in targets {
             if let Err(error) = pointer.click(at) {
                 return Some(aborted(
@@ -188,6 +206,19 @@ impl State {
         None
     }
 
+    /// 清掉「本局盘面」的标记，重开一局。
+    ///
+    /// **不清** `clicks` 与 `locate_misses`：那是给用户看的报告口径（一共点过几次、
+    /// 丢过几帧），重开一局不该把历史抹掉。
+    fn reset_board_marks(&mut self, current_progress: usize) {
+        self.clicked = [false; CELLS];
+        self.dead = [false; CELLS];
+        self.strikes = [0; CELLS];
+        self.pending.clear();
+        self.baseline = current_progress;
+        self.peak_checked = Some(current_progress);
+    }
+
     /// 进度已勾选数；进度格不足 [`MIN_PROGRESS_BOXES`] 个 → `None`（退化，不判进度）。
     fn checked_in(&self, frame: &Frame, located: &LocatedKeys, min_check: u32) -> Option<usize> {
         if located.progress.len() < MIN_PROGRESS_BOXES {
@@ -197,7 +228,7 @@ impl State {
     }
 
     /// 处理上一轮点击的回应；返回 `true` = 本帧还没有结论，先别再点。
-    fn waiting(&mut self, checked: Option<usize>, lit: &[usize], now: u64) -> bool {
+    fn waiting(&mut self, checked: Option<usize>, yellow_lit: &[usize], now: u64) -> bool {
         if self.pending.is_empty() {
             return false;
         }
@@ -207,9 +238,9 @@ impl State {
             self.pending.clear();
             return false;
         }
-        // 判据二（永远可用）：**亮光熄灭**。点对了游戏会收掉该模块高亮；
-        // 亮光还在说明这一轮没生效（或点错了模块）。
-        let still_lit = self.pending.iter().any(|index| lit.contains(index));
+        // 判据二（永远可用）：**黄光熄灭** —— 变暗或转绿都算。
+        // 只认黄光才成立：绿勾是「已完成」的标志，把绿也算成「还亮着」会让 ack 永远等不到。
+        let still_lit = self.pending.iter().any(|index| yellow_lit.contains(index));
         if !still_lit {
             self.pending.clear();
             return false;
@@ -229,13 +260,34 @@ impl State {
         false
     }
 
-    /// 没有可点的亮键：要么等下一帧，要么（不能再期待任何亮键）收尾。
-    fn on_no_target(&self, checked: Option<usize>, events: u64) -> Option<Az3Outcome> {
+    /// 没有可点的黄键：要么等下一帧，要么（不能再期待任何黄键）收尾。
+    ///
+    /// `reset_candidate` = 盘面上还有「亮着、没判死、且可点击」的键，但每一格都已点过 ——
+    /// 这只可能是**盘面被重置过**（读不到进度时唯一的观测信号）。退化模式下允许有限次重扫，
+    /// 超过 [`MAX_DEGENERATE_RESETS`] 立刻 `Abort`，绝不「无限重试同一批键」。
+    fn on_no_target(
+        &mut self,
+        checked: Option<usize>,
+        reset_candidate: bool,
+        events: u64,
+    ) -> Option<Az3Outcome> {
         let exhausted = (0..CELLS).all(|index| self.clicked[index] || self.dead[index]);
         if !exhausted {
             return None;
         }
         match checked {
+            None if reset_candidate && self.degenerate_resets < MAX_DEGENERATE_RESETS => {
+                self.degenerate_resets += 1;
+                self.clicked = [false; CELLS];
+                None
+            }
+            None if reset_candidate => Some(aborted(
+                events,
+                format!(
+                    "黄键台：进度持续回退且读不到进度格（已重扫 {MAX_DEGENERATE_RESETS} 次，已点击 {} 次）",
+                    self.clicks
+                ),
+            )),
             None => {
                 // 退化判据：进度读不到，以「16 格点完」收尾，且必须写明用的是哪条判据。
                 let summary = format!("黄键台 {CELLS} 键已全部点过{PROGRESS_NOTE}");
@@ -313,18 +365,31 @@ fn intersects(left: PxRect, right: PxRect) -> bool {
     overlap_w > 0 && overlap_h > 0
 }
 
-/// 本帧**亮着**的格序号（含已点过的，供 ack 判据用）。
-fn lit_cells(frame: &Frame, cells: &[PxRect], min_glow: u32) -> Vec<usize> {
+/// 本帧**仍在发黄光**的格序号（已经变绿的完成态不在其中）。
+fn yellow_lit_cells(frame: &Frame, cells: &[PxRect], min_glow: u32) -> Vec<usize> {
     (0..cells.len())
-        .filter(|&index| glow_of(frame, cells, index) >= min_glow)
+        .filter(|&index| yellow_of(frame, cells, index) >= min_glow)
         .collect()
 }
 
-/// 本帧要点的**全部**亮键：亮的、没点过、没判死、且属于可点击靶点。
+/// 盘面上是否还有「亮着、没判死、且属于可点击靶点」的键。
+///
+/// 只在「每一格都点过了却还有黄键亮着」时才为真 —— 那就是盘面被重置过的证据。
+fn has_unspent_yellow(yellow_lit: &[usize], located: &LocatedKeys, dead: &[bool; CELLS]) -> bool {
+    yellow_lit.iter().any(|&index| {
+        !dead.get(index).copied().unwrap_or(true)
+            && located
+                .cells
+                .get(index)
+                .is_some_and(|cell| classify(*cell, &located.progress).clickable())
+    })
+}
+
+/// 本帧要点的**全部**待点黄键：发黄光、没点过、没判死、且属于可点击靶点。
 ///
 /// 用户拍板：同一帧亮着的模块按钮**全都要点，不要求顺序**（实测同亮 5 个）；
 /// 只挑「最亮的一个」会让 5 个亮键互相等待，最后卡在 4/5。
-fn pick_lit_targets(
+fn pick_yellow_targets(
     frame: &Frame,
     located: &LocatedKeys,
     clicked: &[bool; CELLS],
@@ -337,17 +402,20 @@ fn pick_lit_targets(
         .enumerate()
         .filter(|(index, _)| !is_spent(*index, clicked, dead))
         .filter(|(_, cell)| classify(**cell, &located.progress).clickable())
-        .filter(|(index, _)| glow_of(frame, &located.cells, *index) >= min_glow)
+        .filter(|(index, _)| yellow_of(frame, &located.cells, *index) >= min_glow)
         .map(|(index, cell)| (index, center_of(*cell)))
         .collect()
 }
 
-/// 某一格的黄/绿高亮像素数（越界返回 0）。
-fn glow_of(frame: &Frame, cells: &[PxRect], index: usize) -> u32 {
+/// 某一格的**纯黄**高亮像素数（越界或已变绿返回 0）。
+///
+/// 必须只认黄：绿勾判据（[`geom::is_check_green`]）是「这一格已经完成」，
+/// 把它算成「还亮着」会让 ack 永远等不到，同一颗键被反复点。
+fn yellow_of(frame: &Frame, cells: &[PxRect], index: usize) -> u32 {
     let Some(cell) = cells.get(index) else {
         return 0;
     };
-    geom::count_in(frame, geom::clip(frame, *cell), geom::is_yellow_or_green_glow)
+    geom::count_in(frame, geom::clip(frame, *cell), geom::is_yellow_glow)
 }
 
 /// 这一格是否已经点过或判死（越界一律当「已用掉」，宁可不点）。
@@ -385,5 +453,161 @@ fn aborted(events: u64, reason: String) -> Az3Outcome {
         kind: Az3Kind::ModuleKeys,
         reason,
         events,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    const LIT_YELLOW: [u8; 3] = [235, 200, 40];
+    const CHECK_GREEN: [u8; 3] = [40, 210, 60];
+
+    fn frame_with_rect(w: u32, h: u32, rect: PxRect, rgb: [u8; 3]) -> Frame {
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for y in rect.y.max(0)..rect.bottom().min(h as i32) {
+            for x in rect.x.max(0)..rect.right().min(w as i32) {
+                let i = ((y as u32 * w + x as u32) * 4) as usize;
+                data[i] = rgb[2];
+                data[i + 1] = rgb[1];
+                data[i + 2] = rgb[0];
+                data[i + 3] = 255;
+            }
+        }
+        Frame::new(w, h, data, Instant::now()).expect("合法测试帧")
+    }
+
+    #[test]
+    fn yellow_of_ignores_an_activated_green_button() {
+        // B2：绿键的 yellow_of 必须是 0，否则 ack 判据永远认为「还亮着」。
+        let cell = PxRect {
+            x: 10,
+            y: 10,
+            w: 20,
+            h: 20,
+        };
+        let yellow = frame_with_rect(60, 60, cell, LIT_YELLOW);
+        let green = frame_with_rect(60, 60, cell, CHECK_GREEN);
+
+        assert_eq!(yellow_of(&yellow, &[cell], 0), 400, "整格亮黄 = 400px");
+        assert_eq!(yellow_of(&green, &[cell], 0), 0, "已变绿的键不得算作待点黄键");
+    }
+
+    #[test]
+    fn waiting_clears_pending_immediately_when_the_button_turns_green() {
+        // B3：点后变绿 ⇒ 下一帧就能继续点别的键，不记 strike、不判死。
+        let mut state = State::default();
+        state.clicked[2] = true;
+        state.pending.push(2);
+        state.click_ms = 100;
+
+        assert!(!state.waiting(Some(0), &[], 110), "黄光已熄灭（转绿）⇒ 立刻放行");
+        assert!(state.pending.is_empty());
+        assert_eq!(state.strikes[2], 0, "正常变绿不该记入超时失误");
+        assert!(!state.dead[2], "正常变绿不许判死");
+    }
+
+    #[test]
+    fn a_progress_regression_clears_the_whole_board() {
+        // B4：进度回退 ⇒ clicked / dead / strikes / pending 全清，报告口径（clicks）保留。
+        let mut state = State {
+            peak_checked: Some(3),
+            pending: vec![3],
+            clicks: 7,
+            ..State::default()
+        };
+        state.clicked[0] = true;
+        state.dead[1] = true;
+        state.strikes[2] = 2;
+
+        state.reset_board_marks(0);
+
+        assert!(state.clicked.iter().all(|flag| !flag), "clicked 必须全清");
+        assert!(state.dead.iter().all(|flag| !flag), "dead 必须全清");
+        assert!(state.strikes.iter().all(|&count| count == 0), "strikes 必须全清");
+        assert!(state.pending.is_empty(), "pending 必须清空");
+        assert_eq!(state.peak_checked, Some(0), "峰值跟着回到新一局的读数");
+        assert_eq!(state.clicks, 7, "已点击总数是报告口径，重开一局不该抹掉");
+    }
+
+    #[test]
+    fn degenerate_resets_stop_at_the_limit_and_abort() {
+        // B5：读不到进度时每次「重置」都是盲重扫，必须有上限 —— 不许死循环。
+        let mut state = State {
+            clicked: [true; CELLS],
+            ..State::default()
+        };
+        for _ in 0..MAX_DEGENERATE_RESETS {
+            assert!(
+                state.on_no_target(None, true, 0).is_none(),
+                "上限之内允许清零重扫"
+            );
+            assert!(state.clicked.iter().all(|flag| !flag));
+            state.clicked = [true; CELLS];
+        }
+
+        let outcome = state.on_no_target(None, true, 0).expect("到上限必须收尾");
+        assert!(!outcome.is_done(), "持续回退不是完成：{outcome:?}");
+        assert!(
+            matches!(&outcome, Az3Outcome::Aborted { reason, .. } if reason.contains("读不到进度格")),
+            "文案必须说清是退化判据下的持续回退：{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_spent_board_without_a_lit_button_finishes_on_the_degraded_criterion() {
+        // 退化模式正常收尾：16 格都点过、且没有黄键还亮着 ⇒ Done，并写明用的是哪条判据。
+        let mut state = State {
+            clicked: [true; CELLS],
+            ..State::default()
+        };
+        let outcome = state.on_no_target(None, false, 0).expect("应当收尾");
+        assert!(outcome.is_done(), "{outcome:?}");
+        assert!(
+            matches!(&outcome, Az3Outcome::Done { summary, .. } if summary.contains("退化判据")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn unspent_yellow_is_only_detected_on_clickable_cells() {
+        let progress = vec![PxRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 10,
+        }];
+        let located = LocatedKeys {
+            grid: PxRect::ZERO,
+            cells: vec![
+                PxRect {
+                    x: 100,
+                    y: 100,
+                    w: 10,
+                    h: 10,
+                },
+                PxRect {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 10,
+                },
+            ],
+            screen: PxRect::ZERO,
+            progress,
+        };
+        assert!(
+            has_unspent_yellow(&[0], &located, &[false; CELLS]),
+            "可点击的亮键 = 盘面可能被重置"
+        );
+        assert!(
+            !has_unspent_yellow(&[1], &located, &[false; CELLS]),
+            "进度指示器上的亮光不是模块按钮，不得据此重扫"
+        );
+        assert!(
+            !has_unspent_yellow(&[0], &located, &[true; CELLS]),
+            "已判死的键不算「还有黄键亮着」"
+        );
     }
 }

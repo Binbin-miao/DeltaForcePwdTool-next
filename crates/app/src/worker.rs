@@ -402,6 +402,13 @@ const READY_POLL_MS: u64 = 40;
 /// 场景判别的容忍线：连续这么多帧 `Unknown` **且** 已耗这么久才允许拒绝（spec P6）。
 const SCENE_UNKNOWN_FRAMES: u32 = 3;
 const SCENE_UNKNOWN_MIN_MS: u64 = 1200;
+/// 快速拒绝的时间线：面板淡入实测 0.400s（`.scratch/az3-fix-batch/spec.md` §0⑤ 锚点表 · 帧 12）。
+///
+/// 0~`QUICK_REJECT_MS` 之间「一帧都不像任何解锁界面」是**正常现象**（面板还在淡入），
+/// 一律不得拒绝；超过这条线仍不像、且结构判别也没命中，就立刻按
+/// [`ui_guard::NOT_UNLOCK_SCREEN`] 收手。它把 v6.7「干等 1.2s 报『未检测到游戏界面』」
+/// 压成 0.4s 报出**准确**文案。
+const QUICK_REJECT_MS: u64 = 400;
 
 /// 通用就绪等待：每轮取一次 `probe`，`Found` 立刻返回；预算用尽返回最后一次的三态。
 ///
@@ -434,38 +441,118 @@ fn wait_ready<T>(
     }
 }
 
+/// 一次轮询帧的三分类结论（**同一帧**同时喂给结构判别与 UI 模板）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollVerdict {
+    /// 结构判别或模板命中，可以动手；`hint` = 模板两帧复核确认过的场景。
+    Ready(Option<delta_scene::Scene>),
+    /// 还说不清，继续等（覆盖 0~400ms 淡入期与模板灰带）。
+    NotYet,
+    /// 明确不是解锁界面（已耗 ≥ [`QUICK_REJECT_MS`] 且模板 `Reject` 且结构未命中）。
+    Reject(&'static str),
+}
+
+/// 单帧综合探测：**先结构后模板**（先便宜后昂贵），两种判据共享同一帧。
+///
+/// `recheck_frame` 只在模板命中时被调用一次：两帧必须有**明确的时间间隔**，
+/// 拿同一帧复核自己是自欺（它一定通过）。
+fn classify_poll_frame(
+    guard: &ui_guard::UiGuard,
+    frame: &Frame,
+    view: &PxView,
+    elapsed_ms: u64,
+    recheck_frame: impl FnOnce() -> Option<Frame>,
+) -> PollVerdict {
+    // 1. 结构判别：原路径一字不改 —— 命中就动手，模板只用来补「免投票的场景」。
+    let structural = delta_scene::detect(frame, view).is_actionable()
+        || delta_scene::az3_variant(frame, view).is_known();
+    if structural {
+        return PollVerdict::Ready(None);
+    }
+    // 2. 模板库为空 = 没有素材可判 ⇒ 说不清，绝不因此拒绝识别。
+    if guard.is_empty() {
+        return PollVerdict::NotYet;
+    }
+    match guard.verdict(frame) {
+        ui_guard::UiVerdict::Target(scene) => match recheck_frame() {
+            Some(second) => match ui_guard::recheck(
+                ui_guard::UiVerdict::Target(scene),
+                guard.verdict(&second),
+            ) {
+                ui_guard::Recheck::Keep(scene) => PollVerdict::Ready(Some(scene)),
+                // 模板掉了，但结构判别还有机会长起来 ⇒ 继续等。
+                ui_guard::Recheck::Downgrade => PollVerdict::NotYet,
+                ui_guard::Recheck::Changed => PollVerdict::Reject(CHANGED_NOTICE),
+            },
+            // 补抓失败：说不清就继续等，交给下一轮/预算耗尽收尾。
+            None => PollVerdict::NotYet,
+        },
+        ui_guard::UiVerdict::Reject(reason) if elapsed_ms >= QUICK_REJECT_MS => {
+            PollVerdict::Reject(reason)
+        }
+        // 淡入期 / 灰带：一帧不像不算证据，等时间给出答案。
+        ui_guard::UiVerdict::Reject(_) | ui_guard::UiVerdict::Gray => PollVerdict::NotYet,
+    }
+}
+
+/// 等场景就绪的收尾结论（`Locate<T>` 表达不了「明确拒绝」这一态）。
+enum ReadyOutcome {
+    /// 可以动手了；`hint` = 模板两帧复核确认过的场景（`None` = 交给结构判别/投票）。
+    Ready {
+        frame: Frame,
+        hint: Option<delta_scene::Scene>,
+    },
+    /// 明确不是解锁界面（模板一张都不像，且结构判别也没命中）。
+    Rejected(&'static str),
+    /// 预算耗尽：等不到任何判据，一帧都不像已知界面。
+    Exhausted,
+    /// 取消 / 抓帧失败（原因已经发给界面）。
+    Stopped,
+}
+
 /// 等画面能被判别成一个已知界面（Q3：摩斯面板打开也有 1.4s 空窗）。
 ///
-/// 「已知」= 常规判别命中，或 AZ3 二级判别命中任一玩法。
+/// 「已知」= 常规判别命中、AZ3 二级判别命中任一玩法、**或** UI 模板确认是某个解锁界面。
+/// 三条判据共享同一帧、同一轮预算：不存在「先抓一帧判模板，再抓一帧判结构」。
 fn wait_scene_ready(
     session: &mut CaptureSession,
     full: PxRect,
     view: &PxView,
+    guard: &ui_guard::UiGuard,
     cancel: &AtomicBool,
     tx: &mpsc::Sender<UiEvent>,
-) -> Locate<Frame> {
+) -> ReadyOutcome {
     let mut clock = delta_flow_az3::SystemClock::new();
-    wait_ready(
-        &mut clock,
-        cancel,
-        SCENE_UNKNOWN_MIN_MS,
-        SCENE_UNKNOWN_FRAMES,
-        || match session.grab(full) {
-            Ok(frame) => {
-                let known = delta_scene::detect(&frame, view).is_actionable()
-                    || delta_scene::az3_variant(&frame, view).is_known();
-                if known {
-                    Locate::Found(frame)
-                } else {
-                    Locate::NotYet
-                }
-            }
+    let began = clock.now_ms();
+    let mut probes = 0u32;
+    loop {
+        // 每轮读一次取消位：关掉总开关后不许还干等。
+        if cancel.load(Ordering::SeqCst) {
+            let _ = tx.send(UiEvent::Failed("已取消".to_owned()));
+            return ReadyOutcome::Stopped;
+        }
+        probes += 1;
+        let frame = match session.grab(full) {
+            Ok(frame) => frame,
             Err(error) => {
                 let _ = tx.send(UiEvent::Failed(error.to_string()));
-                Locate::Absent
+                return ReadyOutcome::Stopped;
             }
-        },
-    )
+        };
+        let elapsed = clock.now_ms().saturating_sub(began);
+        let verdict =
+            classify_poll_frame(guard, &frame, view, elapsed, || session.grab(full).ok());
+        match verdict {
+            PollVerdict::Ready(hint) => return ReadyOutcome::Ready { frame, hint },
+            PollVerdict::Reject(reason) => return ReadyOutcome::Rejected(reason),
+            PollVerdict::NotYet => {}
+        }
+        // 预算耗尽仍说不清 ⇒ 交给上层报「未检测到游戏界面」。
+        if elapsed >= SCENE_UNKNOWN_MIN_MS && probes >= SCENE_UNKNOWN_FRAMES {
+            return ReadyOutcome::Exhausted;
+        }
+        clock.sleep_ms(READY_POLL_MS.min(SCENE_UNKNOWN_MIN_MS.saturating_sub(elapsed).max(1)));
+    }
 }
 
 /// 等黄键台真的可以动手：面板可定位 **且** 亮键像素 ≥3000px@720p，返回就绪的那一帧。
@@ -491,67 +578,22 @@ fn wait_keys_ready(
     })
 }
 
-/// Q5 第二道闸的三种结论。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UiGate {
-    /// 模板命中：这就是某个解锁界面 ⇒ 免掉场景投票，直接按它开跑。
-    Strong(delta_scene::Scene),
-    /// 说不清（灰带 / 模板库为空 / 抓不到帧）⇒ 原路径完全不变。
-    Pass,
-    /// 一张都不像 ⇒ 不是解锁界面，零注入。
-    Reject(&'static str),
-}
-
-/// Q5 第二道闸：先看一眼这是不是**某个解锁界面**（正样本模板）。
-///
-/// 抓帧只抓**一帧**、且用独立会话（不占任务配额）；模板库为空 / 抓帧失败一律 `Pass`
-/// （缺素材绝不拒绝识别，抓不到帧也交给后面的正式路径报错）。
-fn ui_gate(guard: &ui_guard::UiGuard, snapshot: &Config, monitor: MonitorInfo) -> UiGate {
-    if guard.is_empty() {
-        return UiGate::Pass;
-    }
-    let Ok(frame) = grab_full(monitor, snapshot.capture_backend) else {
-        return UiGate::Pass;
-    };
-    match guard.verdict(&frame) {
-        ui_guard::UiVerdict::Target(scene) => UiGate::Strong(scene),
-        ui_guard::UiVerdict::Reject(reason) => {
-            save_evidence(
-                "reject",
-                reason,
-                monitor,
-                snapshot.capture_backend,
-                "Q5 第二道闸（UI 模板未命中任何解锁界面）",
-            );
-            UiGate::Reject(reason)
-        }
-        ui_guard::UiVerdict::Gray => UiGate::Pass,
-    }
-}
-
-/// 就绪判别的依据 —— 前两种都**不必**等结构判别，直接抓当前帧。
+/// 就绪判别的依据。
 #[derive(Debug, Clone, Copy)]
 enum ReadyBasis {
-    /// UI 模板已确认是某个解锁界面（面板已经画出来了，再等只是白等 1.2s）。
-    Template(delta_scene::Scene),
-    /// 强制模式（F5/F6/F7）：用户按键就是命令。
+    /// 强制模式（F5/F6/F7）：用户按键就是命令，连模板都不必读。
     Forced,
-    /// 自动模式：等结构判别长起来（原路径）。
+    /// 自动模式：等面板淡入，由结构判别或 UI 模板确认。
     Detect,
 }
 
 impl ReadyBasis {
-    /// 已知场景或强制模式 ⇒ 场景投票整段不参与。
+    /// 强制模式 ⇒ 场景判别整段不参与，直接抓当前帧。
+    ///
+    /// 写成 `matches!(Forced)` 而不是 `!matches!(Detect)`：新增变体时后者会静默 fail-open，
+    /// 把「还没想清楚的新模式」当成「可以跳过判别」。
     fn skips_detect(self) -> bool {
-        !matches!(self, ReadyBasis::Detect)
-    }
-
-    /// 模板确认过的场景（给免投票的场景分类用）。
-    fn confirmed(self) -> Option<delta_scene::Scene> {
-        match self {
-            ReadyBasis::Template(scene) => Some(scene),
-            ReadyBasis::Forced | ReadyBasis::Detect => None,
-        }
+        matches!(self, ReadyBasis::Forced)
     }
 }
 
@@ -562,38 +604,73 @@ struct Evidence {
     backend: CaptureBackend,
 }
 
+/// 一次就绪等待要用的全部上下文。
+///
+/// 这七样东西永远一起走（会话 / 整屏矩形 / 视图 / 模板库 / 取消位 / 留证 / 事件口），
+/// 拆成裸参数既超 clippy 的 7 参上限，也让调用点读不出「它们在描述同一件事」。
+struct ReadyContext<'a> {
+    session: &'a mut CaptureSession,
+    full: PxRect,
+    view: &'a PxView,
+    guard: &'a ui_guard::UiGuard,
+    cancel: &'a AtomicBool,
+    evidence: Evidence,
+    tx: &'a mpsc::Sender<UiEvent>,
+}
+
+/// 就绪的那一帧 + 模板两帧复核确认过的场景。
+struct ReadyFrame {
+    frame: Frame,
+    hint: Option<delta_scene::Scene>,
+}
+
 /// 等到一帧**真的可以动手**的画面；拿不到就当场把拒绝/失败原因发出去并返回 `None`。
 ///
 /// 三件事收在这一个函数里（调用点不必知道先等什么后等什么）：
-/// 1. 等场景判别出结果（Q3：`Unknown` 连续 3 帧且 ≥1.2s 才判失败，spec B12）；
-/// 2. 模板命中 / 强制模式跳过判别（前者已经知道是哪个界面，后者用户按键就是命令）；
+/// 1. 等面板长起来并确认界面（Q3/Q5：模板与结构判别在同一轮里出结论）；
+/// 2. 明确不是解锁界面 ⇒ 立刻按模板文案拒绝（[`QUICK_REJECT_MS`] 之后）；
 /// 3. 取消位在同一轮里生效（用户关掉总开关不该还干等）。
-fn await_frame(
-    session: &mut CaptureSession,
-    full: PxRect,
-    view: &PxView,
-    cancel: &AtomicBool,
-    basis: ReadyBasis,
-    evidence: Evidence,
-    tx: &mpsc::Sender<UiEvent>,
-) -> Option<Frame> {
-    if basis.skips_detect() || wait_scene_ready(session, full, view, cancel, tx).is_found() {
-        return grab_now(session, full, tx);
+fn await_frame(ctx: ReadyContext<'_>, basis: ReadyBasis) -> Option<ReadyFrame> {
+    let ReadyContext {
+        session,
+        full,
+        view,
+        guard,
+        cancel,
+        evidence,
+        tx,
+    } = ctx;
+    // 强制模式：用户按键就是命令，不进轮询、不看模板、不拒绝。
+    if basis.skips_detect() {
+        return grab_now(session, full, tx).map(|frame| ReadyFrame { frame, hint: None });
     }
-    if cancel.load(Ordering::SeqCst) {
-        let _ = tx.send(UiEvent::Failed("已取消".to_owned()));
-        return None;
+    match wait_scene_ready(session, full, view, guard, cancel, tx) {
+        ReadyOutcome::Ready { frame, hint } => Some(ReadyFrame { frame, hint }),
+        ReadyOutcome::Rejected(reason) => {
+            save_evidence(
+                "reject",
+                reason,
+                evidence.monitor,
+                evidence.backend,
+                "Q5 快速拒绝（模板未命中任何解锁界面）",
+            );
+            let _ = tx.send(UiEvent::Rejected(reason.to_owned()));
+            None
+        }
+        ReadyOutcome::Exhausted => {
+            let reason = format!("{SCENE_UNKNOWN_MIN_MS}ms / {SCENE_UNKNOWN_FRAMES} 帧内没认出界面");
+            save_evidence(
+                "reject",
+                &reason,
+                evidence.monitor,
+                evidence.backend,
+                "场景判别失败",
+            );
+            let _ = tx.send(UiEvent::Rejected("未检测到游戏界面".to_owned()));
+            None
+        }
+        ReadyOutcome::Stopped => None,
     }
-    let reason = format!("{SCENE_UNKNOWN_MIN_MS}ms / {SCENE_UNKNOWN_FRAMES} 帧内没认出界面");
-    save_evidence(
-        "reject",
-        &reason,
-        evidence.monitor,
-        evidence.backend,
-        "场景判别失败",
-    );
-    let _ = tx.send(UiEvent::Rejected("未检测到游戏界面".to_owned()));
-    None
 }
 
 /// 补抓一帧；失败即报错。
@@ -731,10 +808,13 @@ fn run_once(
         return;
     }
 
-    // Q5 第二道闸（用户拍板：解锁界面用 UI 判定模板）：先看一眼这是不是**某个解锁界面**。
-    // 命中 ⇒ 免掉场景投票直接按它开跑；一张都不像 ⇒ 零注入当场拒绝；说不清 ⇒ 一切照旧。
-    // 放在 `focus_game_window()` 之前：先把「不该动的界面」挡掉，再谈激活游戏。
-    // 强制模式（F5/F6/F7）不参与这道闸 —— 用户按键就是命令，连模板都不必读。
+    // Q5：模板闸**并入**面板等待循环（用户拍板：解锁界面用 UI 判定模板）。
+    // 单帧先闸是不可行的 —— 面板 0~400ms 还在淡入，那一帧必然「一张都不像」，
+    // 于是要么误拒、要么白等 1.2s 报「未检测到游戏界面」。搬进轮询后用**时间**区分
+    // 「还没画完」与「这不是解锁界面」（见 `QUICK_REJECT_MS`）。
+    //
+    // 放在 `focus_game_window()` 之前加载模板：激活窗口本身是副作用，与加载无关。
+    // 强制模式（F5/F6/F7）用空库（`UiGuard::default()`）—— 它完全不参与模板判定。
     //
     // 注意这里每轮都重新扫目录 + 解码模板：当前 3 张 200×112（约 33KB）合计远低于 1ms，
     // 改模板后立刻生效，不值得为它引入缓存失效逻辑。
@@ -743,21 +823,10 @@ fn run_once(
         Some(_) => ui_guard::UiGuard::default(),
         None => ui_guard::UiGuard::load(&crate::ui_images_dir()),
     };
-    let strong = match forced {
-        Some(_) => None,
-        None => match ui_gate(&guard, &snapshot, monitor) {
-            UiGate::Strong(scene) => Some(scene),
-            UiGate::Reject(reason) => {
-                let _ = tx.send(UiEvent::Rejected(reason.to_owned()));
-                return;
-            }
-            UiGate::Pass => None,
-        },
-    };
-    let basis = match strong {
-        Some(scene) => ReadyBasis::Template(scene),
-        None if forced.is_some() => ReadyBasis::Forced,
-        None => ReadyBasis::Detect,
+    let basis = if forced.is_some() {
+        ReadyBasis::Forced
+    } else {
+        ReadyBasis::Detect
     };
 
     if let Err(reason) = platform::focus_game_window() {
@@ -775,37 +844,25 @@ fn run_once(
     };
     let full = full_rect(monitor);
 
-    // Q1/Q3：面板 0.4s 才淡入、首颗亮键 1.8s 才出现 —— 单帧判别必然判失败，
-    // 这就是「第一次按 F 没用、要按两次」的根因。这里等画面真的长起来再判。
-    let Some(frame) = await_frame(
-        &mut session,
-        full,
-        &view,
-        cancel,
-        basis,
-        Evidence {
-            monitor,
-            backend: snapshot.capture_backend,
+    // Q1/Q3/Q5：面板 0.4s 才淡入、首颗亮键 1.8s 才出现 —— 单帧判别必然判失败，
+    // 这就是「第一次按 F 没用、要按两次」的根因。这里等画面真的长起来再判，
+    // 模板判定在同一轮里完成（拒绝也从这里出去，不再是「先聚焦再白等」）。
+    let Some(ReadyFrame { frame, hint }) = await_frame(
+        ReadyContext {
+            session: &mut session,
+            full,
+            view: &view,
+            guard: &guard,
+            cancel,
+            evidence: Evidence {
+                monitor,
+                backend: snapshot.capture_backend,
+            },
+            tx,
         },
-        tx,
+        basis,
     ) else {
         return;
-    };
-    // 第二帧复核（spec B15/B17）：用**本来就要用的这一帧**再判一次，零额外抓帧。
-    // 单帧命中不足以下手：两帧不一致就说明界面在变，宁可交回判别/拒绝。
-    let hint = match basis.confirmed() {
-        Some(expected) => match ui_guard::recheck(
-            ui_guard::UiVerdict::Target(expected),
-            guard.verdict(&frame),
-        ) {
-            ui_guard::Recheck::Keep(scene) => Some(scene),
-            ui_guard::Recheck::Downgrade => None,
-            ui_guard::Recheck::Changed => {
-                let _ = tx.send(UiEvent::Rejected(CHANGED_NOTICE.to_owned()));
-                return;
-            }
-        },
-        None => None,
     };
     // 强制模式（上游 F5/F6 的等价物）：跳过判别直接用指定场景。
     // Console 有两条实现路径（v5 旧操作台 / AZ3 4 类玩法），所以必须先问 AZ3：
@@ -1630,8 +1687,9 @@ mod tests {
 
     #[test]
     fn a_template_hit_routes_without_asking_the_scene_detector() {
-        // 「UI 模板确认解锁界面」这句原因只有 `ReadyBasis::Template` 分支会产生，
-        // 拿到它 = 场景投票确实没跑（全黑帧也不可能靠结构分数认出任何界面）。
+        // 「UI 模板确认解锁界面」这句原因只会在拿到模板 hint 时产生 ——
+        // hint 现在由 `classify_poll_frame` 的两帧复核给出（`ReadyFrame.hint`）。
+        // 拿到它就等于场景投票确实没跑（全黑帧也不可能靠结构分数认出任何界面）。
         let (scene, az3, actionable, reason) = auto_classify(
             &black_frame(),
             &led_view(),
@@ -1651,15 +1709,72 @@ mod tests {
     }
 
     #[test]
-    fn only_a_confirmed_template_or_force_mode_skips_scene_detection() {
-        assert!(ReadyBasis::Template(delta_scene::Scene::Console).skips_detect());
-        assert!(ReadyBasis::Forced.skips_detect());
-        assert!(!ReadyBasis::Detect.skips_detect(), "灰带 / 无模板必须照旧走 detect");
-        assert_eq!(
-            ReadyBasis::Template(delta_scene::Scene::Morse).confirmed(),
-            Some(delta_scene::Scene::Morse)
+    fn only_force_mode_skips_scene_detection() {
+        assert!(ReadyBasis::Forced.skips_detect(), "强制模式：用户按键就是命令");
+        assert!(
+            !ReadyBasis::Detect.skips_detect(),
+            "自动模式必须照旧等结构判别 / 模板确认"
         );
-        assert_eq!(ReadyBasis::Forced.confirmed(), None);
-        assert_eq!(ReadyBasis::Detect.confirmed(), None);
+    }
+
+    /// 模板库（真实素材）。B7/B8 的前提是「这个界面一张模板都不像」。
+    fn ui_templates_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../images/ui")
+    }
+
+    /// 骨架帧：没有任何版面结构 ⇒ 结构判别与 AZ3 二级判别都不会命中。
+    fn flat_frame() -> Frame {
+        Frame::new(128, 96, vec![128u8; 128 * 96 * 4], std::time::Instant::now()).expect("合成帧")
+    }
+
+    #[test]
+    fn fading_panel_at_300ms_is_not_rejected() {
+        // B7：面板淡入要 0.4s。300ms 那一刻「一帧都不像」是正常现象，必须继续等。
+        let guard = ui_guard::UiGuard::load(&ui_templates_dir());
+        assert!(!guard.is_empty(), "前提：模板库必须加载到素材");
+        assert_eq!(
+            guard.verdict(&flat_frame()),
+            ui_guard::UiVerdict::Reject(ui_guard::NOT_UNLOCK_SCREEN),
+            "前提：这一帧在模板口径下就是「一张都不像」"
+        );
+        let verdict = classify_poll_frame(&guard, &flat_frame(), &led_view(), 300, || None);
+        assert_eq!(
+            verdict,
+            PollVerdict::NotYet,
+            "淡入期不许拒绝，否则「第一次按 F 没用」的老毛病会回来"
+        );
+    }
+
+    #[test]
+    fn an_inventory_screen_is_quick_rejected_after_quick_reject_ms() {
+        // B8：背包/仓库（模板全 < MAX_REJECT_NCC、结构未命中）⇒ 400ms 后立刻拒绝，
+        // 文案必须是「这不是解锁界面」，不是干等 1.2s 后的「未检测到游戏界面」。
+        let guard = ui_guard::UiGuard::load(&ui_templates_dir());
+        let verdict = classify_poll_frame(
+            &guard,
+            &flat_frame(),
+            &led_view(),
+            QUICK_REJECT_MS,
+            || None,
+        );
+        assert_eq!(
+            verdict,
+            PollVerdict::Reject(ui_guard::NOT_UNLOCK_SCREEN),
+            "400ms 之后必须报准确的文案：{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_template_library_never_rejects() {
+        // 素材被误删/没打包 ⇒ 快速拒绝整段失效，退化为 v6.7 的 1.2s 路径（绝不放狠话）。
+        let guard = ui_guard::UiGuard::default();
+        let verdict = classify_poll_frame(
+            &guard,
+            &flat_frame(),
+            &led_view(),
+            QUICK_REJECT_MS * 3,
+            || None,
+        );
+        assert_eq!(verdict, PollVerdict::NotYet, "没有模板就不许拒绝");
     }
 }

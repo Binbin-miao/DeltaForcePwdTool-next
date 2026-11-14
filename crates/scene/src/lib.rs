@@ -491,19 +491,6 @@ fn is_green_glow([b, g, r]: [u8; 3]) -> bool {
     g > 120 && g > r.saturating_add(25) && g > b.saturating_add(25)
 }
 
-/// 黄/绿高亮（黄键台的亮键）。与 `flow-az3::geom` 同口径：
-/// `r + g > 3b` 必须在 u16 上算，u8 饱和会让 r+g 恒为 255 → 亮黄键漏检；
-/// `b` 上限 120 是为了容下实测 B≈120 的米黄旋钮（靠暗键阵结构拦截误判）。
-#[cfg(test)]
-fn is_yellow_or_green_glow([b, g, r]: [u8; 3]) -> bool {
-    let is_green = is_green_glow([b, g, r]);
-    let is_yellow = r > 140
-        && g > 120
-        && b <= 120
-        && (u16::from(r) + u16::from(g)) > u16::from(b) * 3;
-    is_green || is_yellow
-}
-
 fn is_bright_white([b, g, r]: [u8; 3]) -> bool {
     r > 185 && g > 185 && b > 185
 }
@@ -878,14 +865,6 @@ mod tests {
         assert_eq!(az3_variant(&safe_pins_frame(), &view), Az3Kind::SafePins);
         assert_eq!(az3_variant(&safe_timing_frame(), &view), Az3Kind::SafeTiming);
         assert_eq!(az3_variant(&signal_line_frame(), &view), Az3Kind::SignalLine);
-    }
-
-    #[test]
-    fn yellow_glow_survives_large_red_green_sums() {
-        // 谓词入参是 [B, G, R]。u8 饱和会让 r+g 恒为 255 → 亮黄键漏检。
-        assert!(is_yellow_or_green_glow([105, 200, 240]), "亮黄键必须判成高亮");
-        assert!(is_yellow_or_green_glow([120, 200, 230]), "米黄旋钮也会命中（靠暗键阵拦截）");
-        assert!(!is_yellow_or_green_glow([255, 255, 255]), "纯白不是高亮");
     }
 
     #[test]
