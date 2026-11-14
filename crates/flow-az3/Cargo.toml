@@ -11,5 +11,6 @@ delta-config.workspace = true
 delta-geom.workspace = true
 delta-input.workspace = true
 delta-scene = { path = "../scene" }
+delta-vision.workspace = true
 delta-flow-console = { path = "../flow-console" }
 thiserror.workspace = true

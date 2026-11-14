@@ -351,6 +351,7 @@ dependencies = [
  "delta-geom",
  "delta-input",
  "delta-scene",
+ "delta-vision",
  "thiserror 1.0.69",
 ]
 
@@ -435,6 +436,7 @@ dependencies = [
  "delta-config",
  "delta-geom",
  "delta-vision",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

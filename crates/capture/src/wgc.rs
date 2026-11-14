@@ -162,6 +162,10 @@ impl WgcSession {
             "SetIsCursorCaptureEnabled",
             session.SetIsCursorCaptureEnabled(false),
         )?;
+        // 关掉「正在捕获」的黄色边框（Win11 22H2+ 的 IGraphicsCaptureSession2.SetIsBorderRequired）。
+        // 每建一次会话系统就画一次边框，用户看到的就是「每按一次识别，屏幕四周闪一下黄框」。
+        // 旧系统或系统策略禁止时调用会失败，此时只是边框还在、抓帧不受影响，故不计入初始化错误。
+        let _ = session.SetIsBorderRequired(false);
         init_step("StartCapture", session.StartCapture())?;
 
         Ok(Self {

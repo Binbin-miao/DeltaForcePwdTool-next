@@ -10,4 +10,5 @@ delta-capture.workspace = true
 delta-vision.workspace = true
 delta-config.workspace = true
 delta-geom.workspace = true
+thiserror.workspace = true
 

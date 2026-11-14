@@ -16,10 +16,9 @@ use crate::wizard::{Step, Verdict, Wizard, WizardScene};
 
 /// 主窗口一帧：返回用户动作（无动作为 `None`）。
 pub fn main_window(ui: &mut egui::Ui, state: &mut UiState, pal: &Palette) -> Option<Action> {
-    let time = state.phase_elapsed;
     let full = ui.max_rect();
     let painter = ui.painter().clone();
-    paint_shell(&painter, full, state.phase, time, pal);
+    paint_shell(&painter, full, pal);
     if state.collapsed {
         collapsed_strip(ui, full, state, pal)
     } else {
@@ -30,7 +29,11 @@ pub fn main_window(ui: &mut egui::Ui, state: &mut UiState, pal: &Palette) -> Opt
 // ── 外壳与通用零件 ───────────────────────────────────────────────
 
 /// 外壳：深色外扩 2px 阴影；浅色主题改 1px `line_strong` 外框（egui 无模糊，黑边会脏）。
-fn paint_shell(painter: &egui::Painter, full: Rect, phase: Phase, time: f64, pal: &Palette) {
+///
+/// **外壳不参与状态动画**：只画一层恒定 1px 描边。状态一律由标题栏的 7px 状态点
+/// 与状态文字表达 —— 此前「运行中呼吸 / 未识别 2Hz 闪」会沿整个窗口画 2px 亮色外框，
+/// 每按一次热键就闪一次黄条，实测被用户判为干扰。
+fn paint_shell(painter: &egui::Painter, full: Rect, pal: &Palette) {
     let corner = pal.corner_panel();
     if pal.dark {
         painter.rect_filled(full, corner, pal.shadow());
@@ -47,15 +50,6 @@ fn paint_shell(painter: &egui::Painter, full: Rect, phase: Phase, time: f64, pal
         Stroke::new(1.0, pal.line_strong),
         egui::StrokeKind::Inside,
     );
-    let alpha = phase.status_alpha(time);
-    if alpha > 0.0 {
-        painter.rect_stroke(
-            body,
-            corner,
-            Stroke::new(2.0, theme::with_alpha(phase.color(pal), alpha)),
-            egui::StrokeKind::Inside,
-        );
-    }
 }
 
 /// 面板底 + 1px 描边 + 顶部 1px 高光（浅色主题靠描边撑层级）。
@@ -725,7 +719,7 @@ pub fn wizard_window(
     let full = ui.max_rect();
     let painter = ui.painter().clone();
     let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
-    paint_shell(&painter, full, Phase::Idle, 0.0, pal);
+    paint_shell(&painter, full, pal);
 
     painter.text(
         content.left_top(),
@@ -1345,7 +1339,7 @@ pub fn settings_panel(
     }
     let full = ui.max_rect();
     let painter = ui.painter().clone();
-    paint_shell(&painter, full, Phase::Idle, 0.0, pal);
+    paint_shell(&painter, full, pal);
     let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
     painter.text(
         content.left_top(),

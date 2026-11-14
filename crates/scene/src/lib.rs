@@ -9,6 +9,7 @@
 //!    不得兜底成任意场景去乱点（spec D6 硬约束）。
 
 mod features;
+pub mod locate;
 
 use delta_capture::Frame;
 use delta_config::{PxAz3, PxView, MORSE_REGION_COUNT};
@@ -36,6 +37,8 @@ const LED_PRESENCE: (f32, f32) = (0.01, 0.05);
 const LED_MIN_SEGMENTS: f32 = 7.0;
 /// 操作台面板的最少竖列数（4 列旋钮）。
 const PANEL_MIN_COLUMNS: usize = 4;
+/// 旋钮搜索窗内「暖色像素」占比区间（低于下限 = 没有旋钮）。
+const KNOB_WARM_RATIO: (f32, f32) = (0.01, 0.035);
 
 /// 四类场景。`Unknown` 是**拒绝执行**信号，不是「猜一个」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,10 +111,14 @@ impl SceneVerdict {
 /// 内部任何区域裁剪失败都只让对应分数变 0，绝不 panic、绝不兜底成某场景。
 pub fn detect(frame: &Frame, view: &PxView) -> SceneVerdict {
     let gray = frame.luma();
+    // 操作台一类（旧旋钮台 + AZ3 信号线台）必须**同时**有一颗暖色旋钮：
+    // 单看「LED 亮点 + 面板 4 列」会把摩斯界面判成操作台（深蓝面板 + 数字键盘 +
+    // 顶部指南针刻度三项全过），随后真的去拖旋钮。旋钮是这一类独有的硬证据。
+    let console = console_score(&gray, view) * knob_score(frame, view);
     decide([
         morse_score(&gray, view),
         fingerprint_score(&gray, view),
-        console_score(&gray, view),
+        console,
     ])
 }
 
@@ -224,6 +231,39 @@ pub fn console_score(gray: &GrayImage, view: &PxView) -> f32 {
     0.7 * led_score + 0.3 * panel_score
 }
 
+/// 旋钮搜索窗：半宽 = 屏宽 / 32（1080p ≈ 60px，720p ≈ 40px），远大于旋钮直径、
+/// 又小于「另一个界面元素」到旋钮的距离。
+fn knob_window(center: delta_geom::PxPoint, frame: &Frame) -> delta_geom::PxRect {
+    let half = (frame.w as i32 / 32).max(24);
+    delta_geom::PxRect {
+        x: center.x - half,
+        y: center.y - half,
+        w: half * 2,
+        h: half * 2,
+    }
+}
+
+/// 暖色像素：红通道明显高于蓝通道，且不太暗。
+///
+/// 旧操作台米黄旋钮 ≈ `[80, 205, 235]`、AZ3 信号线台暗红旋钮 ≈ `[30, 40, 140]`，都命中；
+/// 摩斯/指纹/仓库的深蓝面板与白字红蓝差为负，不命中。
+fn is_warm_knob([blue, _, red]: [u8; 3]) -> bool {
+    u16::from(red) >= 70 && u16::from(red) > u16::from(blue) + 40
+}
+
+/// 旋钮存在性得分（0 = 没有旋钮，1 = 明确有）。
+///
+/// 这是「操作台一类」的硬证据：旧旋钮台在 `console.knob_center`、AZ3 信号线台在
+/// `az3.line_knob_center`，两处任一命中即可。未配置（0,0）的坐标直接跳过。
+fn knob_score(frame: &Frame, view: &PxView) -> f32 {
+    let best = [view.console.knob_center, view.az3.line_knob_center]
+        .into_iter()
+        .filter(|center| center.x > 0 || center.y > 0)
+        .map(|center| color_ratio(frame, knob_window(center, frame), is_warm_knob))
+        .fold(0.0f32, f32::max);
+    ramp(best, KNOB_WARM_RATIO.0, KNOB_WARM_RATIO.1)
+}
+
 
 /// AZ3 骇入电脑小游戏的 4 种细分类型（`None` 表示未命中任何 AZ3 界面）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -307,7 +347,7 @@ pub fn az3_variant(frame: &Frame, view: &PxView) -> Az3Kind {
     if looks_like_timing(frame, az3) {
         return Az3Kind::SafeTiming;
     }
-    if looks_like_signal_line(&gray, az3) {
+    if looks_like_signal_line(frame) {
         return Az3Kind::SignalLine;
     }
     Az3Kind::None
@@ -377,16 +417,16 @@ fn looks_like_timing(frame: &Frame, az3: &PxAz3) -> bool {
         && color_columns(frame, target, is_green_glow, AZ3_TIMING_MIN_COLUMNS)
 }
 
-/// 信号线台：**AZ3 自己的** LED 区里真有 `NN-NN-NN-NN`（亮点占比 + ≥7 个字符段）。
+/// 信号线台：**每帧自适应定位**能同时找到旋钮 + 青色屏幕 + LED 数字条 + 4 列档位。
 ///
-/// 不能用一级 `console_score` 兜底：那会把 v5 旧操作台也判成 AZ3，
-/// 接着拿 AZ3 坐标去拖旧面板，两边全废。
-fn looks_like_signal_line(gray: &GrayImage, az3: &PxAz3) -> bool {
-    let Some(cell) = crop(gray, az3.line_led_region) else {
-        return false;
-    };
-    let bright = otsu_foreground_ratio(&cell);
-    bright >= LED_PRESENCE.0 && column_segments(&cell.otsu().binary, 2) as f32 >= LED_MIN_SEGMENTS
+/// 旧实现拿配置里的固定百分比去裁 LED 区再量旋钮窗暖色占比 —— 实测旋钮中心在
+/// `(0.604,0.554)~(0.766,0.573)` 之间漂，同一份配置时而命中、时而全落空，
+/// 于是「信号线台」时而被判成别的场景、时而在空旷场景上被判成信号线台。
+///
+/// 现在判别与执行共用同一份定位证据（[`locate::locate_line`]），不再有两套坐标。
+/// 旋钮放在第一步，所以非信号线台的画面会在第一步就失败退出：不用为每帧付出整段定位。
+fn looks_like_signal_line(frame: &Frame) -> bool {
+    locate::locate_line(frame).is_ok()
 }
 
 /// 灰度裁剪区里是否存在 ≥`min_columns` 条等距竖列。
@@ -663,6 +703,8 @@ mod tests {
         for x in [160, 300, 440, 580] {
             canvas.paint(rect(x, 200, 8, 300), WHITE);
         }
+        // 米黄旋钮（v5 实测色）：操作台一类的硬证据。
+        canvas.paint(rect(725, 320, 40, 40), [235, 205, 80]);
         canvas.frame()
     }
 
@@ -805,19 +847,47 @@ mod tests {
         canvas.frame()
     }
 
-    /// 信号线台：AZ3 LED 区 (809,175)-(1097,229) 内 `NN-NN-NN-NN` + 面板 4 条竖线。
+    /// 信号线台：AZ3 LED 区 (809,175)-(1097,229) 内 `NN-NN-NN-NN` + 面板 4 条竖线 + 暗红旋钮。
+    /// 完整信号线台：青色屏幕 + 4×4 档位 + LED 条 + 暗红旋钮（自适应定位的合成机台）。
     fn signal_line_frame() -> Frame {
+        crate::locate::fixture::machine_frame([None; 4])
+    }
+
+    /// 摩斯界面：深蓝面板 + 三格摩斯 + 右侧数字键盘 + **顶部指南针刻度条**。
+    ///
+    /// `knob` 非空时在同一位置补一颗暗红旋钮，用来证明「旋钮存在」是唯一变量。
+    /// 这一帧曾经被判成「信号线台」并真的去拖旋钮（实机日志：摩斯界面发出 64 个输入事件）。
+    fn morse_like_frame(knob: Option<[u8; 3]>) -> Frame {
         let mut canvas = Canvas::new(W, H);
+        // 深蓝面板（覆盖 AZ3 面板区），带 4 条等距竖线（数字键盘的列）。
+        canvas.paint(rect(300, 160, 700, 460), [30, 45, 70]);
+        for x in [339, 465, 599, 698] {
+            canvas.paint(rect(x, 250, 4, 60), WHITE);
+        }
+        // 顶部指南针刻度：一串数字（旧的 LED 判据就是被它骗过的）。
         let mut cursor = 815;
         for _ in 0..8 {
             canvas.paint(rect(cursor, 185, 12, 40), WHITE);
             cursor += 26;
         }
-        // 深蓝面板上的 4 条白色竖线（实测列 x）。
-        for x in [339, 465, 599, 698] {
-            canvas.paint(rect(x, 200, 4, 60), WHITE);
+        if let Some(rgb) = knob {
+            canvas.paint(rect(925, 390, 32, 32), rgb);
         }
         canvas.frame()
+    }
+
+    #[test]
+    fn console_needs_a_warm_knob() {
+        // 摩斯界面（深蓝面板 + 4 条竖列 + 顶部刻度数字）没有暖色旋钮 ——
+        // 旧判据会把它当成信号线台并拖走旋钮，实机日志已复现（64 个输入事件）。
+        let morse = morse_like_frame(None);
+        assert_ne!(detect(&morse, &spec_view()).scene, Scene::Console);
+        assert_eq!(az3_variant(&morse, &spec_view()), Az3Kind::None);
+
+        // 同一帧补上暗红旋钮后**仍然不是**信号线台：自适应定位要的是「旋钮 + 青色屏幕 +
+        // LED 数字条 + 4 列档位」这一整套结构证据，单有一颗旋钮不够。
+        let with_knob = morse_like_frame(Some([140, 40, 30]));
+        assert_eq!(az3_variant(&with_knob, &spec_view()), Az3Kind::None);
     }
 
     #[test]

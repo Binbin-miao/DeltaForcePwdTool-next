@@ -3,13 +3,14 @@
 //! - `SafeTiming`（大保险）：高亮横带逐格右移的绿色游标过中间格时按空格（`0x39`）
 //! - `SafePins`（任务保险）：5 个竖槽的白色游标压到目标方块时按空格（`0x39`）
 //! - `ModuleKeys`（黄键台）：4×4 网格亮哪个点哪个，进度勾满 5 个即停
-//! - `SignalLine`（信号线台）：复用 `delta-flow-console` 4 列对齐
+//! - `SignalLine`（信号线台）：每帧自适应定位 + 只上下拖动（见 [`line`]）
 //! - `None`：拒绝执行，零输入
 //!
 //! 四条流程共享同一套「找不到特征就 Abort、绝不盲点」的纪律，像素原语见 [`geom`]。
 
 pub mod adapters;
 mod geom;
+pub mod locate;
 pub mod keys;
 pub mod line;
 pub mod pins;
@@ -32,12 +33,28 @@ pub const AZ3_FRAME_BUDGET: u32 = 300;
 /// 抓帧缝。
 pub trait Screen {
     fn grab(&mut self, rect: PxRect) -> Result<Frame, String>;
+
+    /// 可抓取的整帧范围。信号线台要靠整帧做自适应定位，所以必须先知道屏幕尺寸；
+    /// 默认零面积 = 「本实现不支持整帧抓取」，调用方据此零输入退出（不猜）。
+    fn frame_rect(&self) -> PxRect {
+        PxRect::ZERO
+    }
 }
 
-/// 输入注入缝（点击 + 空格键 `0x39`）。
+/// 输入注入缝（点击 + 空格键 `0x39` + 分步纵拖）。
+///
+/// `begin/step/end` 是信号线台「按住左键上下拖」的三个原语，语义与 `delta-input`
+/// 一致：`begin` 只做一次绝对归位，位移只能靠 `step` 的相对增量；
+/// 成对调用必须由调用方在 `finally` 式路径上保证 `end` 一定执行（见 `line::drag`）。
 pub trait Pointer {
     fn click(&mut self, at: PxPoint) -> Result<(), String>;
     fn key_space(&mut self) -> Result<(), String>;
+    /// 归位到 `at` 并按下左键。
+    fn begin(&mut self, at: PxPoint) -> Result<(), String>;
+    /// 相对位移一步（向下为正）。
+    fn step(&mut self, dx: i32, dy: i32) -> Result<(), String>;
+    /// 抬起左键。
+    fn end(&mut self) -> Result<(), String>;
     fn event_count(&self) -> u64;
 }
 
@@ -107,6 +124,41 @@ pub fn run(
     }
 }
 
+/// 跨模块共用的测试夹具：四条流程与信号线台的单测都用同一份假几何
+/// （100% 脱敏：这是一份与任何真实机位无关的合成坐标）。
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use delta_config::PxAz3;
+    use delta_geom::{PxPoint, PxRect};
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> PxRect {
+        PxRect { x, y, w, h }
+    }
+
+    pub(crate) fn az3() -> PxAz3 {
+        PxAz3 {
+            grid_region: rect(288, 257, 371, 143),
+            target_band: rect(288, 317, 371, 86),
+            crack_button: rect(768, 238, 179, 173),
+            timing_window_px: 23,
+            track_band: rect(365, 155, 531, 76),
+            indicator_band: rect(365, 216, 531, 86),
+            pin_center_x: vec![416, 527, 634, 739, 845],
+            pin_tolerance_px: 15,
+            button_grid_region: rect(640, 194, 269, 234),
+            progress_region: rect(335, 315, 198, 90),
+            line_led_region: rect(809, 175, 288, 54),
+            line_panel_region: rect(209, 184, 563, 317),
+            line_col_x: vec![339, 465, 599, 698],
+            line_row_y: vec![248, 292, 340, 389],
+            line_knob_center: PxPoint { x: 941, y: 407 },
+            max_duration_ms: 15_000,
+            frame_budget: 300,
+            poll_interval_ms: 50,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +213,15 @@ mod tests {
             self.cursor += 1;
             Ok(frame)
         }
+
+        fn frame_rect(&self) -> PxRect {
+            self.frames.first().map_or(PxRect::ZERO, |frame| PxRect {
+                x: 0,
+                y: 0,
+                w: frame.w as i32,
+                h: frame.h as i32,
+            })
+        }
     }
 
     /// 黄键台专用：网格帧恒定，进度帧按脚本推进。
@@ -200,6 +261,21 @@ mod tests {
         fn key_space(&mut self) -> Result<(), String> {
             self.spaces += 1;
             self.events += 2;
+            Ok(())
+        }
+
+        fn begin(&mut self, _at: PxPoint) -> Result<(), String> {
+            self.events += 1;
+            Ok(())
+        }
+
+        fn step(&mut self, _dx: i32, _dy: i32) -> Result<(), String> {
+            self.events += 1;
+            Ok(())
+        }
+
+        fn end(&mut self) -> Result<(), String> {
+            self.events += 1;
             Ok(())
         }
 
@@ -347,26 +423,7 @@ mod tests {
     }
 
     fn test_az3() -> PxAz3 {
-        PxAz3 {
-            grid_region: rect(288, 257, 371, 143),
-            target_band: rect(288, 317, TARGET_W as i32, TARGET_H as i32),
-            crack_button: rect(768, 238, 179, 173),
-            timing_window_px: 23,
-            track_band: rect(365, 155, TRACK_W as i32, TRACK_H as i32),
-            indicator_band: rect(365, 216, INDICATOR_W as i32, INDICATOR_H as i32),
-            pin_center_x: vec![416, 527, 634, 739, 845],
-            pin_tolerance_px: 15,
-            button_grid_region: rect(640, 194, GRID_W as i32, GRID_H as i32),
-            progress_region: rect(335, 315, PROGRESS_W as i32, PROGRESS_H as i32),
-            line_led_region: rect(809, 175, 288, 54),
-            line_panel_region: rect(209, 184, 563, 317),
-            line_col_x: vec![339, 465, 599, 698],
-            line_row_y: vec![248, 292, 340, 389],
-            line_knob_center: PxPoint { x: 941, y: 407 },
-            max_duration_ms: 15_000,
-            frame_budget: 300,
-            poll_interval_ms: 50,
-        }
+        tests_support::az3()
     }
 
     fn run_with(

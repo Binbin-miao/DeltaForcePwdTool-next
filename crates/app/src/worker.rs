@@ -631,12 +631,21 @@ fn run_az3(
             return;
         }
     };
+    let mut pointer = delta_flow_az3::SystemPointer::new();
+    let mut clock = delta_flow_az3::SystemClock::new();
+    let mut screen = delta_flow_az3::SystemScreen::new(&mut session);
+    // 信号线台现在是「每帧自适应定位 + 只上下拖」的闭环，入口在 `line::run`；
+    // 其余三类仍走统调度。
     let outcome = if kind == delta_scene::Az3Kind::SignalLine {
-        delta_flow_az3::line::run(config, view, &mut session)
+        delta_flow_az3::line::run(
+            &mut screen,
+            &mut pointer,
+            &mut clock,
+            delta_flow_az3::line::read_led_sequence,
+            &view.az3,
+            cancel,
+        )
     } else {
-        let mut pointer = delta_flow_az3::SystemPointer::new();
-        let mut clock = delta_flow_az3::SystemClock::new();
-        let mut screen = delta_flow_az3::SystemScreen::new(&mut session);
         delta_flow_az3::run(kind, &mut screen, &mut pointer, &mut clock, &view.az3, cancel)
     };
     if session.frames_taken() >= session.budget() {
@@ -647,6 +656,13 @@ fn run_az3(
     }
     match outcome {
         delta_flow_az3::Az3Outcome::Done { kind, steps, summary, .. } => {
+            save_evidence(
+                "ok",
+                &format!("{} 已完成", kind.label()),
+                monitor,
+                config.capture_backend,
+                &format!("AZ3类型: {}", kind.label()),
+            );
             let _ = tx.send(UiEvent::Progress {
                 done: steps,
                 total: steps.max(1),
@@ -688,6 +704,13 @@ fn run_console(
     match outcome {
         Ok(outcome) => {
             if outcome.is_done() {
+                save_evidence(
+                    "ok",
+                    "操作台已完成",
+                    monitor,
+                    config.capture_backend,
+                    &format!("已发输入事件: {}", outcome.events()),
+                );
                 let _ = tx.send(UiEvent::Progress {
                     done: 4,
                     total: 4,
@@ -769,13 +792,14 @@ fn evidence_frame(monitor: MonitorInfo, backend: CaptureBackend) -> Result<Frame
     })
 }
 
-/// 任务失败留证：全屏截图 + 文本日志，落到 `logs/`。
+/// 任务留证：全屏截图 + 文本日志，落到 `logs/task_<时间戳>_<tag>.*`。
 ///
-/// 操作台是 BETA 功能，用户自测时靠这两份证据定位：截屏能看出当时卡在哪一列、
-/// 目标序列读成了什么、面板有没有消失；日志记录时间、原因、分辨率与 `detail`
-/// （操作台是已发事件数，配额超限是已抓帧数）。任何一步失败都只打 stderr，
+/// 自测期**成功与失败都留**（用户要求「每次按 F 都能保留数据」）：截屏能看出当时
+/// 卡在哪一列、目标序列读成了什么、面板有没有消失；日志记录时间、结论、分辨率与
+/// `detail`（操作台是已发事件数，配额超限是已抓帧数）。任何一步失败都只打 stderr，
 /// **不允许把主流程带崩**。
-fn save_failure_evidence(
+fn save_evidence(
+    tag: &str,
     reason: &str,
     monitor: MonitorInfo,
     backend: CaptureBackend,
@@ -790,25 +814,66 @@ fn save_failure_evidence(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
-    let base = dir.join(format!("console_fail_{stamp}"));
+    let base = dir.join(format!("task_{stamp}_{tag}"));
 
     // 留证抓屏是 spec D4 允许的例外之一：独立会话、每次任务最多 1 张、不计入 20 张配额。
     match evidence_frame(monitor, backend) {
         Ok(frame) => {
             if let Err(error) = write_frame_png(&base.with_extension("png"), &frame) {
-                eprintln!("[console] 失败截图保存失败：{error}");
+                eprintln!("[console] 截图保存失败：{error}");
             }
         }
-        Err(error) => eprintln!("[console] 失败截图抓取失败：{error}"),
+        Err(error) => eprintln!("[console] 截图抓取失败：{error}"),
     }
 
     let text = format!(
-        "时间(unix): {stamp}\n原因: {reason}\n分辨率: {}x{}\n{detail}\n",
+        "时间(unix): {stamp}\n结论: {reason}\n分辨率: {}x{}\n{detail}\n",
         monitor.w, monitor.h
     );
     if let Err(error) = std::fs::write(base.with_extension("txt"), text) {
-        eprintln!("[console] 失败日志保存失败：{error}");
+        eprintln!("[console] 日志保存失败：{error}");
     }
+    prune_evidence(dir);
+}
+
+/// 证据保留组数（每组 png + txt）。超过就删最旧的，避免自测一晚上攒出几个 G。
+const EVIDENCE_KEEP: usize = 40;
+
+/// 只保留最近 [`EVIDENCE_KEEP`] 组 `task_*` 证据。读不到目录就静默返回。
+fn prune_evidence(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut groups: std::collections::BTreeMap<u64, Vec<std::path::PathBuf>> =
+        std::collections::BTreeMap::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(rest) = name.strip_prefix("task_") else {
+            continue;
+        };
+        let Some(stamp) = rest.split('_').next().and_then(|s| s.parse::<u64>().ok()) else {
+            continue;
+        };
+        groups.entry(stamp).or_default().push(entry.path());
+    }
+    while groups.len() > EVIDENCE_KEEP {
+        let Some((_, files)) = groups.pop_first() else {
+            break;
+        };
+        for path in files {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// 失败留证（保留旧入口名，语义等同 `save_evidence("fail", ..)`）。
+fn save_failure_evidence(
+    reason: &str,
+    monitor: MonitorInfo,
+    backend: CaptureBackend,
+    detail: &str,
+) {
+    save_evidence("fail", reason, monitor, backend, detail);
 }
 
 /// 把 BGRA 帧编码成 PNG（RGBA）。失败只回错误，不 panic。

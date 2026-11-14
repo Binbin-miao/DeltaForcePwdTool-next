@@ -477,15 +477,18 @@ pub struct Az3Config {
     pub button_grid_region: PctRect,
     /// 黄键台：左侧屏幕底部 5 个进度勾选框区域。
     pub progress_region: PctRect,
-    /// 信号线台：右上 LED 序列区（`NN-NN-NN-NN`）——与旧操作台的 LED 位置不同，不能复用。
+    /// 信号线台：右上 LED 序列区（`NN-NN-NN-NN`）。
+    ///
+    /// **保留仅为向后兼容**：信号线台已改为每帧自适应定位（`delta_scene::locate`），
+    /// 本字段不再参与执行。实测旋钮/面板/LED 会随视角漂动，固定百分比必然时而全落空。
     pub line_led_region: PctRect,
-    /// 信号线台：深蓝面板区。
+    /// 信号线台：深蓝面板区。**保留仅为向后兼容**（已改自适应定位，不再被读取）。
     pub line_panel_region: PctRect,
-    /// 信号线台：4 列旋钮的 x 百分比（相对显示器宽）。
+    /// 信号线台：4 列的 x 百分比。**保留仅为向后兼容**（已改自适应定位，不再被读取）。
     pub line_col_x: Vec<f32>,
-    /// 信号线台：4 行标签的 y 百分比（相对显示器高）。
+    /// 信号线台：4 行标签的 y 百分比。**保留仅为向后兼容**（已改自适应定位，不再被读取）。
     pub line_row_y: Vec<f32>,
-    /// 信号线台：红色旋钮中心。
+    /// 信号线台：红色旋钮中心。**保留仅为向后兼容**（已改自适应定位，不再被读取）。
     pub line_knob_center: PctPoint,
     /// 单次任务最大实时抓帧时长上限（默认 15_000ms）。
     pub max_duration_ms: u64,
