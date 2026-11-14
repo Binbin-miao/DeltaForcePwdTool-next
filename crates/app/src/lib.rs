@@ -32,6 +32,16 @@ pub fn images_dir() -> PathBuf {
     }
 }
 
+/// 任务留证目录（`exe 同级 / logs`）。
+///
+/// **必须是 exe 同级**，不能用相对路径 `logs`：双击启动时进程 cwd 可能是
+/// `C://Windows//System32`，写进去的文件用户永远找不到，等于没留证。
+pub fn logs_dir() -> PathBuf {
+    let dir = exe_dir().join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// 失败留证目录（spec D10：失败必留证）。
 pub fn evidence_dir() -> PathBuf {
     let dir = exe_dir().join("evidence");

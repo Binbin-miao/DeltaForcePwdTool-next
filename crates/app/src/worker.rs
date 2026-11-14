@@ -803,11 +803,8 @@ fn save_evidence(
     backend: CaptureBackend,
     detail: &str,
 ) {
-    let dir = std::path::Path::new("logs");
-    if let Err(error) = std::fs::create_dir_all(dir) {
-        eprintln!("[console] 日志目录创建失败：{error}");
-        return;
-    }
+    // exe 同级目录（不能用相对路径：双击启动时 cwd 可能是 System32，用户找不到文件）。
+    let dir = crate::logs_dir();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
@@ -831,7 +828,7 @@ fn save_evidence(
     if let Err(error) = std::fs::write(base.with_extension("txt"), text) {
         eprintln!("[console] 日志保存失败：{error}");
     }
-    prune_evidence(dir);
+    prune_evidence(&dir);
 }
 
 /// 证据保留组数（每组 png + txt）。超过就删最旧的，避免自测一晚上攒出几个 G。
