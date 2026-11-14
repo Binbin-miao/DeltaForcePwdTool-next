@@ -40,7 +40,7 @@ const SETTLE_MS: u64 = 500;
 const DRAG_STEPS: i32 = 8;
 /// 单列最多拖几次；到次数仍未到位就记 `dead`，不再碰它。
 const MAX_ATTEMPTS: u32 = 3;
-/// 拖完复读后允许**补拖**的次数（spec B17：最多 1 次，仍偏就记 failed）。
+/// 拖完复读后允许**补拖**的次数（spec B20：最多 1 次，仍偏就记 failed）。
 const MAX_CORRECTIONS: u32 = 1;
 /// 定位失败时给用户的下一步动作。
 const POSE_HINT: &str = "（请正对操作台、让屏幕和红旋钮都进入画面）";
@@ -491,7 +491,7 @@ impl Progress {
             self.dead[column] = true;
             return self.on_column_dead(pointer.event_count());
         }
-        // 拖后复读（B17）：复读发现**仍然偏**就补拖，但**只补一次**；补完还偏就记 failed。
+        // 拖后复读（B20）：复读发现**仍然偏**就补拖，但**只补一次**；补完还偏就记 failed。
         // 每列最多 2 次拖动（1 主 + 1 补），因此不存在来回抖动的可能。
         let dragged_before = self.attempts[column] > 0;
         if dragged_before && self.corrections[column] >= MAX_CORRECTIONS {
@@ -1022,7 +1022,7 @@ mod tests {
         assert_eq!(
             game.begin_points.len(),
             (1 + MAX_CORRECTIONS as usize) * LINE_COLUMNS,
-            "每列 1 次主拖 + 最多 {MAX_CORRECTIONS} 次补拖就放弃（B17：不许无限重试）"
+            "每列 1 次主拖 + 最多 {MAX_CORRECTIONS} 次补拖就放弃（B20：不许无限重试）"
         );
         assert!(reason_of(&outcome).contains("4 列都没能对齐"), "{outcome:?}");
     }
