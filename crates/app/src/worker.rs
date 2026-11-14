@@ -326,8 +326,13 @@ fn probe(config: &Arc<Mutex<Config>>, monitor: MonitorInfo, tx: &mpsc::Sender<Ui
         Ok(frame) => {
             let verdict = delta_scene::detect(&frame, &view);
             let scene = map_scene(verdict.scene);
-            let sequence = if scene == SceneKind::Console {
-                read_sequence(&mut session, &view)
+            let az3 = if scene == SceneKind::Console {
+                delta_scene::az3_variant(&frame, &view)
+            } else {
+                delta_scene::Az3Kind::None
+            };
+            let sequence = if scene == SceneKind::Console && reads_led_sequence(az3) {
+                read_sequence(&mut session, led_region_for(&view, az3))
                     .ok()
                     .map(|raw| delta_ui::format_sequence(&raw))
             } else {
@@ -389,21 +394,46 @@ fn run_once(
             return;
         }
     };
-    // 强制模式（上游 F5/F6 的等价物）：跳过判别直接用指定场景，
-    // 用于自动判别不准时人工兜底。自动模式下判别为 Unknown 立即拒绝，零输入。
-    let (scene, actionable, reason) = match forced {
-        Some(kind) => (kind, true, ""),
+    // 强制模式（上游 F5/F6 的等价物）：跳过判别直接用指定场景。
+    // Console 有两条实现路径（v5 旧操作台 / AZ3 4 类玩法），所以必须先问 AZ3：
+    // 命中才走 `run_az3`，未命中一律留给旧 `run_console` —— 否则旧操作台会被 AZ3 顶掉。
+    // 自动模式下若常规判别为 Unknown，再进一步检查是否为 AZ3 4 类玩法之一；
+    // 仍为 Az3Kind::None 时立即拒绝，零输入（spec D6）。
+    let (scene, az3_kind, actionable, reason) = match forced {
+        Some(SceneKind::Console) => (
+            SceneKind::Console,
+            delta_scene::az3_variant(&frame, &view),
+            true,
+            "",
+        ),
+        Some(kind) => (kind, delta_scene::Az3Kind::None, true, ""),
         None => {
             let verdict = delta_scene::detect(&frame, &view);
-            (
-                map_scene(verdict.scene),
-                verdict.is_actionable(),
-                verdict.reason,
-            )
+            if verdict.is_actionable() {
+                let mapped = map_scene(verdict.scene);
+                let az3 = if mapped == SceneKind::Console {
+                    delta_scene::az3_variant(&frame, &view)
+                } else {
+                    delta_scene::Az3Kind::None
+                };
+                (mapped, az3, true, verdict.reason)
+            } else {
+                let az3 = delta_scene::az3_variant(&frame, &view);
+                if az3.is_known() {
+                    (SceneKind::Console, az3, true, "检测到 AZ3 操作台界面")
+                } else {
+                    (
+                        SceneKind::Unknown,
+                        delta_scene::Az3Kind::None,
+                        false,
+                        verdict.reason,
+                    )
+                }
+            }
         }
     };
-    let sequence = if scene == SceneKind::Console {
-        read_sequence(&mut session, &view)
+    let sequence = if scene == SceneKind::Console && reads_led_sequence(az3_kind) {
+        read_sequence(&mut session, led_region_for(&view, az3_kind))
             .ok()
             .map(|raw| delta_ui::format_sequence(&raw))
     } else {
@@ -424,7 +454,17 @@ fn run_once(
     match scene {
         SceneKind::Morse => run_morse(&snapshot, &view, &mut session, tx),
         SceneKind::Fingerprint => run_fingerprint(&snapshot, &view, &mut session, tx),
-        SceneKind::Console => run_console(&snapshot, &view, &mut session, monitor, tx),
+        SceneKind::Console => {
+            if az3_kind.is_known() {
+                // AZ3 实时抓帧上限 300 帧 / 15s（仅任务期存在，结束即 Drop；空闲期零抓帧）。
+                drop(session);
+                run_az3(&snapshot, &view, az3_kind, monitor, cancel, tx);
+            } else {
+                // 旧操作台复用当前会话（配额与留证逻辑都在 `run_console` 内），
+                // 会话随本函数出口 Drop。
+                run_console(&snapshot, &view, &mut session, monitor, tx);
+            }
+        }
         SceneKind::Unknown => {
             let _ = tx.send(UiEvent::Rejected("检查游戏".to_owned()));
         }
@@ -441,10 +481,28 @@ fn map_scene(scene: delta_scene::Scene) -> SceneKind {
     }
 }
 
+/// 该分支是否需要读 LED 目标序列：只有信号线台与 v5 旧操作台有 LED 读数区。
+///
+/// 大保险 / 任务保险 / 黄键台没有 LED，多抓一帧只是白烧配额。
+fn reads_led_sequence(az3: delta_scene::Az3Kind) -> bool {
+    matches!(
+        az3,
+        delta_scene::Az3Kind::SignalLine | delta_scene::Az3Kind::None
+    )
+}
+
+/// LED 读数区：AZ3 信号线台有自己的位置，旧操作台用 v5 的，不能混用。
+fn led_region_for(view: &PxView, az3: delta_scene::Az3Kind) -> PxRect {
+    match az3 {
+        delta_scene::Az3Kind::SignalLine => view.az3.line_led_region,
+        _ => view.console.led_region,
+    }
+}
+
 /// 读操作台 LED 目标序列（只读，不发输入）；走任务会话，因此计入配额。
-fn read_sequence(session: &mut CaptureSession, view: &PxView) -> Result<String, String> {
+fn read_sequence(session: &mut CaptureSession, led_region: PxRect) -> Result<String, String> {
     let frame = session
-        .grab(view.console.led_region)
+        .grab(led_region)
         .map_err(|error| error.to_string())?;
     delta_vision::read_glyph_string(&frame.luma()).map_err(|error| error.to_string())
 }
@@ -552,6 +610,59 @@ fn run_fingerprint(
         }
         Err(failure) => {
             let _ = tx.send(UiEvent::Failed(failure.detail.clone()));
+        }
+    }
+}
+
+/// AZ3 统一闭环入口（使用 `CaptureSession::with_budget` 300 帧 / 15s 预算）。
+fn run_az3(
+    config: &Config,
+    view: &PxView,
+    kind: delta_scene::Az3Kind,
+    monitor: MonitorInfo,
+    cancel: &AtomicBool,
+    tx: &mpsc::Sender<UiEvent>,
+) {
+    let budget = view.az3.frame_budget.max(delta_flow_az3::AZ3_FRAME_BUDGET);
+    let mut session = match CaptureSession::with_budget(config.capture_backend, budget) {
+        Ok(s) => s,
+        Err(error) => {
+            let _ = tx.send(UiEvent::Failed(error.to_string()));
+            return;
+        }
+    };
+    let outcome = if kind == delta_scene::Az3Kind::SignalLine {
+        delta_flow_az3::line::run(config, view, &mut session)
+    } else {
+        let mut pointer = delta_flow_az3::SystemPointer::new();
+        let mut clock = delta_flow_az3::SystemClock::new();
+        let mut screen = delta_flow_az3::SystemScreen::new(&mut session);
+        delta_flow_az3::run(kind, &mut screen, &mut pointer, &mut clock, &view.az3, cancel)
+    };
+    if session.frames_taken() >= session.budget() {
+        let detail = format!("已抓帧数: {}（上限 {}）", session.frames_taken(), session.budget());
+        save_failure_evidence("AZ3 截图次数超限", monitor, config.capture_backend, &detail);
+        let _ = tx.send(UiEvent::Failed("截图次数超限".to_owned()));
+        return;
+    }
+    match outcome {
+        delta_flow_az3::Az3Outcome::Done { kind, steps, summary, .. } => {
+            let _ = tx.send(UiEvent::Progress {
+                done: steps,
+                total: steps.max(1),
+                note: summary.clone(),
+            });
+            let _ = tx.send(UiEvent::Result(delta_ui::az3_result(kind.label(), &summary)));
+            let _ = tx.send(UiEvent::Succeeded(format!("{} · 已完成", kind.label())));
+        }
+        delta_flow_az3::Az3Outcome::Aborted { kind, reason, events } => {
+            save_failure_evidence(
+                &reason,
+                monitor,
+                config.capture_backend,
+                &format!("AZ3类型: {}, 已发输入事件: {events}", kind.label()),
+            );
+            let _ = tx.send(UiEvent::Failed(reason));
         }
     }
 }
@@ -779,5 +890,65 @@ mod tests {
             h: 60,
         });
         assert_eq!((center.x, center.y), (30, 50));
+    }
+
+    /// 两个 LED 区可区分的最小视图：旧操作台 LED 在 (869,113)，AZ3 在 (809,175)。
+    fn led_view() -> PxView {
+        PxView {
+            monitor: MonitorInfo::new(1280, 720).expect("合法显示器"),
+            regions: Vec::new(),
+            fingerprint: delta_config::PxFingerprint {
+                name_region: PxRect::ZERO,
+                number_region: PxRect::ZERO,
+                candidate_boxes: Vec::new(),
+            },
+            console: delta_config::PxConsole {
+                led_region: PxRect {
+                    x: 869,
+                    y: 113,
+                    w: 378,
+                    h: 47,
+                },
+                panel_region: PxRect::ZERO,
+                col_x: Vec::new(),
+                row_y: Vec::new(),
+                knob_center: PxPoint::ZERO,
+            },
+            az3: delta_config::PxAz3 {
+                line_led_region: PxRect {
+                    x: 809,
+                    y: 175,
+                    w: 288,
+                    h: 54,
+                },
+                ..delta_config::PxAz3::default()
+            },
+            confirm_clicks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn led_sequence_is_read_only_for_signal_line_and_legacy_console() {
+        // 大保险/任务保险/黄键台没有 LED 区，读它等于白烧一张截图配额。
+        assert!(reads_led_sequence(delta_scene::Az3Kind::SignalLine));
+        assert!(reads_led_sequence(delta_scene::Az3Kind::None));
+        assert!(!reads_led_sequence(delta_scene::Az3Kind::SafeTiming));
+        assert!(!reads_led_sequence(delta_scene::Az3Kind::SafePins));
+        assert!(!reads_led_sequence(delta_scene::Az3Kind::ModuleKeys));
+    }
+
+    #[test]
+    fn led_region_follows_the_route_instead_of_the_v5_default() {
+        let view = led_view();
+        assert_eq!(
+            led_region_for(&view, delta_scene::Az3Kind::SignalLine),
+            view.az3.line_led_region,
+            "AZ3 信号线台必须读自己的 LED 区"
+        );
+        assert_eq!(
+            led_region_for(&view, delta_scene::Az3Kind::None),
+            view.console.led_region,
+            "旧操作台必须读 v5 的 LED 区"
+        );
     }
 }

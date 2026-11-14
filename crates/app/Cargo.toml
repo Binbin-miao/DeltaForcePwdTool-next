@@ -27,6 +27,7 @@ delta-scene = { path = "../scene" }
 delta-flow-morse = { path = "../flow-morse" }
 delta-flow-fingerprint = { path = "../flow-fingerprint" }
 delta-flow-console = { path = "../flow-console" }
+delta-flow-az3 = { path = "../flow-az3" }
 # 补录指纹模板要把九格写成 PNG（与模板库解码同一套 png 0.17）。
 png = { workspace = true }
 # spec D1：glow 后端（禁 wgpu）。

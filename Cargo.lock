@@ -301,6 +301,7 @@ version = "0.1.0"
 dependencies = [
  "delta-capture",
  "delta-config",
+ "delta-flow-az3",
  "delta-flow-console",
  "delta-flow-fingerprint",
  "delta-flow-morse",
@@ -337,6 +338,19 @@ dependencies = [
  "delta-geom",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "delta-flow-az3"
+version = "0.1.0"
+dependencies = [
+ "delta-capture",
+ "delta-config",
+ "delta-flow-console",
+ "delta-geom",
+ "delta-input",
+ "delta-scene",
  "thiserror 1.0.69",
 ]
 

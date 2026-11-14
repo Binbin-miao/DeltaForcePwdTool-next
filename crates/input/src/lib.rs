@@ -17,7 +17,10 @@ pub use inject::{
     event_count, plan_click_events, plan_digit_events, reset_event_count, split_steps, Injected,
     RecordHandle, CLICK_GAP, CLICK_HOLD, INJECTION_TAG, MAX_SUBSTEP_PX, SUBSTEP_DELAY,
 };
-pub use key::{key_digit, key_digits, plan_key_digits, scancode_for_digit};
+pub use key::{
+    key_digit, key_digits, key_space, plan_key_digits, plan_key_space, scancode_for_digit,
+    SPACE_SCANCODE,
+};
 
 use delta_geom::PxPoint;
 use thiserror::Error;

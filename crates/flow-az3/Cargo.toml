@@ -1,0 +1,15 @@
+[package]
+name = "delta-flow-az3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+delta-capture.workspace = true
+delta-config.workspace = true
+delta-geom.workspace = true
+delta-input.workspace = true
+delta-scene = { path = "../scene" }
+delta-flow-console = { path = "../flow-console" }
+thiserror.workspace = true

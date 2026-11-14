@@ -647,6 +647,7 @@ mod tests {
                 row_y: Vec::new(),
                 knob_center: PxPoint { x: 0, y: 0 },
             },
+            az3: delta_config::PxAz3::default(),
             confirm_clicks: confirm,
         }
     }

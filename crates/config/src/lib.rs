@@ -142,6 +142,8 @@ pub struct Config {
     pub fingerprint: FingerprintConfig,
     /// 操作台面板区域。
     pub console: ConsoleConfig,
+    /// AZ3 骇入电脑 4 类小游戏区域与预算配置。
+    pub az3: Az3Config,
     /// 确认按钮点击点（spec §2.2 不变量 4：空数组 = 跳过确认点击）。
     pub confirm_clicks: Vec<PctPoint>,
     /// 热键绑定（spec D6：默认单键 F8 / `MOD_NOREPEAT`）。
@@ -201,6 +203,7 @@ impl Default for Config {
             regions: default_regions(),
             fingerprint: FingerprintConfig::default(),
             console: ConsoleConfig::default(),
+            az3: Az3Config::default(),
             confirm_clicks: Vec::new(),
             hotkeys: Hotkeys::default(),
             timings: Timings::default(),
@@ -271,6 +274,36 @@ impl Config {
                 col_x,
                 row_y,
                 knob_center: self.console.knob_center.to_px(monitor)?,
+            },
+            az3: PxAz3 {
+                grid_region: px_rect(self.az3.grid_region, monitor)?,
+                target_band: px_rect(self.az3.target_band, monitor)?,
+                crack_button: px_rect(self.az3.crack_button, monitor)?,
+                timing_window_px: ((self.az3.timing_window_pct * monitor.w as f32).round() as i32).max(2),
+                track_band: px_rect(self.az3.track_band, monitor)?,
+                indicator_band: px_rect(self.az3.indicator_band, monitor)?,
+                pin_center_x: self.az3.pin_center_x.iter().map(|v| pct_axis_to_px(*v, monitor.w)).collect::<Result<Vec<_>, ConfigError>>()?,
+                pin_tolerance_px: ((self.az3.pin_tolerance_pct * monitor.w as f32).round() as i32).max(2),
+                button_grid_region: px_rect(self.az3.button_grid_region, monitor)?,
+                progress_region: px_rect(self.az3.progress_region, monitor)?,
+                line_led_region: px_rect(self.az3.line_led_region, monitor)?,
+                line_panel_region: px_rect(self.az3.line_panel_region, monitor)?,
+                line_col_x: self
+                    .az3
+                    .line_col_x
+                    .iter()
+                    .map(|value| pct_axis_to_px(*value, monitor.w))
+                    .collect::<Result<Vec<_>, ConfigError>>()?,
+                line_row_y: self
+                    .az3
+                    .line_row_y
+                    .iter()
+                    .map(|value| pct_axis_to_px(*value, monitor.h))
+                    .collect::<Result<Vec<_>, ConfigError>>()?,
+                line_knob_center: self.az3.line_knob_center.to_px(monitor)?,
+                max_duration_ms: self.az3.max_duration_ms,
+                frame_budget: self.az3.frame_budget,
+                poll_interval_ms: self.az3.poll_interval_ms,
             },
             // 自动确认开 + 配置里没写坐标 → 用内置坐标（开箱即用）；
             // 自动确认关 → 一律空数组（spec 不变量 4 的「空 = 跳过」）。
@@ -420,6 +453,73 @@ impl Default for FingerprintConfig {
     }
 }
 
+/// AZ3 骇入电脑 4 类小游戏配置（百分比坐标，1280×720 实测默认值）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Az3Config {
+    /// 大保险：5×5 字符矩阵区域。
+    pub grid_region: PctRect,
+    /// 大保险：高亮目标行带。
+    pub target_band: PctRect,
+    /// 大保险：右侧绿色「破解成功」圆钮区域。
+    pub crack_button: PctRect,
+    /// 大保险：光标命中中心容差（相对屏幕宽百分比）。
+    pub timing_window_pct: f32,
+    /// 任务保险：5 个竖向游标滑槽带。
+    pub track_band: PctRect,
+    /// 任务保险：底部 5 个绿色锁定指示条带。
+    pub indicator_band: PctRect,
+    /// 任务保险：5 槽中心 x 百分比。
+    pub pin_center_x: Vec<f32>,
+    /// 任务保险：游标命中中心容差（相对屏幕宽百分比）。
+    pub pin_tolerance_pct: f32,
+    /// 黄键台：右侧 4×4 按键网格区域。
+    pub button_grid_region: PctRect,
+    /// 黄键台：左侧屏幕底部 5 个进度勾选框区域。
+    pub progress_region: PctRect,
+    /// 信号线台：右上 LED 序列区（`NN-NN-NN-NN`）——与旧操作台的 LED 位置不同，不能复用。
+    pub line_led_region: PctRect,
+    /// 信号线台：深蓝面板区。
+    pub line_panel_region: PctRect,
+    /// 信号线台：4 列旋钮的 x 百分比（相对显示器宽）。
+    pub line_col_x: Vec<f32>,
+    /// 信号线台：4 行标签的 y 百分比（相对显示器高）。
+    pub line_row_y: Vec<f32>,
+    /// 信号线台：红色旋钮中心。
+    pub line_knob_center: PctPoint,
+    /// 单次任务最大实时抓帧时长上限（默认 15_000ms）。
+    pub max_duration_ms: u64,
+    /// 单次任务实时抓帧配额上限（默认 300 帧 ≈ 15s @ 20fps）。
+    pub frame_budget: u32,
+    /// 实时轮询间隔（默认 50ms ≈ 20fps）。
+    pub poll_interval_ms: u64,
+}
+
+impl Default for Az3Config {
+    fn default() -> Self {
+        Self {
+            grid_region: builtin::AZ3_GRID_REGION,
+            target_band: builtin::AZ3_TARGET_BAND,
+            crack_button: builtin::AZ3_CRACK_BUTTON,
+            timing_window_pct: 0.018,
+            track_band: builtin::AZ3_TRACK_BAND,
+            indicator_band: builtin::AZ3_INDICATOR_BAND,
+            pin_center_x: builtin::AZ3_PIN_CENTER_X.to_vec(),
+            pin_tolerance_pct: 0.012,
+            button_grid_region: builtin::AZ3_BUTTON_GRID_REGION,
+            progress_region: builtin::AZ3_PROGRESS_REGION,
+            line_led_region: builtin::AZ3_LINE_LED_REGION,
+            line_panel_region: builtin::AZ3_LINE_PANEL_REGION,
+            line_col_x: builtin::AZ3_LINE_COL_X.to_vec(),
+            line_row_y: builtin::AZ3_LINE_ROW_Y.to_vec(),
+            line_knob_center: builtin::AZ3_LINE_KNOB_CENTER,
+            max_duration_ms: 15_000,
+            frame_budget: 300,
+            poll_interval_ms: 50,
+        }
+    }
+}
+
 /// 操作台面板区域（spec D7 / §2.3）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -527,6 +627,33 @@ pub mod builtin {
     pub const ROW_Y: [f32; CONSOLE_ROWS] = [0.283333, 0.384722, 0.486111, 0.588889];
     /// 旋钮中心：录屏帧实测约 (719, 331)/(1280×720)。
     pub const KNOB_CENTER: PctPoint = point(0.561719, 0.459722);
+
+    /// AZ3 大保险：5×5 字符矩阵区域（1280×720 实测）。
+    pub const AZ3_GRID_REGION: PctRect = rect(0.215, 0.330, 0.310, 0.300);
+    /// AZ3 大保险：高亮目标行带（1280×720 实测：x 0.225–0.515、y 0.455–0.548，留上下余量）。
+    pub const AZ3_TARGET_BAND: PctRect = rect(0.225, 0.440, 0.290, 0.120);
+    /// AZ3 大保险：右侧「破解成功」圆钮（1280×720 实测）。
+    pub const AZ3_CRACK_BUTTON: PctRect = rect(0.600, 0.330, 0.140, 0.240);
+    /// AZ3 任务保险：5 槽横向轨道（1280×720 实测：y 0.225–0.315）。
+    pub const AZ3_TRACK_BAND: PctRect = rect(0.285, 0.215, 0.415, 0.105);
+    /// AZ3 任务保险：底部 5 个绿灯锁定条带（1280×720 实测）。
+    pub const AZ3_INDICATOR_BAND: PctRect = rect(0.285, 0.300, 0.415, 0.120);
+    /// AZ3 任务保险：5 槽中心 x 百分比（1280×720 实测）。
+    pub const AZ3_PIN_CENTER_X: [f32; 5] = [0.325, 0.412, 0.495, 0.577, 0.660];
+    /// AZ3 黄键台：右侧 4×4 按键网格（1280×720 实测：x 0.505–0.705、y 0.275–0.590）。
+    pub const AZ3_BUTTON_GRID_REGION: PctRect = rect(0.500, 0.270, 0.210, 0.325);
+    /// AZ3 黄键台：左侧屏幕底部 5 个进度勾选框（1280×720 实测）。
+    pub const AZ3_PROGRESS_REGION: PctRect = rect(0.262, 0.438, 0.155, 0.125);
+    /// AZ3 信号线台：右上 LED 序列区（1280×720 实测）。
+    pub const AZ3_LINE_LED_REGION: PctRect = rect(0.632, 0.243, 0.225, 0.075);
+    /// AZ3 信号线台：深蓝面板区（1280×720 实测）。
+    pub const AZ3_LINE_PANEL_REGION: PctRect = rect(0.163, 0.255, 0.440, 0.440);
+    /// AZ3 信号线台：4 列旋钮的 x 百分比（1280×720 实测）。
+    pub const AZ3_LINE_COL_X: [f32; CONSOLE_COLUMNS] = [0.265, 0.363, 0.468, 0.545];
+    /// AZ3 信号线台：4 行标签的 y 百分比（1280×720 实测）。
+    pub const AZ3_LINE_ROW_Y: [f32; CONSOLE_ROWS] = [0.345, 0.405, 0.472, 0.540];
+    /// AZ3 信号线台：红色旋钮中心（1280×720 实测）。
+    pub const AZ3_LINE_KNOB_CENTER: PctPoint = point(0.735, 0.565);
 
     /// 摩斯三区条目（名字与校准向导一致，便于逐项覆盖）。
     pub fn regions() -> Vec<RegionEntry> {
@@ -736,7 +863,31 @@ pub struct PxView {
     pub regions: Vec<PxRegion>,
     pub fingerprint: PxFingerprint,
     pub console: PxConsole,
+    pub az3: PxAz3,
     pub confirm_clicks: Vec<PxPoint>,
+}
+
+/// AZ3 4 类小游戏的像素视图（只读，不落盘）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PxAz3 {
+    pub grid_region: PxRect,
+    pub target_band: PxRect,
+    pub crack_button: PxRect,
+    pub timing_window_px: i32,
+    pub track_band: PxRect,
+    pub indicator_band: PxRect,
+    pub pin_center_x: Vec<i32>,
+    pub pin_tolerance_px: i32,
+    pub button_grid_region: PxRect,
+    pub progress_region: PxRect,
+    pub line_led_region: PxRect,
+    pub line_panel_region: PxRect,
+    pub line_col_x: Vec<i32>,
+    pub line_row_y: Vec<i32>,
+    pub line_knob_center: PxPoint,
+    pub max_duration_ms: u64,
+    pub frame_budget: u32,
+    pub poll_interval_ms: u64,
 }
 
 /// 具名像素区域。

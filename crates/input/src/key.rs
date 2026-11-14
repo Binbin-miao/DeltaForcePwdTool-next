@@ -1,10 +1,13 @@
-//! 数字键注入（spec §2.2 不变量 5：摩斯流程要敲出已识别到的数字键）。
+//! 数字键与空格键注入（spec §2.2 不变量 5；AZ3 保险箱空格锁定）。
 //!
 //! 用 `KEYEVENTF_SCANCODE` 而不是 VK：游戏按物理键位读输入，VK 注入在 DirectInput
-//! 场景下可能丢失。扫描码表是 PS/2 Set 1（与 `MapVirtualKey` 对 `0..=9` 的输出一致）。
+//! 场景下可能丢失。扫描码表是 PS/2 Set 1（与 `MapVirtualKey` 对 `0..=9` 及空格的输出一致）。
 
 use crate::inject::{plan_digit_events, Injected};
 use crate::InputError;
+
+/// 空格键的 PS/2 Set 1 扫描码。
+pub const SPACE_SCANCODE: u16 = 0x39;
 
 /// 数字字符 → PS/2 Set 1 扫描码。非数字返回 `None`。
 pub fn scancode_for_digit(digit: char) -> Option<u16> {
@@ -40,6 +43,29 @@ pub fn key_digits(digits: &str) -> Result<(), InputError> {
         }
         key_digit(digit)?;
     }
+    Ok(())
+}
+
+/// 规划一次空格键点击（按下 + 抬起，PS/2 Set 1 扫描码 `0x39`）。
+pub fn plan_key_space() -> [Injected; 2] {
+    [
+        Injected::Key {
+            scancode: SPACE_SCANCODE,
+            up: false,
+        },
+        Injected::Key {
+            scancode: SPACE_SCANCODE,
+            up: true,
+        },
+    ]
+}
+
+/// 敲一次空格键（按下 → 短保持 → 抬起），用于 AZ3 大保险与任务保险锁定。
+pub fn key_space() -> Result<(), InputError> {
+    let [down, up] = plan_key_space();
+    crate::inject::inject(&down)?;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    crate::inject::inject(&up)?;
     Ok(())
 }
 
@@ -116,5 +142,35 @@ mod tests {
                 up: true
             }
         );
+    }
+
+    #[test]
+    fn space_plan_emits_down_then_up_with_scancode_0x39() {
+        let events = plan_key_space();
+        assert_eq!(
+            events[0],
+            Injected::Key {
+                scancode: 0x39,
+                up: false
+            }
+        );
+        assert_eq!(
+            events[1],
+            Injected::Key {
+                scancode: 0x39,
+                up: true
+            }
+        );
+        assert_eq!(scancode_for_digit(' '), None, "空格不得混入数字键表");
+    }
+
+    #[test]
+    fn space_plan_repeated_twice_is_consistent() {
+        let mut seq = Vec::new();
+        seq.extend_from_slice(&plan_key_space());
+        seq.extend_from_slice(&plan_key_space());
+        assert_eq!(seq.len(), 4);
+        assert_eq!(seq[0], seq[2]);
+        assert_eq!(seq[1], seq[3]);
     }
 }

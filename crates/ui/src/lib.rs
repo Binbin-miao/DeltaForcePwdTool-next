@@ -9,7 +9,7 @@ pub mod view;
 pub mod wizard;
 
 pub use state::{
-    conflict_copy, console_result, fingerprint_result, format_sequence, morse_result, read_capture,
+    az3_result, conflict_copy, console_result, fingerprint_result, format_sequence, morse_result, read_capture,
     Action, CaptureBackend, CaptureOutcome, CaptureTestResult, GridCell, KeyChord, Phase,
     PrimaryState, Progress, ResultContent, ResultState, SceneKind, ThemeId, UiState, CAPTURABLE,
 };

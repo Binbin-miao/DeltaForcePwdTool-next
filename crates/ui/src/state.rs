@@ -163,6 +163,11 @@ impl ResultContent {
 
 /// 摩斯结果：把连续数字排成 26px 等宽可读的一行（`427` → `4 2 7`），
 /// 标签订正「自动下载开关」的真实后果（spec D2b）。
+/// AZ3 操作台细分玩法结果展示（`操作台 · AZ3 · 大保险/任务保险/黄键台/信号线台`）。
+pub fn az3_result(variant_label: &str, summary: &str) -> ResultContent {
+    ResultContent::new(format!("操作台 · AZ3 · {variant_label}"), summary)
+}
+
 pub fn morse_result(password: &str, auto_download: bool) -> ResultContent {
     let digits: String = password.chars().filter(char::is_ascii_digit).collect();
     let headline = if digits.is_empty() {

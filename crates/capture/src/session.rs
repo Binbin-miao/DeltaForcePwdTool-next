@@ -3,8 +3,9 @@
 //! 生命周期契约：
 //! - 一次识别任务开始（按 F8 / 主按钮）时建 [`CaptureSession`]，任务结束（成功 / 失败 /
 //!   取消 / 超时）时 `Drop` 释放全部采集对象 —— **程序空闲时不得持有任何采集对象**；
-//! - 配额随会话存在：任务开始时为 [`FRAME_BUDGET`] 张，超限的 `grab` 直接报错且**不抓屏**；
-//! - 后端切换由下一次 `CaptureSession::new` 生效，不需要重启程序。
+//! - 配额随会话存在：默认任务开始时为 [`FRAME_BUDGET`] 张，超限的 `grab` 直接报错且**不抓屏**；
+//! - 时序类任务可通过 [`CaptureSession::with_budget`] 指定限时实时配额；
+//! - 后端切换由下一次 `CaptureSession::new` / `with_budget` 生效，不需要重启程序。
 
 use std::fmt;
 
@@ -12,7 +13,7 @@ use delta_geom::PxRect;
 
 use crate::{gdi, wgc, CaptureError, Frame};
 
-/// 单次识别任务的截图硬上限（spec D4）。
+/// 单次识别任务的默认截图硬上限（spec D4）。
 pub const FRAME_BUDGET: u32 = 20;
 
 /// 截图后端（spec D1：用户可选，默认 WGC）。
@@ -59,15 +60,20 @@ enum Backend {
 pub struct CaptureSession {
     backend: Backend,
     kind: CaptureBackend,
+    budget: u32,
     used: u32,
 }
 
 impl CaptureSession {
-    /// 建立会话：`Wgc` 在这里就把设备与采集会话全部拉起，失败**立即**报错而不是以后静默降级。
+    /// 建立默认配额（[`FRAME_BUDGET`] = 20）的采集会话。
     ///
-    /// 形参里没有 `monitor`：当前只支持主显示器（`wgc.rs` 内用
-    /// `MonitorFromPoint((0,0), MONITOR_DEFAULTTOPRIMARY)` 取采集项），**多屏需把 hmonitor 传进来**。
+    /// `Wgc` 在这里就把设备与采集会话全部拉起，失败**立即**报错而不是以后静默降级。
     pub fn new(kind: CaptureBackend) -> Result<Self, CaptureError> {
+        Self::with_budget(kind, FRAME_BUDGET)
+    }
+
+    /// 建立自定义配额的采集会话（供 AZ3 时序类小游戏限时实时抓帧使用）。
+    pub fn with_budget(kind: CaptureBackend, budget: u32) -> Result<Self, CaptureError> {
         let backend = match kind {
             CaptureBackend::BitBlt => Backend::BitBlt,
             CaptureBackend::Wgc => Backend::Wgc(wgc::WgcSession::new()?),
@@ -75,6 +81,7 @@ impl CaptureSession {
         Ok(Self {
             backend,
             kind,
+            budget,
             used: 0,
         })
     }
@@ -84,6 +91,11 @@ impl CaptureSession {
         self.kind
     }
 
+    /// 本会话允许的最大抓帧配额。
+    pub fn budget(&self) -> u32 {
+        self.budget
+    }
+
     /// 已抓取的帧数（供测试与「超限只报一次」的日志去重使用）。
     pub fn frames_taken(&self) -> u32 {
         self.used
@@ -91,10 +103,8 @@ impl CaptureSession {
 
     /// 抓取一帧：配额耗尽时**不抓屏**，直接返回 [`CaptureError::BudgetExceeded`]。
     pub fn grab(&mut self, rect: PxRect) -> Result<Frame, CaptureError> {
-        if self.used >= FRAME_BUDGET {
-            return Err(CaptureError::BudgetExceeded {
-                limit: FRAME_BUDGET,
-            });
+        if self.used >= self.budget {
+            return Err(CaptureError::BudgetExceeded { limit: self.budget });
         }
         self.used = self.used.saturating_add(1);
         match &mut self.backend {
@@ -129,6 +139,7 @@ mod tests {
     fn the_twenty_first_grab_is_rejected_by_the_budget() {
         let mut session =
             CaptureSession::new(CaptureBackend::BitBlt).expect("BitBlt 会话可建");
+        assert_eq!(session.budget(), FRAME_BUDGET);
         for round in 0..FRAME_BUDGET {
             session
                 .grab(tiny_rect())
@@ -149,6 +160,19 @@ mod tests {
         // 超限的调用不抓屏、也不推进计数。
         assert_eq!(session.frames_taken(), FRAME_BUDGET);
         assert!(error.to_string().contains("配额"), "{error}");
+    }
+
+    #[test]
+    fn with_budget_enforces_custom_limit() {
+        let mut session =
+            CaptureSession::with_budget(CaptureBackend::BitBlt, 3).expect("BitBlt 会话可建");
+        assert_eq!(session.budget(), 3);
+        for _ in 0..3 {
+            session.grab(tiny_rect()).expect("配额内应成功");
+        }
+        let error = session.grab(tiny_rect()).expect_err("第 4 次必须超限");
+        assert!(matches!(error, CaptureError::BudgetExceeded { limit: 3 }));
+        assert_eq!(session.frames_taken(), 3);
     }
 
     #[test]
