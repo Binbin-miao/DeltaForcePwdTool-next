@@ -609,6 +609,14 @@ pub struct UiState {
     pub morse_auto_download: bool,
     /// F 键监听总开关（spec D3 边界 3）：关 = 卸载钩子，F 键完全不受本程序影响。
     pub f_key_hook: bool,
+    /// 识别总开关：关 = 任何热键（F/F5/F6/F7/F8）都不再触发识别，连截图都不抓。
+    pub master_enabled: bool,
+    /// 三个强制入口的热键名（设置页逐行可改；全局热键用 [`Self::hotkey`]）。
+    pub hotkey_morse: String,
+    pub hotkey_fingerprint: String,
+    pub hotkey_console: String,
+    /// 正在捕获的槽位（只在 `hotkey_editing` 为真时有效）。
+    pub hotkey_slot: delta_config::HotkeySlot,
     /// 游戏前台窗口标题关键词（spec D3 边界 5；设置页可增删）。
     ///
     /// 默认值直接取自 `delta_config`，两份默认值不允许各写一遍（否则一改就漂）。
@@ -730,6 +738,11 @@ impl Default for UiState {
             fingerprint_auto_click: true,
             morse_auto_download: true,
             f_key_hook: true,
+            master_enabled: true,
+            hotkey_morse: "F5".to_owned(),
+            hotkey_fingerprint: "F6".to_owned(),
+            hotkey_console: "F7".to_owned(),
+            hotkey_slot: delta_config::HotkeySlot::Scene,
             game_title_keywords: keywords.clone(),
             keywords_buffer: keywords.join(", "),
             theme_id: ThemeId::default(),
@@ -741,6 +754,16 @@ impl Default for UiState {
 }
 
 impl UiState {
+    /// 按槽位写热键显示名（只由热键线程的成功回执调用）。
+    pub fn set_hotkey_name(&mut self, slot: delta_config::HotkeySlot, name: String) {
+        match slot {
+            delta_config::HotkeySlot::Scene => self.hotkey = name,
+            delta_config::HotkeySlot::Morse => self.hotkey_morse = name,
+            delta_config::HotkeySlot::Fingerprint => self.hotkey_fingerprint = name,
+            delta_config::HotkeySlot::Console => self.hotkey_console = name,
+        }
+    }
+
     /// 是否已校准（`validate()` 为空）。
     pub fn is_calibrated(&self) -> bool {
         self.missing.is_empty()

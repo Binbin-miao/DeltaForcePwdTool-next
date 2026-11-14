@@ -175,6 +175,13 @@ pub struct Config {
     /// 关掉 = 卸载钩子，F 键完全不受本程序影响。**绝不**在关闭后回退成
     /// `RegisterHotKey("F")` —— 那是全局独占，会把游戏的 F 交互键吞掉（D3 边界 4）。
     pub f_key_hook_enabled: bool,
+    /// 识别总开关（默认 **开**）。
+    ///
+    /// 关掉之后**任何**热键（F / F5 / F6 / F7 / F8）按下都不再触发识别，
+    /// 连截图都不抓 —— 用于「现在不想让它动」的场合（对枪、跑图、看录像）。
+    /// 与 `f_key_hook_enabled` 的区别：那个只管 F 键钩子，这个管全部入口。
+    #[serde(default = "default_true")]
+    pub master_enabled: bool,
     /// 前台窗口标题命中这些关键词才响应 F 键（spec D3 边界 5）。
     ///
     /// 默认 `["三角洲", "Delta Force"]`；匹配规则是**大小写不敏感的子串包含**。
@@ -196,6 +203,11 @@ pub struct Config {
     pub runtime_monitor: MonitorInfo,
 }
 
+/// serde 默认值：字段缺失时按「开」处理（旧配置升级不该把功能关掉）。
+fn default_true() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -213,6 +225,7 @@ impl Default for Config {
             capture_backend: CaptureBackend::Wgc,
             always_on_top: false,
             f_key_hook_enabled: true,
+            master_enabled: true,
             game_title_keywords: default_game_title_keywords(),
             theme_id: ThemeId::default(),
             accent_override: None,
@@ -474,8 +487,13 @@ pub struct Az3Config {
     /// 任务保险：游标命中中心容差（相对屏幕宽百分比）。
     pub pin_tolerance_pct: f32,
     /// 黄键台：右侧 4×4 按键网格区域。
+    ///
+    /// **保留仅为向后兼容**：黄键台已改为每帧自适应定位（`delta_scene::locate::locate_keys`），
+    /// 本字段不再参与判别与执行。实测换一版界面布局，这个固定矩形就整体偏出去，
+    /// 四等分切出来的格子会落在键缝里（点空）。
     pub button_grid_region: PctRect,
     /// 黄键台：左侧屏幕底部 5 个进度勾选框区域。
+    /// **保留仅为向后兼容**（已改自适应定位，不再被读取）。
     pub progress_region: PctRect,
     /// 信号线台：右上 LED 序列区（`NN-NN-NN-NN`）。
     ///
@@ -563,6 +581,66 @@ pub struct Hotkeys {
     pub fingerprint: String,
     /// 强制跑操作台。
     pub console: String,
+}
+
+/// 四个可独立改键的槽位（设置页逐个可点）。
+///
+/// 与 [`Hotkeys`] 的字段一一对应；`Scene` 是「一键识别」，其余三个是强制入口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HotkeySlot {
+    /// 一键识别（自动判别场景）。
+    Scene,
+    /// 强制摩斯。
+    Morse,
+    /// 强制指纹。
+    Fingerprint,
+    /// 强制操作台。
+    Console,
+}
+
+impl HotkeySlot {
+    /// 按设置页显示顺序排列。
+    pub const ALL: [Self; 4] = [Self::Scene, Self::Morse, Self::Fingerprint, Self::Console];
+
+    /// 数组下标（`ALL` 的位置）。
+    pub fn index(self) -> usize {
+        match self {
+            Self::Scene => 0,
+            Self::Morse => 1,
+            Self::Fingerprint => 2,
+            Self::Console => 3,
+        }
+    }
+
+    /// 设置页左侧标题。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Scene => "全局热键",
+            Self::Morse => "摩斯热键",
+            Self::Fingerprint => "指纹热键",
+            Self::Console => "操作台热键",
+        }
+    }
+
+    /// 读当前键名。
+    pub fn read(self, keys: &Hotkeys) -> &str {
+        match self {
+            Self::Scene => &keys.scene,
+            Self::Morse => &keys.morse,
+            Self::Fingerprint => &keys.fingerprint,
+            Self::Console => &keys.console,
+        }
+    }
+
+    /// 写回键名。
+    pub fn write(self, keys: &mut Hotkeys, value: String) {
+        match self {
+            Self::Scene => keys.scene = value,
+            Self::Morse => keys.morse = value,
+            Self::Fingerprint => keys.fingerprint = value,
+            Self::Console => keys.console = value,
+        }
+    }
 }
 
 impl Default for Hotkeys {
@@ -881,7 +959,9 @@ pub struct PxAz3 {
     pub indicator_band: PxRect,
     pub pin_center_x: Vec<i32>,
     pub pin_tolerance_px: i32,
+    /// 黄键台 4×4 键阵。**保留仅为向后兼容**（已改自适应定位，不再被读取）。
     pub button_grid_region: PxRect,
+    /// 黄键台进度勾选格。**保留仅为向后兼容**（已改自适应定位，不再被读取）。
     pub progress_region: PxRect,
     pub line_led_region: PxRect,
     pub line_panel_region: PxRect,

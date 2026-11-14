@@ -10,7 +10,7 @@ use std::time::Duration;
 use delta_capture::{CaptureBackend, CaptureSession, Frame, FRAME_BUDGET};
 use delta_config::{Config, PxView, Timings};
 use delta_geom::{MonitorInfo, PxPoint, PxRect};
-use delta_hotkey::{Hotkey, Hotkeys as HotkeyRegistry};
+use delta_hotkey::Hotkey;
 use delta_ui::SceneKind;
 
 use crate::platform;
@@ -44,8 +44,11 @@ pub enum UiEvent {
     /// spec D6：未识别必须拒绝执行，零输入。
     Rejected(String),
     TimedOut(String),
-    /// 改键成功：`state.hotkey` 只在这条回执之后才换成新键。
-    HotkeyApplied(String),
+    /// 改键成功：界面只在这条回执之后才换显示（`slot` 指明是哪一个键）。
+    HotkeyApplied {
+        slot: delta_config::HotkeySlot,
+        name: String,
+    },
     /// 改键失败（spec D2）：`kept = Some(旧键)` 表示旧键已回滚可用；
     /// `kept = None` 表示连旧键都占不到，本会话只剩按钮。
     HotkeyConflict {
@@ -72,7 +75,7 @@ pub struct Worker {
     pub events: mpsc::Receiver<UiEvent>,
     pub commands: mpsc::Sender<Cmd>,
     /// 改键通道：把新热键名送进热键泵线程，实现「改完立刻生效」。
-    hotkey_tx: mpsc::Sender<String>,
+    hotkey_tx: mpsc::Sender<(delta_config::HotkeySlot, String)>,
     shutdown: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
 }
@@ -82,8 +85,9 @@ impl Worker {
     ///
     /// 返回 `false` 表示热键线程已经退出（例如 `Hotkeys::new()` 失败），本次改键不可能生效。
     /// 调用方必须据此当场提示 —— 否则用户会等一个永远不会来的回执（spec D2「不允许静默失败」）。
-    pub fn set_hotkey(&self, name: String) -> bool {
-        self.hotkey_tx.send(name).is_ok()
+    /// 请求改键：只重绑被指定的槽位。
+    pub fn set_hotkey(&self, slot: delta_config::HotkeySlot, name: String) -> bool {
+        self.hotkey_tx.send((slot, name)).is_ok()
     }
 }
 
@@ -102,19 +106,19 @@ impl Worker {
         let cancel = Arc::new(AtomicBool::new(false));
 
         // 四个热键：一键识别（自动判别）+ 三个强制键（对齐上游 F5/F6，另加操作台 F7）。
-        let bindings: Vec<(String, Cmd)> = {
+        // 四个都能在设置里改；改键消息带槽位，泵只重绑被改的那一个。
+        let bindings: Vec<(delta_config::HotkeySlot, String)> = {
             let keys = match config.lock() {
                 Ok(cfg) => cfg.hotkeys.clone(),
                 Err(_) => delta_config::Hotkeys::default(),
             };
-            vec![
-                (keys.scene, Cmd::Trigger),
-                (keys.morse, Cmd::Force(SceneKind::Morse)),
-                (keys.fingerprint, Cmd::Force(SceneKind::Fingerprint)),
-                (keys.console, Cmd::Force(SceneKind::Console)),
-            ]
+            delta_config::HotkeySlot::ALL
+                .iter()
+                .map(|slot| (*slot, slot.read(&keys).to_owned()))
+                .collect()
         };
-        let (hotkey_tx, hotkey_rx) = mpsc::channel::<String>();
+        let (hotkey_tx, hotkey_rx) =
+            mpsc::channel::<(delta_config::HotkeySlot, String)>();
         {
             let trigger = commands.clone();
             let stop = shutdown.clone();
@@ -127,58 +131,47 @@ impl Worker {
                         return;
                     };
                     // 启动读配置是 spec D3 唯一允许回落 F8 的地方，且必须留痕。
-                    let resolved: Vec<(String, Hotkey, Cmd)> = bindings
-                        .iter()
-                        .map(|(name, cmd)| (name.clone(), platform::startup_hotkey(name), *cmd))
-                        .collect();
                     let mut routes: Vec<(u32, Cmd)> = Vec::new();
-                    let mut scene_id: Option<u32> = None;
-                    // 「一键识别」当前真正在案的键名 + 实际注册用的 `Hotkey`。
-                    // 改键失败时靠它回滚（D2），因此不能只记名字、更不能重新解析。
-                    let (mut scene_name, mut scene_key) = resolved
-                        .iter()
-                        .find(|(_, _, cmd)| matches!(cmd, Cmd::Trigger))
-                        .map_or_else(
-                            || (String::new(), Hotkey::default()),
-                            |(name, hotkey, _)| (name.clone(), *hotkey),
-                        );
-                    for (_, hotkey, cmd) in &resolved {
-                        if let Ok(id) = hotkeys.register(*hotkey) {
-                            if matches!(cmd, Cmd::Trigger) {
-                                scene_id = Some(id);
-                            }
-                            routes.push((id, *cmd));
+                    // 每个槽当前在案的 `(注册 id, 实际 Hotkey, 键名)`；改键失败靠它回滚（D2），
+                    // 所以不能只记名字，也不能事后重新解析。
+                    let mut bound: [Option<(u32, Hotkey, String)>; 4] =
+                        [None, None, None, None];
+                    for (slot, name) in &bindings {
+                        let hotkey = platform::startup_hotkey(name);
+                        if let Ok(id) = hotkeys.register(hotkey) {
+                            bound[slot.index()] = Some((id, hotkey, name.clone()));
+                            routes.push((id, cmd_for(*slot)));
                         }
                     }
                     while !stop.load(Ordering::Relaxed) {
-                        // 改键只重绑「一键识别」；其余三键改配置文件后重启生效。
-                        if let Ok(wanted) = hotkey_rx.try_recv() {
-                            if let Some(id) = scene_id.take() {
+                        // 改键：只重绑被改的那一个槽位，其余三个原样不动。
+                        if let Ok((slot, wanted)) = hotkey_rx.try_recv() {
+                            let index = slot.index();
+                            let cmd = cmd_for(slot);
+                            let previous = bound[index].take();
+                            if let Some((id, _, _)) = previous {
                                 let _ = hotkeys.unregister(id);
                                 routes.retain(|(route, _)| *route != id);
                             }
                             // 解析失败只可能是捕获表与解析表漂移，一样按「注册失败」显形。
                             let registered = platform::parse_hotkey(&wanted)
-                                .map_err(|_| ())
-                                .and_then(|hotkey| {
-                                    hotkeys.register(hotkey).map(|id| (id, hotkey)).map_err(|_| ())
-                                });
+                                .ok()
+                                .and_then(|hotkey| hotkeys.register(hotkey).ok().map(|id| (id, hotkey)));
                             match registered {
-                                Ok((id, hotkey)) => {
-                                    scene_id = Some(id);
-                                    routes.push((id, Cmd::Trigger));
-                                    scene_name = wanted.clone();
-                                    scene_key = hotkey;
-                                    let _ = notify.send(UiEvent::HotkeyApplied(wanted));
+                                Some((id, hotkey)) => {
+                                    bound[index] = Some((id, hotkey, wanted.clone()));
+                                    routes.push((id, cmd));
+                                    let _ = notify
+                                        .send(UiEvent::HotkeyApplied { slot, name: wanted });
                                 }
-                                Err(()) => {
-                                    let kept = restore_scene(
-                                        &hotkeys,
-                                        &scene_name,
-                                        scene_key,
-                                        &mut routes,
-                                        &mut scene_id,
-                                    );
+                                None => {
+                                    // 回滚：把这一槽原来的键重新注册回去。
+                                    let kept = previous.and_then(|(_, hotkey, name)| {
+                                        let id = hotkeys.register(hotkey).ok()?;
+                                        routes.push((id, cmd));
+                                        bound[index] = Some((id, hotkey, name.clone()));
+                                        Some(name)
+                                    });
                                     let _ = notify.send(UiEvent::HotkeyConflict { wanted, kept });
                                 }
                             }
@@ -239,23 +232,14 @@ impl Worker {
     }
 }
 
-/// 改键失败后的回滚（spec D2）：把旧键重新注册回去。
-///
-/// 返回界面该显示的「仍为 X」；`None` = 连旧键都占不到（接口被别的程序抢走了）。
-fn restore_scene(
-    hotkeys: &HotkeyRegistry,
-    scene_name: &str,
-    scene_key: Hotkey,
-    routes: &mut Vec<(u32, Cmd)>,
-    scene_id: &mut Option<u32>,
-) -> Option<String> {
-    let Ok(id) = hotkeys.register(scene_key) else {
-        eprintln!("[hotkey] 旧键 {scene_name} 也注册不上，本会话只剩按钮可用");
-        return None;
-    };
-    *scene_id = Some(id);
-    routes.push((id, Cmd::Trigger));
-    Some(scene_name.to_owned())
+/// 槽位 → 该键按下后派发的命令。
+fn cmd_for(slot: delta_config::HotkeySlot) -> Cmd {
+    match slot {
+        delta_config::HotkeySlot::Scene => Cmd::Trigger,
+        delta_config::HotkeySlot::Morse => Cmd::Force(SceneKind::Morse),
+        delta_config::HotkeySlot::Fingerprint => Cmd::Force(SceneKind::Fingerprint),
+        delta_config::HotkeySlot::Console => Cmd::Force(SceneKind::Console),
+    }
 }
 
 /// 取当前配置快照（锁内只做 clone，不做耗时操作）。
@@ -311,6 +295,11 @@ fn open_session(config: &Config, tx: &mpsc::Sender<UiEvent>) -> Option<CaptureSe
 fn probe(config: &Arc<Mutex<Config>>, monitor: MonitorInfo, tx: &mpsc::Sender<UiEvent>) {
     let _ = tx.send(UiEvent::Started);
     let snapshot = snapshot(config);
+    if !snapshot.master_enabled {
+        // 总开关关掉：热键还能按下，但这里直接返回 —— 不截图、不注入、不弹流程。
+        let _ = tx.send(UiEvent::Rejected("识别已暂停（设置里可重新打开）".to_owned()));
+        return;
+    }
     if let Err(reason) = platform::focus_game_window() {
         let _ = tx.send(UiEvent::Rejected(reason));
         return;
@@ -443,6 +432,15 @@ fn run_once(
 
     if !actionable {
         // spec D6 硬约束：拒绝执行，不产生任何输入。
+        // 自测期把「按了热键但没认出界面」也留一份证：否则用户只能说「按了没用」，
+        // 没法区分是钩子压根没触发、还是判成了 Unknown（两种情况修法完全不同）。
+        save_evidence(
+            "reject",
+            &format!("未识别：{reason}"),
+            monitor,
+            snapshot.capture_backend,
+            &format!("场景: {scene:?}, AZ3: {az3_kind:?}"),
+        );
         let _ = tx.send(UiEvent::Rejected(reason.to_owned()));
         return;
     }

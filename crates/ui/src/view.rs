@@ -1115,7 +1115,11 @@ fn backend_label(backend: CaptureBackend) -> &'static str {
 /// 内容高于视口时由 [`settings_panel`] 内部滚动（主界面不允许滚动）。
 #[derive(Debug, Clone, Copy)]
 struct SettingsRows {
+    master: Rect,
     hotkey: Rect,
+    morse: Rect,
+    fingerprint: Rect,
+    console: Rect,
     ocr: Rect,
     theme: Rect,
     accent: Rect,
@@ -1139,7 +1143,11 @@ fn settings_rows(content: Rect, has_result: bool) -> SettingsRows {
         top = rect.bottom() + SETTINGS_GAP;
         rect
     };
+    let master = next(SETTINGS_LINE_H);
     let hotkey = next(SETTINGS_LINE_H);
+    let morse = next(SETTINGS_LINE_H);
+    let fingerprint = next(SETTINGS_LINE_H);
+    let console = next(SETTINGS_LINE_H);
     let ocr = next(SETTINGS_LINE_H);
     let theme_row = next(SETTINGS_LINE_H);
     let accent = next(SETTINGS_LINE_H);
@@ -1154,7 +1162,11 @@ fn settings_rows(content: Rect, has_result: bool) -> SettingsRows {
     };
     let extra = next(extra_height);
     SettingsRows {
+        master,
         hotkey,
+        morse,
+        fingerprint,
+        console,
         ocr,
         theme: theme_row,
         accent,
@@ -1169,9 +1181,9 @@ fn settings_rows(content: Rect, has_result: bool) -> SettingsRows {
 
 /// 设置页滚动区的总高度（含标题留给视口的余量）。
 fn settings_inner_height(has_result: bool) -> f32 {
-    let lines = 5.0 * SETTINGS_LINE_H;
+    let lines = 9.0 * SETTINGS_LINE_H;
     let rows = 2.0 * SETTINGS_ROW_H + if has_result { CAPTURE_RESULT_H } else { SETTINGS_ROW_H };
-    let gaps = 8.0 * SETTINGS_GAP;
+    let gaps = 12.0 * SETTINGS_GAP;
     theme::TITLE_BAR_H + theme::SPACE_S + lines + rows + gaps
 }
 
@@ -1243,7 +1255,15 @@ fn fit_inside(area: Rect, width: u32, height: u32) -> Rect {
 
 /// 设置浮层素材。
 pub struct SettingsView<'a> {
+    /// 识别总开关：关掉后任何热键都不再触发识别。
+    pub master_enabled: bool,
     pub hotkey: &'a str,
+    /// 三个强制入口的热键名（与 `hotkey` 同一套捕获机制）。
+    pub hotkey_morse: &'a str,
+    pub hotkey_fingerprint: &'a str,
+    pub hotkey_console: &'a str,
+    /// 正在捕获的槽位（`hotkey_editing` 为真时才有意义）。
+    pub hotkey_slot: delta_config::HotkeySlot,
     /// 是否正在捕获新热键（捕获态只显示提示，没有任何文本输入框）。
     pub hotkey_editing: bool,
     /// 热键冲突提示文案（`None` = 不显示）。
@@ -1270,8 +1290,10 @@ pub enum SettingsAction {
     /// 只读检查游戏与场景，不产生任何输入。
     Probe,
     ToggleOcr,
-    /// 点热键行 → 进入捕获态。
-    EditHotkey,
+    /// 翻转「识别总开关」。
+    ToggleMaster,
+    /// 点某一行热键 → 进入捕获态（带槽位，四个键各自独立改）。
+    EditHotkey(delta_config::HotkeySlot),
     /// 捕获成功 → 提交这一组键。
     CommitHotkey(KeyChord),
     /// 捕获态下 Esc / 点热键行外 → 只退出捕获，不关面板（D4）。
@@ -1289,6 +1311,67 @@ pub enum SettingsAction {
     /// 提交关键词原文。
     CommitKeywords(String),
     Close,
+}
+
+/// 一行热键：左侧标题、右侧键名。点行进入捕获；正在捕获的那一行显示提示。
+///
+/// 四行共用同一套捕获结算（见 `resolve_capture`），所以这里只负责画与点。
+struct HotkeyRow<'a> {
+    rect: Rect,
+    title: &'a str,
+    key: &'a str,
+    slot: delta_config::HotkeySlot,
+}
+
+fn paint_hotkey_row(
+    ui: &egui::Ui,
+    row: &HotkeyRow<'_>,
+    viewport: Rect,
+    view: &SettingsView<'_>,
+    pal: &Palette,
+) -> Option<SettingsAction> {
+    let rect = row.rect;
+    let painter = ui.painter().clone().with_clip_rect(viewport);
+    paint_panel(&painter, rect, pal);
+    painter.text(
+        rect.left_center() + Vec2::new(theme::SPACE_M, 0.0),
+        Align2::LEFT_CENTER,
+        row.title,
+        pal.text(pal.font_body),
+        pal.text_2,
+    );
+    if view.hotkey_editing && view.hotkey_slot == row.slot {
+        painter.text(
+            rect.left_center() + Vec2::new(rect.width() * 0.45, 0.0),
+            Align2::LEFT_CENTER,
+            "请按下新热键…",
+            pal.text(pal.font_body),
+            pal.accent,
+        );
+        painter.text(
+            rect.right_center() - Vec2::new(theme::SPACE_M, 0.0),
+            Align2::RIGHT_CENTER,
+            "Esc 取消",
+            pal.text(pal.font_label),
+            pal.text_3,
+        );
+        return None;
+    }
+    let id = format!("hotkey-row-{}", row.slot.index());
+    let response = clickable(ui, rect.intersect(viewport), &id, Sense::click());
+    let (label, color) = match (view.hotkey_conflict, response.hovered()) {
+        (Some(text), _) => (text.to_owned(), pal.err),
+        (None, true) => (format!("{} · 点这里改", row.key), pal.accent),
+        (None, false) => (row.key.to_owned(), pal.text_1),
+    };
+    painter.text(
+        rect.right_center() - Vec2::new(theme::SPACE_M, 0.0),
+        Align2::RIGHT_CENTER,
+        label,
+        theme::mono(pal.font_body),
+        color,
+    );
+    response.clicked().then_some(SettingsAction::EditHotkey(row.slot))
 }
 
 /// 捕获态的一帧结算：可捕获键提交、Esc 或点行外取消、其余继续等。
@@ -1370,58 +1453,59 @@ pub fn settings_panel(
     let painter = ui.painter().clone().with_clip_rect(viewport);
     let hit = |rect: Rect| rect.intersect(viewport);
 
-    // ── 全局热键（点一下即可捕获）──────────────────────────────
-    paint_panel(&painter, rows.hotkey, pal);
-    painter.text(
-        rows.hotkey.left_center() + Vec2::new(theme::SPACE_M, 0.0),
-        Align2::LEFT_CENTER,
-        "全局热键",
-        pal.text(pal.font_body),
-        pal.text_2,
-    );
-    // 捕获结算先于既有控件：这一帧的按键/取消不会被按钮点击覆盖掉。
-    if action.is_none() {
-        action = resolve_capture(ui, view.hotkey_editing, hit(rows.hotkey));
+    // ── 识别总开关（关掉后任何热键都不再触发，连截图都不抓）──────
+    if toggle_row(
+        ui,
+        hit(rows.master),
+        if view.master_enabled {
+            "识别总开关 · 开"
+        } else {
+            "识别总开关 · 已暂停"
+        },
+        view.master_enabled,
+        pal,
+    ) {
+        action = Some(SettingsAction::ToggleMaster);
     }
-    if view.hotkey_editing {
-        painter.text(
-            rows.hotkey.left_center() + Vec2::new(content.width() * 0.45, 0.0),
-            Align2::LEFT_CENTER,
-            "请按下新热键…",
-            pal.text(pal.font_body),
-            pal.accent,
-        );
-        painter.text(
-            rows.hotkey.right_center() - Vec2::new(theme::SPACE_M, 0.0),
-            Align2::RIGHT_CENTER,
-            "Esc 取消",
-            pal.text(pal.font_label),
-            pal.text_3,
-        );
-    } else {
-        let response = clickable(ui, hit(rows.hotkey), "hotkey-row", Sense::click());
-        let (label, font, color) = match (view.hotkey_conflict, response.hovered()) {
-            (Some(text), _) => (text.to_owned(), pal.text(pal.font_label), pal.err),
-            (None, true) => (
-                format!("{} · 点这里改", view.hotkey),
-                theme::mono(pal.font_body),
-                pal.accent,
-            ),
-            (None, false) => (
-                view.hotkey.to_owned(),
-                theme::mono(pal.font_body),
-                pal.text_1,
-            ),
-        };
-        painter.text(
-            rows.hotkey.right_center() - Vec2::new(theme::SPACE_M, 0.0),
-            Align2::RIGHT_CENTER,
-            label,
-            font,
-            color,
-        );
-        if response.clicked() {
-            action = Some(SettingsAction::EditHotkey);
+
+    // ── 四个热键（各自点一下即可捕获）────────────────────────────
+    let hotkey_rows = [
+        HotkeyRow {
+            rect: rows.hotkey,
+            title: "全局热键",
+            key: view.hotkey,
+            slot: delta_config::HotkeySlot::Scene,
+        },
+        HotkeyRow {
+            rect: rows.morse,
+            title: "摩斯热键",
+            key: view.hotkey_morse,
+            slot: delta_config::HotkeySlot::Morse,
+        },
+        HotkeyRow {
+            rect: rows.fingerprint,
+            title: "指纹热键",
+            key: view.hotkey_fingerprint,
+            slot: delta_config::HotkeySlot::Fingerprint,
+        },
+        HotkeyRow {
+            rect: rows.console,
+            title: "操作台热键",
+            key: view.hotkey_console,
+            slot: delta_config::HotkeySlot::Console,
+        },
+    ];
+    // 捕获结算先于既有控件：这一帧的按键/取消不会被按钮点击覆盖掉。
+    if action.is_none() && view.hotkey_editing {
+        let editing_rect = hotkey_rows
+            .iter()
+            .find(|row| row.slot == view.hotkey_slot)
+            .map_or(rows.hotkey, |row| row.rect);
+        action = resolve_capture(ui, true, hit(editing_rect));
+    }
+    for row in &hotkey_rows {
+        if let Some(produced) = paint_hotkey_row(ui, row, viewport, &view, pal) {
+            action = Some(produced);
         }
     }
 
@@ -1978,7 +2062,12 @@ mod tests {
                 action = settings_panel(
                     ui,
                     SettingsView {
+                        master_enabled: true,
                         hotkey: "F8",
+                        hotkey_morse: "F5",
+                        hotkey_fingerprint: "F6",
+                        hotkey_console: "F7",
+                        hotkey_slot: delta_config::HotkeySlot::Scene,
                         hotkey_editing,
                         hotkey_conflict: None,
                         ocr_enabled: true,
@@ -2150,7 +2239,12 @@ mod tests {
                                 let _ = settings_panel(
                                     ui,
                                     SettingsView {
+                                        master_enabled: true,
                                         hotkey: "F8",
+                                        hotkey_morse: "F5",
+                                        hotkey_fingerprint: "F6",
+                                        hotkey_console: "F7",
+                                        hotkey_slot: delta_config::HotkeySlot::Scene,
                                         hotkey_editing: false,
                                         hotkey_conflict: None,
                                         ocr_enabled: true,

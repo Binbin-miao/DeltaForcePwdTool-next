@@ -158,13 +158,13 @@ impl DeltaApp {
                 UiEvent::Failed(message) => self.finish(Phase::Unrecognized, message),
                 UiEvent::Rejected(message) => self.finish(Phase::Unrecognized, message),
                 UiEvent::TimedOut(message) => self.finish(Phase::TimedOut, message),
-                UiEvent::HotkeyApplied(name) => {
+                UiEvent::HotkeyApplied { slot, name } => {
                     // 只有拿到成功回执才换显示 + 落盘（D2；成功路径只写一次盘）。
                     // 反过来，注册失败就什么都不写 —— 配置里永远不会留下一个没生效的键。
                     if let Ok(mut config) = self.config.lock() {
-                        config.hotkeys.scene = name.clone();
+                        delta_config::HotkeySlot::write(slot, &mut config.hotkeys, name.clone());
                     }
-                    self.state.hotkey = name;
+                    self.state.set_hotkey_name(slot, name);
                     self.state.dismiss_hotkey_conflict();
                     if let Err(reason) = self.persist() {
                         eprintln!("[hotkey] 热键已生效但落盘失败：{reason}");
@@ -210,13 +210,17 @@ impl DeltaApp {
     ///
     /// 捕获结果直接用虚拟键码 + 修饰位生成 `Hotkey`，不再走「拼字符串→再解析」的往返。
     fn commit_hotkey(&mut self, chord: KeyChord, now: f64) {
+        let slot = self.state.hotkey_slot;
         let Some(hotkey) = platform::hotkey_from_chord(chord) else {
             // 捕获表与解析表漂移才会走到这里：说出来，绝不设默认值糊过去。
             eprintln!("[hotkey] 捕获结果 {chord:?} 无法映射到虚拟键码");
             self.state.show_hotkey_conflict(conflict_copy(None), now);
             return;
         };
-        if !self.worker.set_hotkey(platform::format_hotkey(&hotkey)) {
+        if !self
+            .worker
+            .set_hotkey(slot, platform::format_hotkey(&hotkey))
+        {
             // 热键线程已退出（例如注册接口建不起来）：当场显形，不留「无回执」的死角。
             eprintln!("[hotkey] 热键线程不可用，本次改键未生效");
             self.state.show_hotkey_conflict(conflict_copy(None), now);
@@ -395,6 +399,24 @@ impl DeltaApp {
             config.auto_confirm = wanted;
         }
         self.state.set_morse_auto_download(wanted);
+        self.persist_settings();
+    }
+
+    /// 识别总开关：关掉后任何热键（F/F5/F6/F7/F8）都不再触发识别，连截图都不抓。
+    ///
+    /// 与 F 键钩子开关的分工：那个只管 F 键这一路入口，这个管全部入口，
+    /// 而且**不卸载钩子**（钩子还要负责在重新打开后立刻可用）。
+    fn toggle_master(&mut self) {
+        let wanted = !self.state.master_enabled;
+        if let Ok(mut config) = self.config.lock() {
+            config.master_enabled = wanted;
+        }
+        self.state.master_enabled = wanted;
+        self.state.notice = Some(if wanted {
+            "识别已开启".to_owned()
+        } else {
+            "识别已暂停：热键不再触发".to_owned()
+        });
         self.persist_settings();
     }
 
@@ -829,6 +851,9 @@ impl eframe::App for DeltaApp {
             // 冲突提示到期即消失：每帧结算一次，视图只拿到结果。
             let conflict = self.state.hotkey_conflict_text(now).map(str::to_owned);
             let hotkey_text = self.state.hotkey.clone();
+            let hotkey_morse = self.state.hotkey_morse.clone();
+            let hotkey_fingerprint = self.state.hotkey_fingerprint.clone();
+            let hotkey_console = self.state.hotkey_console.clone();
             let hotkey_editing = self.state.hotkey_editing;
             let capture_locked = !self.state.capture_switchable();
             let capture_test = self.state.capture_test.clone();
@@ -843,7 +868,12 @@ impl eframe::App for DeltaApp {
             let action = delta_ui::view::settings_panel(
                 ui,
                 delta_ui::view::SettingsView {
+                    master_enabled: self.state.master_enabled,
                     hotkey: &hotkey_text,
+                    hotkey_morse: &hotkey_morse,
+                    hotkey_fingerprint: &hotkey_fingerprint,
+                    hotkey_console: &hotkey_console,
+                    hotkey_slot: self.state.hotkey_slot,
                     hotkey_editing,
                     hotkey_conflict: conflict.as_deref(),
                     ocr_enabled: self.snapshot().ocr_enabled,
@@ -871,8 +901,9 @@ impl eframe::App for DeltaApp {
                     }
                     let _ = self.persist();
                 }
-                Some(delta_ui::view::SettingsAction::EditHotkey) => {
+                Some(delta_ui::view::SettingsAction::EditHotkey(slot)) => {
                     self.state.hotkey_editing = true;
+                    self.state.hotkey_slot = slot;
                     self.state.dismiss_hotkey_conflict();
                 }
                 Some(delta_ui::view::SettingsAction::CancelHotkey) => {
@@ -888,6 +919,7 @@ impl eframe::App for DeltaApp {
                 Some(delta_ui::view::SettingsAction::TestCapture) => self.start_capture_test(&ctx),
                 Some(delta_ui::view::SettingsAction::SetTheme(theme)) => self.set_theme(theme),
                 Some(delta_ui::view::SettingsAction::SetAccent(accent)) => self.set_accent(accent),
+                Some(delta_ui::view::SettingsAction::ToggleMaster) => self.toggle_master(),
                 Some(delta_ui::view::SettingsAction::ToggleFKeyHook) => self.toggle_f_key_hook(),
                 Some(delta_ui::view::SettingsAction::CommitKeywords(raw)) => {
                     self.commit_keywords(&raw);
@@ -1088,6 +1120,11 @@ fn initial_state(config: &Config, monitor: MonitorInfo) -> UiState {
         fingerprint_auto_click: config.fingerprint_auto_click,
         morse_auto_download: config.auto_confirm,
         f_key_hook: config.f_key_hook_enabled,
+        master_enabled: config.master_enabled,
+        hotkey_morse: config.hotkeys.morse.clone(),
+        hotkey_fingerprint: config.hotkeys.fingerprint.clone(),
+        hotkey_console: config.hotkeys.console.clone(),
+        hotkey_slot: delta_config::HotkeySlot::Scene,
         game_title_keywords: config.game_title_keywords.clone(),
         keywords_buffer: config.game_title_keywords.join(", "),
         theme_id: config.theme_id,
@@ -1496,11 +1533,8 @@ mod tests {
             session.grab(rect).map_err(|error| error.to_string())
         });
         let frames = captured.frames.len() as u32;
-        assert_eq!(
-            session.frames_taken(),
-            frames,
-            "抓到的每一格都必须出自同一个会话"
-        );
+        // 先判「九格是否齐」，齐了才有资格断言；否则静态桌面上 WGC 只出首帧会让
+        // 「每格都成功」这个前提不成立，断言必红（本用例曾经因此随机失败）。
         if frames < delta_config::CANDIDATE_BOX_COUNT as u32 {
             // 静态桌面下 WGC 只出首帧是已知行为，此时保存会被 `incomplete_cells_notice` 拦住，
             // 本用例无法验证「九格一个会话」：明确跳过，而不是把断言降级成 `> 0` 的安慰剂
@@ -1508,10 +1542,11 @@ mod tests {
             eprintln!("[test] {backend:?} 只出了 {frames} 帧（静态桌面），跳过九格断言");
             return;
         }
+        // 九格齐了才验核心命题：一个会话抓满九格（`frames_taken` 与成功帧数相等）。
         assert_eq!(
+            session.frames_taken(),
             frames,
-            delta_config::CANDIDATE_BOX_COUNT as u32,
-            "默认后端必须抓满九格"
+            "抓到的每一格都必须出自同一个会话"
         );
         for (_, frame) in &captured.frames {
             assert_eq!(frame.luma().as_slice().len(), (frame.w * frame.h) as usize);

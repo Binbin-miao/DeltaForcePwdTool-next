@@ -13,7 +13,7 @@ pub mod locate;
 
 use delta_capture::Frame;
 use delta_config::{PxAz3, PxView, MORSE_REGION_COUNT};
-use delta_vision::{external_contours, BinaryImage, GrayImage};
+use delta_vision::{BinaryImage, GrayImage};
 
 pub use features::{
     column_segments, crop, edge_density, equidistant_column_peaks, otsu_foreground_ratio,
@@ -300,20 +300,12 @@ impl Az3Kind {
 
 // ── AZ3 二级变体判别（有序：先强特征，后弱特征）──
 
-/// 黄键台：右侧网格内黄/绿高亮占比下限（至少一个亮键）。
-const AZ3_KEYS_GLOW_RATIO: f32 = 0.004;
-/// 黄键台：网格能切出的等距竖列下限（4 列按键）。
-const AZ3_KEYS_MIN_COLUMNS: usize = 4;
-/// 黄键台：暗色键块的下限数量（4×4 里允许 6 颗亮着/被遮挡）。
-const AZ3_KEYS_MIN_BLOCKS: usize = 10;
-/// 黄键台：判定「暗键」的灰度上限。
-const AZ3_KEY_DARK_LUMA: u8 = 90;
-/// 黄键台：单颗键的宽高区间（像素）。
-const AZ3_KEY_SIDE: (u32, u32) = (15, 80);
-/// 黄键台：单颗键的宽高比区间（近方形）。
-const AZ3_KEY_ASPECT: (f32, f32) = (0.6, 1.6);
-/// 黄键台：单颗键的最小面积。
-const AZ3_KEY_MIN_AREA: u32 = 120;
+/// 黄键台：整帧黄/绿高亮占比下限。
+///
+/// 这只是**便宜的快速过滤**（整帧一遍谓词），用来跳过明显无关的画面；
+/// 真正的结构判据是 [`locate::locate_keys`]。阈值按整帧口径取 0.001：
+/// 720p 下一颗 40×40 的亮键 ≈ 1600px / 921600 ≈ 0.0017，仍能过关。
+const AZ3_KEYS_FRAME_GLOW_RATIO: f32 = 0.001;
 /// 任务保险：轨道带内竖直白块数量下限（5 槽，容忍 1 根被游标遮住）。
 const AZ3_PINS_MIN_SLOTS: usize = 4;
 /// 任务保险：每个滑槽在配置中心两侧的搜索半宽（与执行层同口径）。
@@ -336,9 +328,8 @@ pub fn az3_variant(frame: &Frame, view: &PxView) -> Az3Kind {
     if frame.w < 32 || frame.h < 32 {
         return Az3Kind::None;
     }
-    let gray = frame.luma();
     let az3 = &view.az3;
-    if looks_like_keys(frame, &gray, az3) {
+    if looks_like_keys(frame) {
         return Az3Kind::ModuleKeys;
     }
     if looks_like_pins(frame, az3) {
@@ -353,40 +344,25 @@ pub fn az3_variant(frame: &Frame, view: &PxView) -> Az3Kind {
     Az3Kind::None
 }
 
-/// 黄键台：右侧是 **4×4 暗色键阵**（结构证据）+ 有黄/绿亮键 + 4 条等距竖列。
+/// 黄键台：**每帧自适应定位**能同时找到 4×4 暗键阵 + 左侧屏幕。
 ///
-/// 只靠「亮色占比 + 4 列」会劫持 v5 旧操作台：面板右缘与米黄旋钮正好落在这个区域里，
-/// 旋钮的琥珀色会被当成亮键，随后拿 AZ3 网格坐标去点旧面板。暗键阵是 AZ3 独有的结构。
-fn looks_like_keys(frame: &Frame, gray: &GrayImage, az3: &PxAz3) -> bool {
-    let grid = az3.button_grid_region;
-    if color_ratio(frame, grid, is_yellow_or_green_glow) < AZ3_KEYS_GLOW_RATIO {
+/// 旧实现拿配置里的 `az3.button_grid_region` 去裁右侧网格 —— 换一版界面布局，
+/// 那个固定矩形就整体偏出去（只盖住键阵右半），于是「黄键台」时而被判成别的场景、
+/// 时而判对了却按错的坐标去点。现在判别与执行共用同一份定位证据（[`locate::locate_keys`]），
+/// 不再有两套坐标。
+///
+/// 先跑便宜的全帧黄/绿占比过滤，再跑昂贵的连通域定位（先便宜后昂贵）。
+fn looks_like_keys(frame: &Frame) -> bool {
+    let whole = delta_geom::PxRect {
+        x: 0,
+        y: 0,
+        w: frame.w as i32,
+        h: frame.h as i32,
+    };
+    if color_ratio(frame, whole, is_yellow_or_green_glow) < AZ3_KEYS_FRAME_GLOW_RATIO {
         return false;
     }
-    columns_of(gray, grid, AZ3_KEYS_MIN_COLUMNS) && dark_key_blocks(gray, grid) >= AZ3_KEYS_MIN_BLOCKS
-}
-
-/// 数「暗色近方形块」：键阵里每颗未点亮的键都是一块这样的暗块。
-fn dark_key_blocks(gray: &GrayImage, rect: delta_geom::PxRect) -> usize {
-    let Some(cell) = crop(gray, rect) else {
-        return 0;
-    };
-    let Ok(mut dark) = BinaryImage::new(cell.w, cell.h) else {
-        return 0;
-    };
-    for y in 0..cell.h {
-        for x in 0..cell.w {
-            dark.set(x, y, cell.pixel(x, y) < AZ3_KEY_DARK_LUMA);
-        }
-    }
-    external_contours(&dark)
-        .into_iter()
-        .filter(|block| {
-            (AZ3_KEY_SIDE.0..=AZ3_KEY_SIDE.1).contains(&block.region.w)
-                && (AZ3_KEY_SIDE.0..=AZ3_KEY_SIDE.1).contains(&block.region.h)
-                && (AZ3_KEY_ASPECT.0..=AZ3_KEY_ASPECT.1).contains(&block.aspect())
-                && block.area >= AZ3_KEY_MIN_AREA
-        })
-        .count()
+    locate::locate_keys(frame).is_ok()
 }
 
 /// 任务保险：5 个配置槽里至少有 4 个槽内有细长竖直白块（游标）。
@@ -427,13 +403,6 @@ fn looks_like_timing(frame: &Frame, az3: &PxAz3) -> bool {
 /// 旋钮放在第一步，所以非信号线台的画面会在第一步就失败退出：不用为每帧付出整段定位。
 fn looks_like_signal_line(frame: &Frame) -> bool {
     locate::locate_line(frame).is_ok()
-}
-
-/// 灰度裁剪区里是否存在 ≥`min_columns` 条等距竖列。
-fn columns_of(gray: &GrayImage, rect: delta_geom::PxRect, min_columns: usize) -> bool {
-    crop(gray, rect)
-        .and_then(|region| equidistant_column_peaks(&region.otsu().binary, min_columns))
-        .is_some()
 }
 
 /// 指定颜色在裁剪区内是否形成 ≥`min_columns` 条等距竖列。
@@ -808,26 +777,36 @@ mod tests {
         canvas.frame()
     }
 
-    /// 黄键台：右侧 4×4 暗格键阵 (640,194)-(909,428) + 1 个亮黄键。
+    /// 黄键台：金属台面 + 左侧深色屏幕（内有一行 5 个进度框）+ 右侧 4×4 暗键阵。
     ///
-    /// 台面必须比键亮（灰 120 vs 键 40）：暗键阵的判断前提是「键比台面暗」，
-    /// 全黑底会让整块区域连成一片，反而数不出键。
+    /// 第 5 颗键（行 1 列 1）**整颗亮成黄块** = 「亮键」：这样全帧黄/绿像素够多，
+    /// 能过场景判别那道「便宜的快速过滤」（放宽到整帧口径后仍要求 ≥0.1%）。
+    /// 台面必须比键亮（灰 120 vs 键 40），暗键阵才数得出来。
     fn module_keys_frame() -> Frame {
         let mut canvas = Canvas::new(W, H);
-        canvas.paint(rect(640, 194, 269, 234), [120, 120, 120]);
+        canvas.paint(rect(540, 170, 440, 300), [120, 120, 120]);
+        canvas.paint(rect(555, 200, 145, 140), [20, 22, 24]);
+        for stage in 0..5 {
+            let frame = rect(570 + stage * 24, 290, 18, 14);
+            canvas.paint(rect(frame.x, frame.y, frame.w, 2), [200, 200, 200]);
+            canvas.paint(rect(frame.x, frame.bottom() - 2, frame.w, 2), [200, 200, 200]);
+            canvas.paint(rect(frame.x, frame.y, 2, frame.h), [200, 200, 200]);
+            canvas.paint(rect(frame.right() - 2, frame.y, 2, frame.h), [200, 200, 200]);
+        }
         for row in 0..4 {
             for col in 0..4 {
-                canvas.paint(rect(648 + col * 67, 200 + row * 58, 51, 46), [40, 40, 40]);
+                let key = rect(760 + col * 52, 200 + row * 52, 38, 38);
+                let lit = row == 1 && col == 1;
+                canvas.paint(key, if lit { [235, 200, 40] } else { [40, 40, 40] });
             }
         }
-        canvas.paint(rect(648 + 67, 200 + 58, 51, 46), [235, 200, 40]);
         canvas.frame()
     }
 
     /// v5 旧操作台：青绿面板 + 面板 4 列 + 米黄旋钮 + 旧 LED。
     ///
-    /// 关键点：面板右缘与米黄旋钮正好落在 AZ3 的 `button_grid_region` 里，
-    /// 旋钮的琥珀色也满足「黄绿高亮」——这正是旧操作台曾被误判成黄键台的路径。
+    /// 关键点：米黄旋钮的琥珀色满足「黄绿高亮」——这正是旧操作台曾被误判成黄键台的路径。
+    /// 现在黄键台要求「4×4 暗键阵 + 左侧屏幕」这套结构证据，旧面板凑不出来。
     fn legacy_console_frame() -> Frame {
         let mut canvas = Canvas::new(W, H);
         // 青绿面板（H≈90 / S≈120 / V≈110），覆盖 AZ3 网格所在区域。

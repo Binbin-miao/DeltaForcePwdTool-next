@@ -172,10 +172,6 @@ mod tests {
     const TRACK_H: u32 = 76;
     const INDICATOR_W: u32 = 531;
     const INDICATOR_H: u32 = 86;
-    const GRID_W: u32 = 269;
-    const GRID_H: u32 = 234;
-    const PROGRESS_W: u32 = 198;
-    const PROGRESS_H: u32 = 90;
 
     /// 高亮带底色：半透明绿罩，够 `is_green_glow` 但不够「亮绿」。
     const BAND_GREEN: [u8; 3] = [60, 150, 60];
@@ -186,10 +182,6 @@ mod tests {
     const WHITE: [u8; 3] = [240, 240, 240];
     const LIT_YELLOW: [u8; 3] = [235, 200, 40];
     const LOCK_GREEN: [u8; 3] = [40, 210, 60];
-    /// 黄键台台面：比暗键亮，暗键阵才数得出来。
-    const TABLE_GREY: [u8; 3] = [120, 120, 120];
-    /// 未点亮的暗键。
-    const DARK_KEY: [u8; 3] = [40, 40, 40];
 
     /// 顺序脚本：播完停在最后一帧（等价于「画面静止」），便于断言"之后不再触发"。
     struct ScriptScreen {
@@ -224,23 +216,39 @@ mod tests {
         }
     }
 
-    /// 黄键台专用：网格帧恒定，进度帧按脚本推进。
-    struct SplitScreen {
-        grid_rect: PxRect,
-        grid: Frame,
-        progress: Vec<Frame>,
+    /// 黄键台专用：整帧按脚本推进（面板几何恒定，只有亮键与进度框在变）。
+    struct PanelScreen {
+        rect: PxRect,
+        frames: Vec<Frame>,
         pulled: usize,
     }
 
-    impl Screen for SplitScreen {
-        fn grab(&mut self, rect: PxRect) -> Result<Frame, String> {
-            if rect == self.grid_rect {
-                return Ok(self.grid.clone());
+    impl PanelScreen {
+        fn new(frames: Vec<Frame>) -> Self {
+            let rect = frames.first().map_or(PxRect::ZERO, |frame| PxRect {
+                x: 0,
+                y: 0,
+                w: frame.w as i32,
+                h: frame.h as i32,
+            });
+            Self {
+                rect,
+                frames,
+                pulled: 0,
             }
-            let last = self.progress.len().saturating_sub(1);
-            let frame = self.progress.get(self.pulled.min(last)).cloned();
+        }
+    }
+
+    impl Screen for PanelScreen {
+        fn grab(&mut self, _rect: PxRect) -> Result<Frame, String> {
+            let last = self.frames.len().saturating_sub(1);
+            let frame = self.frames.get(self.pulled.min(last)).cloned();
             self.pulled += 1;
-            frame.ok_or_else(|| "进度帧脚本为空".to_owned())
+            frame.ok_or_else(|| "脚本帧为空".to_owned())
+        }
+
+        fn frame_rect(&self) -> PxRect {
+            self.rect
         }
     }
 
@@ -364,62 +372,106 @@ mod tests {
             .collect()
     }
 
-    /// 黄键台网格：灰台面上第 `lit` / `also` 格亮黄，其余为暗键。
-    fn grid_frame(lit: Option<usize>, also: Option<usize>) -> Frame {
-        let mut shapes = vec![(rect(0, 0, GRID_W as i32, GRID_H as i32), TABLE_GREY)];
-        for index in 0..16 {
-            if Some(index) == lit || Some(index) == also {
-                continue;
-            }
-            let (x0, y0) = cell_origin(index);
-            shapes.push((rect(x0 + 6, y0 + 4, 55, 50), DARK_KEY));
-        }
-        for index in [lit, also].into_iter().flatten() {
-            let (x0, y0) = cell_origin(index);
-            shapes.push((rect(x0 + 6, y0 + 4, 55, 50), LIT_YELLOW));
-        }
-        paint_frame(GRID_W, GRID_H, &shapes)
+    // ── 黄键台合成面板（100% 脱敏：与任何真实机位无关，只复刻相对结构）──
+
+    const PANEL_W: u32 = 480;
+    const PANEL_H: u32 = 320;
+    /// 金属台面：亮灰 —— 键必须比台面暗，暗键阵才数得出来。
+    const PANEL_GREY: [u8; 3] = [152, 152, 150];
+    /// 屏幕内部：近黑。
+    const SCREEN_DARK: [u8; 3] = [30, 32, 34];
+    /// 未点亮的键面。
+    const DARK_KEY: [u8; 3] = [36, 38, 40];
+    /// 进度框的浅色细边框。
+    const BOX_BORDER: [u8; 3] = [200, 200, 200];
+    const PANEL_SCREEN: PxRect = PxRect {
+        x: 40,
+        y: 60,
+        w: 160,
+        h: 140,
+    };
+    const PANEL_KEY_SIZE: (i32, i32) = (34, 30);
+    const PANEL_COL_X: [i32; 4] = [240, 284, 328, 372];
+    const PANEL_ROW_Y: [i32; 4] = [50, 96, 142, 188];
+    const PANEL_BOX_SIZE: (i32, i32) = (24, 18);
+    const PANEL_BOX_X: [i32; 5] = [48, 76, 104, 132, 160];
+    const PANEL_BOX_Y: i32 = 132;
+
+    fn panel_key(index: usize) -> PxRect {
+        rect(
+            PANEL_COL_X[index % 4],
+            PANEL_ROW_Y[index / 4],
+            PANEL_KEY_SIZE.0,
+            PANEL_KEY_SIZE.1,
+        )
     }
 
-    fn cell_origin(index: usize) -> (i32, i32) {        let cell_w = (GRID_W / 4) as i32;
-        let cell_h = (GRID_H / 4) as i32;
-        (((index % 4) as i32) * cell_w, ((index / 4) as i32) * cell_h)
-    }
-
-    /// 16 格全亮（模拟「所有键都点过却推不动进度」）。
-    fn grid_all_lit() -> Frame {
-        let mut shapes = vec![(rect(0, 0, GRID_W as i32, GRID_H as i32), TABLE_GREY)];
-        for index in 0..16 {
-            let (x0, y0) = cell_origin(index);
-            shapes.push((rect(x0 + 6, y0 + 4, 55, 50), LIT_YELLOW));
-        }
-        paint_frame(GRID_W, GRID_H, &shapes)
-    }
-
-    /// 该格的全局点击坐标（与 `keys::cell_clip` 的切分口径逐像素一致）。
-    fn cell_center_global(index: usize) -> PxPoint {
-        let az3 = test_az3();
-        let cell_w = (GRID_W / 4) as i32;
-        let cell_h = (GRID_H / 4) as i32;
-        let col = (index % 4) as i32;
-        let row = (index / 4) as i32;
-        let x0 = col * cell_w;
-        let y0 = row * cell_h;
-        let x1 = if col == 3 { GRID_W as i32 } else { x0 + cell_w };
-        let y1 = if row == 3 { GRID_H as i32 } else { y0 + cell_h };
+    /// 第 `index` 颗键的几何中心（点击落点）。
+    fn panel_key_center(index: usize) -> PxPoint {
+        let key = panel_key(index);
         PxPoint {
-            x: az3.button_grid_region.x + x0 + (x1 - x0) / 2,
-            y: az3.button_grid_region.y + y0 + (y1 - y0) / 2,
+            x: key.x + key.w / 2,
+            y: key.y + key.h / 2,
         }
     }
 
-    /// 进度条：前 `checked` 个勾选格为绿。
-    fn progress_frame(checked: usize) -> Frame {
-        let slot = PROGRESS_W as i32 / 5;
-        let shapes: Vec<(PxRect, [u8; 3])> = (0..checked)
-            .map(|index| (rect(index as i32 * slot + 5, 20, 25, 40), LOCK_GREEN))
-            .collect();
-        paint_frame(PROGRESS_W, PROGRESS_H, &shapes)
+    fn panel_box(stage: usize) -> PxRect {
+        rect(PANEL_BOX_X[stage], PANEL_BOX_Y, PANEL_BOX_SIZE.0, PANEL_BOX_SIZE.1)
+    }
+
+    /// 一帧完整黄键台：金属台面 + 左侧屏幕 + 16 颗暗键 + 5 个进度框。
+    ///
+    /// `lit` 里的键在键面上多一块发光图标（键本身仍是暗块）；`checked` 个进度框内部变绿。
+    /// 同一个构造函数覆盖「只亮一格」「同一格一直亮」「16 格全亮」「进度推进」全部状态。
+    fn panel_frame(lit: &[usize], checked: usize, keys: usize, boxes: bool) -> Frame {
+        let mut shapes = vec![(rect(0, 0, PANEL_W as i32, PANEL_H as i32), PANEL_GREY)];
+        shapes.push((PANEL_SCREEN, SCREEN_DARK));
+        if boxes {
+            for stage in 0..PANEL_BOX_X.len() {
+                let frame = panel_box(stage);
+                if stage < checked {
+                    shapes.push((
+                        rect(frame.x + 2, frame.y + 2, frame.w - 4, frame.h - 4),
+                        LOCK_GREEN,
+                    ));
+                }
+                push_ring(&mut shapes, frame, 2, BOX_BORDER);
+            }
+        }
+        for index in 0..keys.min(16) {
+            let key = panel_key(index);
+            shapes.push((key, DARK_KEY));
+            if lit.contains(&index) {
+                shapes.push((
+                    rect(key.x + key.w / 4, key.y + key.h / 4, key.w / 2, key.h / 2),
+                    LIT_YELLOW,
+                ));
+            }
+        }
+        paint_frame(PANEL_W, PANEL_H, &shapes)
+    }
+
+    /// 空心细边框（进度框就是这种）。
+    fn push_ring(shapes: &mut Vec<(PxRect, [u8; 3])>, frame: PxRect, thickness: i32, rgb: [u8; 3]) {
+        shapes.push((rect(frame.x, frame.y, frame.w, thickness), rgb));
+        shapes.push((
+            rect(frame.x, frame.bottom() - thickness, frame.w, thickness),
+            rgb,
+        ));
+        shapes.push((rect(frame.x, frame.y, thickness, frame.h), rgb));
+        shapes.push((
+            rect(frame.right() - thickness, frame.y, thickness, frame.h),
+            rgb,
+        ));
+    }
+
+    /// 空白画面：看不到任何面板。
+    fn blank_panel_frame() -> Frame {
+        paint_frame(
+            PANEL_W,
+            PANEL_H,
+            &[(rect(0, 0, PANEL_W as i32, PANEL_H as i32), PANEL_GREY)],
+        )
     }
 
     fn test_az3() -> PxAz3 {
@@ -616,81 +668,87 @@ mod tests {
         assert_eq!(pointer.spaces, 0);
     }
 
-    // ── 黄键台 ──
+    // ── 黄键台（每帧自适应定位）──
 
-    fn key_screen(grid: Frame, progress: Vec<Frame>) -> SplitScreen {
-        SplitScreen {
-            grid_rect: test_az3().button_grid_region,
-            grid,
-            progress,
-            pulled: 0,
-        }
+    /// 面板恒定、只有发光键与进度框按脚本变化的整帧假屏幕。
+    fn panel_screen(frames: Vec<Frame>) -> PanelScreen {
+        PanelScreen::new(frames)
     }
 
     #[test]
-    fn module_keys_clicks_lit_cell_and_finishes_at_five_checks() {
-        let mut screen = key_screen(
-            grid_frame(Some(0), None),
-            vec![progress_frame(4), progress_frame(5)],
-        );
+    fn module_keys_clicks_the_lit_key_centre_and_finishes_at_five_checks() {
+        // 进度 4/5 + 第 9 颗键发光 → 点它的几何中心一次 → 进度 5/5 → Done。
+        let mut screen = panel_screen(vec![
+            panel_frame(&[9], 4, 16, true),
+            panel_frame(&[9], 5, 16, true),
+        ]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
         assert!(outcome.is_done(), "{outcome:?}");
-        assert_eq!(pointer.clicks, vec![cell_center_global(0)]);
+        assert_eq!(pointer.clicks, vec![panel_key_center(9)], "{outcome:?}");
     }
 
     #[test]
-    fn module_keys_aborts_when_no_key_lights_up() {
-        let mut screen = key_screen(grid_frame(None, None), vec![progress_frame(0)]);
+    fn module_keys_aborts_with_zero_input_when_no_panel_is_visible() {
+        // 空白画面：定位连败 6 帧后零输入退出，并给出「正对面板」的提示。
+        let mut screen = panel_screen(vec![blank_panel_frame()]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
-        assert!(!outcome.is_done());
-        assert!(abort_reason(&outcome).contains("已点击 0 次"), "{outcome:?}");
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(pointer.events, 0, "定位失败必须零输入");
         assert!(pointer.clicks.is_empty());
+        assert!(abort_reason(&outcome).contains("4×4 按键阵"), "{outcome:?}");
+        assert!(abort_reason(&outcome).contains("请正对按键面板"), "{outcome:?}");
+    }
+
+    #[test]
+    fn module_keys_never_reclicks_a_key_that_stays_lit() {
+        // 同一颗键一直亮、进度永不推进 → 只许点一次（点后 400ms 判死换下一格）。
+        let mut screen = panel_screen(vec![panel_frame(&[3], 0, 16, true)]);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(pointer.clicks, vec![panel_key_center(3)], "{outcome:?}");
     }
 
     #[test]
     fn module_keys_aborts_once_all_sixteen_keys_are_spent() {
-        // 16 格全点过、进度仍不动 → 必须立即 Abort，而不是烧满 15s 超时。
-        let mut screen = key_screen(grid_all_lit(), vec![progress_frame(0)]);
+        // 16 格全亮、进度始终 0：每格只点一次，全点完立即 Abort，不烧满 15s 超时。
+        let mut screen = panel_screen(vec![panel_frame(&(0..16).collect::<Vec<_>>(), 0, 16, true)]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
-        assert!(!outcome.is_done());
+        assert!(!outcome.is_done(), "{outcome:?}");
         assert_eq!(pointer.clicks.len(), 16, "{outcome:?}");
-        assert!(abort_reason(&outcome).contains("16 键已点完但进度未满"), "{outcome:?}");
-    }
-
-    #[test]
-    fn module_keys_never_reclicks_the_same_cell() {
-        // 进度永不推进：两个亮键各点一次后都被判死，同一格绝不重复点击。
-        let mut screen = key_screen(
-            grid_frame(Some(0), Some(5)),
-            vec![progress_frame(0)],
-        );
-        let mut pointer = MockPointer::default();
-        let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
-        assert!(!outcome.is_done());
-        assert_eq!(
-            pointer.clicks,
-            vec![cell_center_global(0), cell_center_global(5)],
+        let mut centres: Vec<(i32, i32)> = pointer.clicks.iter().map(|p| (p.x, p.y)).collect();
+        centres.sort_unstable();
+        centres.dedup();
+        assert_eq!(centres.len(), 16, "16 次点击必须落在 16 个不同的键中心上");
+        assert!(
+            abort_reason(&outcome).contains("16 键已点完但进度未满"),
             "{outcome:?}"
         );
     }
 
     #[test]
-    fn module_keys_never_reclicks_a_key_that_stays_lit_after_progress() {
-        // 点亮的键在进度推进后仍然亮着（游戏常见表现）——这种键绝不能再点第二次，
-        // 否则就是旧实现里那个「同一亮键点到超时」的死循环。
-        let mut screen = key_screen(
-            grid_frame(Some(0), Some(5)),
-            vec![progress_frame(0), progress_frame(1), progress_frame(2)],
-        );
+    fn module_keys_rejects_a_panel_with_only_ten_keys() {
+        // 只有 10 颗键 → 对不上 4×4 → 零输入 Abort，绝不猜坐标。
+        let mut screen = panel_screen(vec![panel_frame(&[], 0, 10, true)]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
-        assert_eq!(
-            pointer.clicks,
-            vec![cell_center_global(0), cell_center_global(5)],
-            "{outcome:?}"
-        );
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(pointer.events, 0);
+        assert!(abort_reason(&outcome).contains("4×4 按键阵"), "{outcome:?}");
+    }
+
+    #[test]
+    fn module_keys_falls_back_to_the_degraded_criterion_without_progress_boxes() {
+        // 进度框读不出来（退化）→ 不判进度、不判死键；16 格点完按退化判据收尾，
+        // 且文案必须说明「用的是退化判据」，不许假装读到了进度。
+        let mut screen = panel_screen(vec![panel_frame(&(0..16).collect::<Vec<_>>(), 0, 16, false)]);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
+        assert!(outcome.is_done(), "{outcome:?}");
+        assert_eq!(pointer.clicks.len(), 16, "{outcome:?}");
+        assert!(abort_reason(&outcome).contains("退化判据"), "{outcome:?}");
     }
 }

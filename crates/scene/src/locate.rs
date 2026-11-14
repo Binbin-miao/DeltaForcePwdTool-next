@@ -15,10 +15,13 @@
 //!
 //! 性能红线：只扫候选小区域，绝不整帧逐像素 HSV。旋钮粗扫按步长降采样
 //! （整帧 ≤ 480×270 次采样），屏幕在降采样网格上找轮廓，LED 与档位阵只扫窄窗。
+//!
+//! 同一个理由也适用于黄键台（[`locate_keys`]）：旧配置把 4×4 键阵写死成百分比矩形，
+//! 换一版界面布局就整体偏出去，四等分切出来的格子落在键缝里 → 点空。这里逐帧重新量。
 
 use delta_capture::Frame;
 use delta_geom::{PxPoint, PxRect};
-use delta_vision::{external_contours, BinaryImage, Contour, Region};
+use delta_vision::{external_contours, BinaryImage, Contour, GrayImage, Region};
 use thiserror::Error;
 
 use crate::features::column_segments;
@@ -82,6 +85,55 @@ const SPACING_SPREAD: f32 = 0.25;
 /// 琥珀定位框的像素数下限（720p 实测 106~183）。
 const MARKER_MIN_PIXELS: u32 = 40;
 
+/// 黄键台 4×4 键阵的边长。
+pub const KEY_GRID_SIDE: usize = 4;
+/// 4×4 组合里至少要命中的格数：允许 4 颗键正在发光/被 HUD 挡住。
+const KEY_MIN_HITS: usize = 12;
+
+/// 「暗键」的灰度上限（键面近黑）。
+const KEY_DARK_LUMA: u8 = 95;
+/// 单颗键的边长区间。720p 实机实测 55~57px。
+const KEY_SIDE: (u32, u32) = (18, 70);
+/// 单颗键的宽高比区间（近方形）。
+const KEY_ASPECT: (f32, f32) = (0.6, 1.7);
+/// 单颗键在自身外接框内的填充率下限。
+///
+/// 720p 实机实测 0.47~0.56 —— 键面被白色图标与下方小字挖掉约一半，
+/// 按 0.55 会把 16 颗键只留下 1 颗，整台机器永远定位失败。
+const KEY_MIN_FILL: f32 = 0.40;
+/// 单颗键的最小面积。
+const KEY_MIN_AREA: u32 = 200;
+/// 行/列聚类容差 = 该方向中位键边长 × 此系数。
+const KEY_CLUSTER_TOL: f32 = 0.4;
+/// 键块尺寸一致性区间（相对中位边长）：4×4 键阵的键大小一致。
+const KEY_SIZE_SPREAD: (f32, f32) = (0.7, 1.4);
+/// 命中判定容差 = 半格间距 × 此系数。
+const KEY_HIT_TOL: f32 = 0.6;
+
+/// 屏幕：灰度上限与「暗像素」占外接框的比例下限。
+const KEY_SCREEN_LUMA: u8 = 80;
+const KEY_SCREEN_DARK: f32 = 0.45;
+/// 屏幕宽高比区间。
+const KEY_SCREEN_ASPECT: (f32, f32) = (0.9, 2.2);
+/// 屏幕搜索窗的横向范围（帧宽比例，另受键阵左缘约束）。
+const KEY_SCREEN_SIDE: f32 = 0.55;
+/// 屏幕与键阵的尺寸比区间：同一块面板上两者的尺寸同量级。
+const KEY_SCREEN_SIZE: (f32, f32) = (0.5, 2.0);
+/// 屏幕与键阵左缘的最大间距（占键阵宽度的比例）：屏幕就贴在键阵左边。
+const KEY_SCREEN_GAP: f32 = 0.5;
+
+/// 进度框（屏幕内浅色细边框）的亮度区间。
+const KEY_BOX_LUMA: (u8, u8) = (150, 230);
+/// 进度框的宽高比区间。
+const KEY_BOX_ASPECT: (f32, f32) = (1.2, 3.0);
+/// 进度框在屏幕内的宽/高占比区间。
+const KEY_BOX_W: (f32, f32) = (0.06, 0.45);
+const KEY_BOX_H: (f32, f32) = (0.05, 0.60);
+/// 细边框在自身外接框内的占比区间（实心亮块不是边框）。
+const KEY_BOX_FILL: (f32, f32) = (0.05, 0.70);
+/// 进度框最多 5 个。
+pub const KEY_PROGRESS_MAX: usize = 5;
+
 /// 定位结果：信号线台的全部几何都由这一帧量出来。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocatedLine {
@@ -133,6 +185,8 @@ pub enum LocateError {
     Led,
     #[error("屏幕上数不到 4 列档位")]
     Columns,
+    #[error("没找到右侧的 4×4 按键阵（能对上号的暗色键块不足 12 个）")]
+    Keys,
 }
 
 /// 一帧定位：全部几何都由 `frame` 决定，不读配置、不碰 IO。
@@ -573,10 +627,15 @@ impl Masked {
 
 /// 把矩形裁进帧内，返回右下开区间的像素边界；完全在帧外 → `None`。
 fn clip(frame: &Frame, rect: PxRect) -> Option<(u32, u32, u32, u32)> {
-    let x0 = rect.x.max(0).min(frame.w as i32) as u32;
-    let y0 = rect.y.max(0).min(frame.h as i32) as u32;
-    let x1 = rect.right().max(0).min(frame.w as i32) as u32;
-    let y1 = rect.bottom().max(0).min(frame.h as i32) as u32;
+    clip_to(frame.w, frame.h, rect)
+}
+
+/// 同上，但画面尺寸由调用方给（灰度图与帧同尺寸，省掉一次 Frame 借用）。
+fn clip_to(w: u32, h: u32, rect: PxRect) -> Option<(u32, u32, u32, u32)> {
+    let x0 = rect.x.max(0).min(w as i32) as u32;
+    let y0 = rect.y.max(0).min(h as i32) as u32;
+    let x1 = rect.right().max(0).min(w as i32) as u32;
+    let y1 = rect.bottom().max(0).min(h as i32) as u32;
     (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
 }
 
@@ -712,6 +771,10 @@ fn within_usize(range: (usize, usize), value: usize) -> bool {
     value >= range.0 && value <= range.1
 }
 
+fn within_u8(range: (u8, u8), value: u8) -> bool {
+    value >= range.0 && value <= range.1
+}
+
 fn fill_of(contour: &Contour) -> f32 {
     contour.area as f32 / contour.region.area().max(1) as f32
 }
@@ -732,6 +795,405 @@ fn inset(rect: PxRect, by: i32) -> PxRect {
         w: (rect.w - by * 2).max(1),
         h: (rect.h - by * 2).max(1),
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 黄键台（ModuleKeys）：4×4 键阵 + 左侧屏幕 + 屏幕内 5 个进度框
+// ══════════════════════════════════════════════════════════════════════════
+
+/// 黄键台一帧量出来的全部几何。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedKeys {
+    /// 4×4 键阵的外接框（= 16 个格的并集）。
+    pub grid: PxRect,
+    /// 16 颗键，**行优先**（左上 → 右下）；不足的格由中位键尺寸补出来。
+    pub cells: Vec<PxRect>,
+    /// 左侧深色屏幕。
+    pub screen: PxRect,
+    /// 屏幕内排成一行的进度框，自左向右；读不到就是空（调用方据此退化，不猜）。
+    pub progress: Vec<PxRect>,
+}
+
+/// 一帧定位：键阵 → 屏幕 → 进度框，任一步失败即报错（调用方零输入退出）。
+pub fn locate_keys(frame: &Frame) -> Result<LocatedKeys, LocateError> {
+    if frame.w < MIN_FRAME_SIDE || frame.h < MIN_FRAME_SIDE {
+        return Err(LocateError::Frame {
+            w: frame.w,
+            h: frame.h,
+        });
+    }
+    // 只做一次灰度转换：三步判定全部复用同一份灰度图。
+    let gray = frame.luma();
+    let keys = find_key_grid(&gray).ok_or(LocateError::Keys)?;
+    let screen = find_key_screen(&gray, keys.grid).ok_or(LocateError::Screen)?;
+    let progress = find_progress_boxes(&gray, screen);
+    Ok(LocatedKeys {
+        grid: keys.grid,
+        cells: keys.cells,
+        screen,
+        progress,
+    })
+}
+
+// ── 1. 暗键候选 ──
+
+/// 键块候选：灰度低于 [`KEY_DARK_LUMA`]、近方形、够大、填充率达标的外轮廓。
+fn dark_blocks(gray: &GrayImage) -> Vec<PxRect> {
+    let whole = PxRect {
+        x: 0,
+        y: 0,
+        w: gray.w as i32,
+        h: gray.h as i32,
+    };
+    let Some(mask) = gray_mask(gray, whole, |luma| luma < KEY_DARK_LUMA) else {
+        return Vec::new();
+    };
+    external_contours(&mask.binary)
+        .into_iter()
+        .filter(|block| (KEY_SIDE.0..=KEY_SIDE.1).contains(&block.region.w))
+        .filter(|block| (KEY_SIDE.0..=KEY_SIDE.1).contains(&block.region.h))
+        .filter(|block| within(KEY_ASPECT, block.aspect()))
+        .filter(|block| block.area >= KEY_MIN_AREA)
+        .filter(|block| fill_of(block) >= KEY_MIN_FILL)
+        .map(|block| mask.to_frame(block.region, 1))
+        .collect()
+}
+
+// ── 2. 聚成 4×4 ──
+
+struct KeyGrid {
+    grid: PxRect,
+    cells: Vec<PxRect>,
+}
+
+/// 一个 4×4 判定结果：16 个格 + 命中数 + 间距均匀度。
+struct Quad {
+    cells: Vec<PxRect>,
+    hits: usize,
+    spread: f32,
+}
+
+impl Quad {
+    /// 量一个 4×4 窗口：交点附近有键块就用它的**实测矩形**，没有就用中位键尺寸补。
+    fn measure(
+        blocks: &[PxRect],
+        rows: [i32; KEY_GRID_SIDE],
+        cols: [i32; KEY_GRID_SIDE],
+        spread: f32,
+    ) -> Self {
+        let (fallback_w, fallback_h) = median_side(blocks);
+        let tol_x = (cols[KEY_GRID_SIDE - 1] - cols[0]) as f32 / 6.0 * KEY_HIT_TOL;
+        let tol_y = (rows[KEY_GRID_SIDE - 1] - rows[0]) as f32 / 6.0 * KEY_HIT_TOL;
+        let mut cells = Vec::with_capacity(KEY_GRID_SIDE * KEY_GRID_SIDE);
+        let mut hits = 0;
+        for &row in &rows {
+            for &col in &cols {
+                match nearest_block(blocks, col, row, tol_x, tol_y) {
+                    Some(block) => {
+                        hits += 1;
+                        cells.push(block);
+                    }
+                    None => cells.push(PxRect {
+                        x: col - fallback_w / 2,
+                        y: row - fallback_h / 2,
+                        w: fallback_w,
+                        h: fallback_h,
+                    }),
+                }
+            }
+        }
+        Self { cells, hits, spread }
+    }
+
+    /// 命中更多的优先；同样多时取间距更均匀的。
+    fn beats(&self, other: &Self) -> bool {
+        self.hits > other.hits || (self.hits == other.hits && self.spread < other.spread)
+    }
+}
+
+fn find_key_grid(gray: &GrayImage) -> Option<KeyGrid> {
+    let blocks = uniform_blocks(&dark_blocks(gray));
+    if blocks.len() < KEY_MIN_HITS {
+        return None;
+    }
+    let quad = best_quad(&blocks)?;
+    if quad.hits < KEY_MIN_HITS {
+        return None;
+    }
+    Some(KeyGrid {
+        grid: bounding(&quad.cells),
+        cells: quad.cells,
+    })
+}
+
+/// 只保留与中位尺寸一致的键块。
+///
+/// 4×4 键阵的 16 颗键大小一致；尺寸离群的暗块是**别的东西**：屏幕里空槽的内腔、
+/// 背景上的暗斑。它们若混进行/列聚类，会把行距算歪（实测：5 个空槽内腔足以让整台机器
+/// 定位失败）。
+fn uniform_blocks(blocks: &[PxRect]) -> Vec<PxRect> {
+    let (median_w, median_h) = median_side(blocks);
+    blocks
+        .iter()
+        .copied()
+        .filter(|block| {
+            within(KEY_SIZE_SPREAD, block.w as f32 / median_w.max(1) as f32)
+                && within(KEY_SIZE_SPREAD, block.h as f32 / median_h.max(1) as f32)
+        })
+        .collect()
+}
+
+/// 行/列各自聚类成 4 个中心，取「间距最均匀 + 命中最多」的那一组。
+fn best_quad(blocks: &[PxRect]) -> Option<Quad> {
+    let (median_w, median_h) = median_side(blocks);
+    let tol_x = (median_w as f32 * KEY_CLUSTER_TOL) as i32;
+    let tol_y = (median_h as f32 * KEY_CLUSTER_TOL) as i32;
+    let cols = clusters(blocks.iter().map(center_x).collect(), tol_x);
+    let rows = clusters(blocks.iter().map(center_y).collect(), tol_y);
+    if cols.len() < KEY_GRID_SIDE || rows.len() < KEY_GRID_SIDE {
+        return None;
+    }
+
+    let mut best: Option<Quad> = None;
+    for row_window in rows.windows(KEY_GRID_SIDE) {
+        for col_window in cols.windows(KEY_GRID_SIDE) {
+            let spread = spacing_spread(row_window).max(spacing_spread(col_window));
+            if spread > SPACING_SPREAD {
+                continue;
+            }
+            let (Some(rows), Some(cols)) = (quad_of(row_window), quad_of(col_window)) else {
+                continue;
+            };
+            let quad = Quad::measure(blocks, rows, cols, spread);
+            if best.as_ref().is_none_or(|current| quad.beats(current)) {
+                best = Some(quad);
+            }
+        }
+    }
+    best.filter(|quad| quad.hits >= KEY_MIN_HITS)
+}
+
+/// 一维中心值聚成若干簇，返回各簇的**中位数**（升序）。
+///
+/// 用中位数而不是均值：个别离群候选（背景上的暗斑）落在两行之间时，
+/// 均值会把整行拽偏，中位数不动。
+fn clusters(mut values: Vec<i32>, tol: i32) -> Vec<i32> {
+    values.sort_unstable();
+    let mut groups: Vec<Vec<i32>> = Vec::new();
+    for value in values {
+        let joins = groups
+            .last()
+            .and_then(|group| group.last())
+            .is_some_and(|last| value - *last <= tol);
+        match groups.last_mut() {
+            Some(group) if joins => group.push(value),
+            _ => groups.push(vec![value]),
+        }
+    }
+    groups
+        .iter()
+        .filter_map(|group| group.get(group.len() / 2).copied())
+        .collect()
+}
+
+/// 间距均匀度 `(max_gap - min_gap) / max_gap`；单值或退化间距按 0 处理。
+fn spacing_spread(values: &[i32]) -> f32 {
+    let gaps: Vec<f32> = values
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]) as f32)
+        .collect();
+    let max = gaps.iter().copied().fold(0.0f32, f32::max);
+    if max <= 0.0 {
+        return 0.0;
+    }
+    let min = gaps.iter().copied().fold(f32::INFINITY, f32::min);
+    (max - min) / max
+}
+
+fn quad_of(window: &[i32]) -> Option<[i32; KEY_GRID_SIDE]> {
+    match *window {
+        [a, b, c, d] => Some([a, b, c, d]),
+        _ => None,
+    }
+}
+
+/// 离交点最近、且横纵偏差都在容差内的键块。
+fn nearest_block(blocks: &[PxRect], x: i32, y: i32, tol_x: f32, tol_y: f32) -> Option<PxRect> {
+    blocks
+        .iter()
+        .map(|block| {
+            let dx = (center_x(block) - x).abs() as f32;
+            let dy = (center_y(block) - y).abs() as f32;
+            (block, dx, dy)
+        })
+        .filter(|(_, dx, dy)| *dx <= tol_x && *dy <= tol_y)
+        .min_by(|left, right| (left.1 + left.2).total_cmp(&(right.1 + right.2)))
+        .map(|(block, _, _)| *block)
+}
+
+fn median_side(blocks: &[PxRect]) -> (i32, i32) {
+    let (mut widths, mut heights): (Vec<i32>, Vec<i32>) =
+        blocks.iter().map(|block| (block.w, block.h)).unzip();
+    widths.sort_unstable();
+    heights.sort_unstable();
+    let mid = blocks.len() / 2;
+    (
+        widths.get(mid).copied().unwrap_or(KEY_SIDE.0 as i32),
+        heights.get(mid).copied().unwrap_or(KEY_SIDE.0 as i32),
+    )
+}
+
+fn bounding(rects: &[PxRect]) -> PxRect {
+    let left = rects.iter().map(|rect| rect.x).min().unwrap_or(0);
+    let top = rects.iter().map(|rect| rect.y).min().unwrap_or(0);
+    let right = rects.iter().map(|rect| rect.right()).max().unwrap_or(0);
+    let bottom = rects.iter().map(|rect| rect.bottom()).max().unwrap_or(0);
+    PxRect {
+        x: left,
+        y: top,
+        w: right - left,
+        h: bottom - top,
+    }
+}
+
+fn center_x(rect: &PxRect) -> i32 {
+    rect.x + rect.w / 2
+}
+
+fn center_y(rect: &PxRect) -> i32 {
+    rect.y + rect.h / 2
+}
+
+// ── 3. 屏幕 ──
+
+/// 键阵左侧的深色大矩形（同一块面板上的操作屏）。
+///
+/// 三道硬门槛之外还有一条「相邻性」优先级：背景也是一大片暗色，
+/// 但它不会紧贴键阵左缘；先挑贴得最近的那块，挑不到才退回最大面积。
+fn find_key_screen(gray: &GrayImage, grid: PxRect) -> Option<PxRect> {
+    let window = screen_window(gray, grid);
+    let mask = gray_mask(gray, window, |luma| luma < KEY_SCREEN_LUMA)?;
+    let candidates: Vec<(PxRect, u32)> = external_contours(&mask.binary)
+        .into_iter()
+        .filter(|block| within(KEY_SCREEN_ASPECT, block.aspect()))
+        .filter(|block| dark_ratio(block) >= KEY_SCREEN_DARK)
+        .map(|block| (mask.to_frame(block.region, 1), block.area))
+        .filter(|(rect, _)| rect.right() <= grid.x)
+        .filter(|(rect, _)| same_magnitude(*rect, grid) && overlaps_vertically(*rect, grid))
+        .collect();
+
+    let adjacent = candidates
+        .iter()
+        .copied()
+        .filter(|(rect, _)| (grid.x - rect.right()) as f32 <= grid.w as f32 * KEY_SCREEN_GAP)
+        .max_by_key(|(_, area)| *area);
+    adjacent
+        .or_else(|| candidates.iter().copied().max_by_key(|(_, area)| *area))
+        .map(|(rect, _)| rect)
+}
+
+/// 屏幕搜索窗：帧左 0..[`KEY_SCREEN_SIDE`]、纵向比键阵上下各放宽 1/4。
+fn screen_window(gray: &GrayImage, grid: PxRect) -> PxRect {
+    let margin = grid.h / 4;
+    let right = (gray.w as f32 * KEY_SCREEN_SIDE).min(grid.x as f32).max(0.0) as i32;
+    PxRect {
+        x: 0,
+        y: grid.y - margin,
+        w: right,
+        h: grid.h + margin * 2,
+    }
+}
+
+/// 暗像素占外接框的比例。
+fn dark_ratio(block: &Contour) -> f32 {
+    block.area as f32 / block.region.area().max(1) as f32
+}
+
+/// 屏幕与键阵尺寸同量级（同一台机器上两者不会差一个数量级）。
+fn same_magnitude(rect: PxRect, grid: PxRect) -> bool {
+    within(KEY_SCREEN_SIZE, rect.w as f32 / grid.w.max(1) as f32)
+        && within(KEY_SCREEN_SIZE, rect.h as f32 / grid.h.max(1) as f32)
+}
+
+/// 与键阵的纵向重叠 ≥ 自身高度的一半。
+fn overlaps_vertically(rect: PxRect, grid: PxRect) -> bool {
+    let top = rect.y.max(grid.y);
+    let bottom = rect.bottom().min(grid.bottom());
+    (bottom - top).max(0) * 2 >= rect.h.max(1)
+}
+
+// ── 4. 进度框 ──
+
+/// 屏幕内排成一行、最多 [`KEY_PROGRESS_MAX`] 个浅色细边框矩形。
+///
+/// 少于 3 个不算失败：进度判据会退化（见 `flow_az3::keys`），绝不猜进度。
+fn find_progress_boxes(gray: &GrayImage, screen: PxRect) -> Vec<PxRect> {
+    let Some(mask) = gray_mask(gray, screen, |luma| {
+        within_u8(KEY_BOX_LUMA, luma)
+    }) else {
+        return Vec::new();
+    };
+    let boxes: Vec<PxRect> = external_contours(&mask.binary)
+        .into_iter()
+        .filter(|block| within(KEY_BOX_ASPECT, block.aspect()))
+        .filter(|block| box_sized(block.region, mask.binary.width(), mask.binary.height()))
+        .filter(|block| within(KEY_BOX_FILL, fill_of(block)))
+        .map(|block| mask.to_frame(block.region, 1))
+        .collect();
+    largest_row(boxes)
+}
+
+/// 进度框相对屏幕的尺寸区间。
+fn box_sized(region: Region, screen_w: u32, screen_h: u32) -> bool {
+    let w = region.w as f32 / screen_w.max(1) as f32;
+    let h = region.h as f32 / screen_h.max(1) as f32;
+    within(KEY_BOX_W, w) && within(KEY_BOX_H, h)
+}
+
+/// 取成员最多的那一行（y 中心在同一带内），按 x 升序、截到 [`KEY_PROGRESS_MAX`]。
+fn largest_row(rects: Vec<PxRect>) -> Vec<PxRect> {
+    let mut rows: Vec<Vec<PxRect>> = Vec::new();
+    for rect in sorted_by_center(rects) {
+        let joins = rows
+            .last()
+            .is_some_and(|row| same_band(row, rect));
+        match rows.last_mut() {
+            Some(row) if joins => row.push(rect),
+            _ => rows.push(vec![rect]),
+        }
+    }
+    let mut best = rows.into_iter().max_by_key(Vec::len).unwrap_or_default();
+    best.sort_by_key(|rect| rect.x);
+    best.truncate(KEY_PROGRESS_MAX);
+    best
+}
+
+fn sorted_by_center(mut rects: Vec<PxRect>) -> Vec<PxRect> {
+    rects.sort_by_key(|rect| (rect.y + rect.h / 2, rect.x));
+    rects
+}
+
+/// 与这一行的 y 中心差 ≤ 半格高（同一行的框高度一致）。
+fn same_band(row: &[PxRect], rect: PxRect) -> bool {
+    let anchor = row
+        .first()
+        .map_or(rect.y + rect.h / 2, |first| first.y + first.h / 2);
+    (rect.y + rect.h / 2 - anchor).abs() <= rect.h.max(1) / 2
+}
+
+// ── 灰度原语（比逐像素 RGB 求亮度省两次乘法）──
+
+/// 灰度阈值掩码。`gray` 是整帧灰度图，`rect` 是帧内窗口。
+fn gray_mask(gray: &GrayImage, rect: PxRect, keep: impl Fn(u8) -> bool) -> Option<Masked> {
+    let (x0, y0, x1, y1) = clip_to(gray.w, gray.h, rect)?;
+    let mut binary = BinaryImage::new(x1 - x0, y1 - y0).ok()?;
+    for y in y0..y1 {
+        let row = gray.row(y);
+        for x in x0..x1 {
+            binary.set(x - x0, y - y0, keep(row[x as usize]));
+        }
+    }
+    Some(Masked { binary, x0, y0 })
 }
 
 #[cfg(test)]
@@ -1042,3 +1504,290 @@ mod tests {
         assert_eq!(most_even(&[0, 10, 20, 30], 40), None, "间距小于下限要拒绝");
     }
 }
+
+/// 黄键台的合成机台：100% 脱敏，只复刻「相对结构」（暗键阵 / 左侧屏幕 / 一行进度框）。
+#[cfg(test)]
+pub(crate) mod keys_fixture {
+    use super::inset;
+    use delta_capture::Frame;
+    use delta_geom::PxRect;
+    use std::time::Instant;
+
+    pub(crate) const W: u32 = 640;
+    pub(crate) const H: u32 = 360;
+    /// 金属台面：亮灰（键块必须比它暗，暗键阵才数得出来）。
+    pub(crate) const MACHINE: [u8; 3] = [152, 152, 150];
+    /// 屏幕内部：近黑。
+    pub(crate) const PANEL: [u8; 3] = [30, 32, 34];
+    /// 未点亮的键面。
+    pub(crate) const KEY: [u8; 3] = [36, 38, 40];
+    /// 亮键的发光图标。
+    pub(crate) const GLOW: [u8; 3] = [235, 200, 40];
+    /// 已勾选的进度框内部（绿）。
+    pub(crate) const CHECK: [u8; 3] = [40, 210, 60];
+    /// 进度框的浅色细边框。
+    pub(crate) const BORDER: [u8; 3] = [200, 200, 200];
+
+    pub(crate) const SCREEN: PxRect = PxRect {
+        x: 80,
+        y: 100,
+        w: 200,
+        h: 180,
+    };
+    pub(crate) const KEY_SIZE: (i32, i32) = (44, 40);
+    pub(crate) const COL_X: [i32; 4] = [322, 382, 442, 502];
+    pub(crate) const ROW_Y: [i32; 4] = [92, 147, 202, 257];
+    pub(crate) const BOX_SIZE: (i32, i32) = (30, 24);
+    pub(crate) const BOX_X: [i32; 5] = [96, 134, 172, 210, 248];
+    pub(crate) const BOX_Y: i32 = 190;
+
+    pub(crate) struct Canvas {
+        data: Vec<u8>,
+    }
+
+    impl Canvas {
+        pub(crate) fn new(fill: [u8; 3]) -> Self {
+            let mut data = vec![0u8; (W * H * 4) as usize];
+            for pixel in data.as_chunks_mut::<4>().0 {
+                pixel[0] = fill[2];
+                pixel[1] = fill[1];
+                pixel[2] = fill[0];
+                pixel[3] = 255;
+            }
+            Self { data }
+        }
+
+        pub(crate) fn rect(&mut self, rect: PxRect, rgb: [u8; 3]) -> &mut Self {
+            for y in rect.y.max(0)..rect.bottom().min(H as i32) {
+                for x in rect.x.max(0)..rect.right().min(W as i32) {
+                    let index = ((y as u32 * W + x as u32) * 4) as usize;
+                    self.data[index] = rgb[2];
+                    self.data[index + 1] = rgb[1];
+                    self.data[index + 2] = rgb[0];
+                }
+            }
+            self
+        }
+
+        /// 空心细边框（进度框就是这种）。
+        fn ring(&mut self, rect: PxRect, thickness: i32, rgb: [u8; 3]) -> &mut Self {
+            self.rect(PxRect { w: thickness, ..rect }, rgb);
+            self.rect(
+                PxRect {
+                    x: rect.right() - thickness,
+                    w: thickness,
+                    ..rect
+                },
+                rgb,
+            );
+            self.rect(PxRect { h: thickness, ..rect }, rgb);
+            self.rect(
+                PxRect {
+                    y: rect.bottom() - thickness,
+                    h: thickness,
+                    ..rect
+                },
+                rgb,
+            )
+        }
+
+        pub(crate) fn frame(&self) -> Frame {
+            Frame::new(W, H, self.data.clone(), Instant::now()).expect("合法合成帧")
+        }
+    }
+
+    /// 第 `index` 颗键（行优先）的矩形。
+    pub(crate) fn key_rect(index: usize) -> PxRect {
+        PxRect {
+            x: COL_X[index % 4],
+            y: ROW_Y[index / 4],
+            w: KEY_SIZE.0,
+            h: KEY_SIZE.1,
+        }
+    }
+
+    /// 第 `index` 颗键的几何中心（点击落点）。
+    pub(crate) fn key_center(index: usize) -> (i32, i32) {
+        let rect = key_rect(index);
+        (rect.x + rect.w / 2, rect.y + rect.h / 2)
+    }
+
+    /// 第 `stage` 个进度框。
+    pub(crate) fn box_rect(stage: usize) -> PxRect {
+        PxRect {
+            x: BOX_X[stage],
+            y: BOX_Y,
+            w: BOX_SIZE.0,
+            h: BOX_SIZE.1,
+        }
+    }
+
+    /// 一帧完整黄键台：金属台面 + 左侧屏幕 + 16 颗暗键（`lit` 里的发光）+ `checked` 个已勾选框。
+    ///
+    /// `lit` / `checked` 之外的键与框保持初始外观，因此同一份夹具能表达「只亮一格」
+    /// 「同一格一直亮」「进度推进」等全部状态。
+    pub(crate) fn panel(lit: &[usize], checked: usize) -> Canvas {
+        let mut canvas = Canvas::new(MACHINE);
+        canvas.rect(SCREEN, PANEL);
+        for stage in 0..BOX_X.len() {
+            let rect = box_rect(stage);
+            if stage < checked {
+                canvas.rect(inset(rect, 2), CHECK);
+            }
+            canvas.ring(rect, 2, BORDER);
+        }
+        for index in 0..16 {
+            let rect = key_rect(index);
+            canvas.rect(rect, KEY);
+            if lit.contains(&index) {
+                let icon = PxRect {
+                    x: rect.x + rect.w / 4,
+                    y: rect.y + rect.h / 4,
+                    w: rect.w / 2,
+                    h: rect.h / 2,
+                };
+                canvas.rect(icon, GLOW);
+            }
+        }
+        canvas
+    }
+
+    /// 不带屏幕的黄键台（用来钉死「缺屏幕必须报错」）。
+    pub(crate) fn panel_without_screen() -> Canvas {
+        let mut canvas = Canvas::new(MACHINE);
+        for index in 0..16 {
+            canvas.rect(key_rect(index), KEY);
+        }
+        canvas
+    }
+
+    /// 只保留前 `count` 颗键（其余涂回台面），用来钉死「缺格子必须拒绝」。
+    pub(crate) fn panel_with_keys(count: usize) -> Canvas {
+        let mut canvas = Canvas::new(MACHINE);
+        canvas.rect(SCREEN, PANEL);
+        for index in 0..count.min(16) {
+            canvas.rect(key_rect(index), KEY);
+        }
+        canvas
+    }
+
+    /// 没有进度框的屏幕（进度判据要退化）。
+    pub(crate) fn panel_without_boxes() -> Canvas {
+        let mut canvas = Canvas::new(MACHINE);
+        canvas.rect(SCREEN, PANEL);
+        for index in 0..16 {
+            canvas.rect(key_rect(index), KEY);
+        }
+        canvas
+    }
+}
+
+#[cfg(test)]
+mod keys_tests {
+    use super::keys_fixture::*;
+    use super::*;
+
+    #[test]
+    fn locates_the_whole_module_keys_panel_in_one_frame() {
+        let frame = panel(&[5], 0).frame();
+        let keys = locate_keys(&frame).expect("合成黄键台必须一次定位成功");
+
+        assert_eq!(keys.cells.len(), KEY_GRID_SIDE * KEY_GRID_SIDE, "16 颗键");
+        assert_eq!(keys.screen, SCREEN, "屏幕必须量到同一块区域");
+        assert_eq!(keys.progress.len(), KEY_PROGRESS_MAX, "5 个进度框");
+        assert_eq!(
+            keys.progress,
+            (0..KEY_PROGRESS_MAX).map(box_rect).collect::<Vec<_>>(),
+            "进度框必须自左向右排序"
+        );
+        assert_eq!(
+            keys.grid,
+            PxRect {
+                x: COL_X[0],
+                y: ROW_Y[0],
+                w: COL_X[3] + KEY_SIZE.0 - COL_X[0],
+                h: ROW_Y[3] + KEY_SIZE.1 - ROW_Y[0],
+            },
+            "外接框 = 16 颗键的并集"
+        );
+        for index in 0..16 {
+            let cell = keys.cells[index];
+            let (cx, cy) = key_center(index);
+            assert_eq!(
+                (cell.x + cell.w / 2, cell.y + cell.h / 2),
+                (cx, cy),
+                "第 {index} 颗键的中心（行优先）"
+            );
+        }
+    }
+
+    #[test]
+    fn glowing_key_still_yields_a_cell_on_its_centre() {
+        // 整颗键亮成黄块时它不再是「暗键」—— 这一格由中位键尺寸补齐，
+        // 中心必须仍落在键的几何中心上（否则会点在键缝里）。
+        let lit = locate_keys(&panel(&[6], 0).frame()).expect("亮键不影响定位");
+        assert_eq!(lit.cells[6], key_rect(6));
+        assert_eq!(lit.cells.len(), 16);
+    }
+
+    #[test]
+    fn boxes_report_only_the_checked_count_through_their_pixels() {
+        let frame = panel(&[], 3).frame();
+        let keys = locate_keys(&frame).expect("勾选状态不影响几何");
+        assert_eq!(keys.progress.len(), KEY_PROGRESS_MAX, "框本身一个不少");
+    }
+
+    #[test]
+    fn panel_without_screen_reports_the_screen() {
+        assert_eq!(
+            locate_keys(&panel_without_screen().frame()),
+            Err(LocateError::Screen)
+        );
+    }
+
+    #[test]
+    fn ten_keys_are_not_a_key_grid() {
+        // 10 颗键对不上 4×4：宁可报错，也不许凑出一套假坐标乱点。
+        assert_eq!(
+            locate_keys(&panel_with_keys(10).frame()),
+            Err(LocateError::Keys)
+        );
+    }
+
+    #[test]
+    fn thirteen_keys_still_form_a_full_grid() {
+        // 13 颗键 = 3 颗正在发光/被遮挡：允许，缺的 3 格用中位键尺寸补出来。
+        let keys = locate_keys(&panel_with_keys(13).frame()).expect("13 颗键仍能定出 4×4");
+        assert_eq!(keys.cells.len(), 16);
+        assert_eq!(keys.cells[0], key_rect(0), "实测格用实测矩形");
+        assert_eq!(
+            keys.cells[15].w, KEY_SIZE.0,
+            "补出来的格用中位键尺寸：{:?}",
+            keys.cells[15]
+        );
+    }
+
+    #[test]
+    fn missing_progress_boxes_degrade_to_an_empty_list() {
+        // 读不到进度框不是定位失败：返回空，让执行层退化（绝不猜进度）。
+        let keys = locate_keys(&panel_without_boxes().frame()).expect("几何仍然完整");
+        assert!(keys.progress.is_empty(), "{:?}", keys.progress);
+        assert_eq!(keys.cells.len(), 16);
+    }
+
+    #[test]
+    fn blank_machine_body_has_no_key_grid() {
+        assert_eq!(
+            locate_keys(&Canvas::new(MACHINE).frame()),
+            Err(LocateError::Keys)
+        );
+    }
+
+    #[test]
+    fn tiny_frame_is_rejected_before_scanning() {
+        let frame =
+            Frame::new(64, 64, vec![0u8; 64 * 64 * 4], std::time::Instant::now()).expect("合法帧");
+        assert_eq!(locate_keys(&frame), Err(LocateError::Frame { w: 64, h: 64 }));
+    }
+}
+
