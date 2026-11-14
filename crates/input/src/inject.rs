@@ -18,9 +18,9 @@ use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_
 use crate::InputError;
 
 /// 单个子步最大位移（浮光：Delta Force 里一次大跳会被丢帧）。
+///
+/// **这条不许放宽**：游戏 raw input 每子步 ≤20px 是硬约束，加大必丢事件。
 pub const MAX_SUBSTEP_PX: i32 = 20;
-/// 子步之间的间隔。
-pub const SUBSTEP_DELAY: Duration = Duration::from_millis(2);
 /// 左键按下到抬起的保持时长（上游 `mouse.py` 的 0.05s）。
 pub const CLICK_HOLD: Duration = Duration::from_millis(50);
 /// 连点之间的间隔（上游 `click_sequence(delay=0.05)`）。
@@ -98,10 +98,6 @@ impl Sink {
                 Ok(())
             }
         }
-    }
-
-    pub(crate) fn is_recording(&self) -> bool {
-        matches!(self, Self::Record(_))
     }
 }
 
@@ -309,7 +305,6 @@ mod tests {
         sink.emit(Injected::LeftUp).expect("记录");
         assert_eq!(handle.events(), vec![Injected::LeftDown, Injected::LeftUp]);
         assert_eq!(handle.len(), 2);
-        assert!(sink.is_recording());
     }
 
     #[test]

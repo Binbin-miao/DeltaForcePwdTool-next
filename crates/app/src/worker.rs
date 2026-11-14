@@ -9,17 +9,22 @@ use std::time::Duration;
 
 use delta_capture::{CaptureBackend, CaptureSession, Frame, FRAME_BUDGET};
 use delta_config::{Config, PxView, Timings};
+use delta_flow_az3::Clock;
 use delta_geom::{MonitorInfo, PxPoint, PxRect};
 use delta_hotkey::Hotkey;
+use delta_scene::locate::Locate;
 use delta_ui::SceneKind;
 
-use crate::platform;
+use crate::{platform, ui_guard};
 
 /// 热键等待切片：既保证热键响应，也保证线程能及时看到退出标志。
 const HOTKEY_POLL: Duration = Duration::from_millis(200);
 
 /// 总开关关掉时给用户的唯一一句解释（检查入口与识别入口共用，防两处文案漂移）。
 const NOTICE_MASTER_PAUSED: &str = "识别已暂停（设置里可重新打开）";
+
+/// 两帧认出的界面不一致时的解释（界面在识别过程中变了 ⇒ 零注入）。
+const CHANGED_NOTICE: &str = "界面在识别过程中变了，请重新按 F";
 
 /// 后台 → UI 的事件。
 #[derive(Debug, Clone)]
@@ -388,6 +393,265 @@ fn open_session(config: &Config, tx: &mpsc::Sender<UiEvent>) -> Option<CaptureSe
     }
 }
 
+// ── 就绪等待（Q1/Q3：面板 0.4s 才淡入、首颗亮键 1.8s 才出现）──
+
+/// ready 等待的总预算：面板出现到第一颗可识别亮键实测 1.4s × 1.5（spec P1）。
+pub const READY_BUDGET_MS: u64 = 2100;
+/// 等待期间的抓帧间隔（40ms ≈ 25fps；2.1s 约 52 帧，任务会话 300 帧装得下）。
+const READY_POLL_MS: u64 = 40;
+/// 场景判别的容忍线：连续这么多帧 `Unknown` **且** 已耗这么久才允许拒绝（spec P6）。
+const SCENE_UNKNOWN_FRAMES: u32 = 3;
+const SCENE_UNKNOWN_MIN_MS: u64 = 1200;
+
+/// 通用就绪等待：每轮取一次 `probe`，`Found` 立刻返回；预算用尽返回最后一次的三态。
+///
+/// **每轮读一次 `cancel`**（铁律：关掉总开关后不许还干等 2.1s）。
+/// `NotYet` / `Absent` 都不提前退出 —— 0~1.8s 之间画面本来就是「什么都没有」，
+/// 提前判失败正是「首开要按两次 F」的根因（spec B1/B2）。
+fn wait_ready<T>(
+    clock: &mut impl Clock,
+    cancel: &AtomicBool,
+    budget_ms: u64,
+    min_probes: u32,
+    mut probe: impl FnMut() -> Locate<T>,
+) -> Locate<T> {
+    let began = clock.now_ms();
+    let mut probes = 0u32;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Locate::Absent;
+        }
+        probes += 1;
+        let seen = probe();
+        if seen.is_found() {
+            return seen;
+        }
+        let elapsed = clock.now_ms().saturating_sub(began);
+        if elapsed >= budget_ms && probes >= min_probes {
+            return seen;
+        }
+        clock.sleep_ms(READY_POLL_MS.min(budget_ms.saturating_sub(elapsed).max(1)));
+    }
+}
+
+/// 等画面能被判别成一个已知界面（Q3：摩斯面板打开也有 1.4s 空窗）。
+///
+/// 「已知」= 常规判别命中，或 AZ3 二级判别命中任一玩法。
+fn wait_scene_ready(
+    session: &mut CaptureSession,
+    full: PxRect,
+    view: &PxView,
+    cancel: &AtomicBool,
+    tx: &mpsc::Sender<UiEvent>,
+) -> Locate<Frame> {
+    let mut clock = delta_flow_az3::SystemClock::new();
+    wait_ready(
+        &mut clock,
+        cancel,
+        SCENE_UNKNOWN_MIN_MS,
+        SCENE_UNKNOWN_FRAMES,
+        || match session.grab(full) {
+            Ok(frame) => {
+                let known = delta_scene::detect(&frame, view).is_actionable()
+                    || delta_scene::az3_variant(&frame, view).is_known();
+                if known {
+                    Locate::Found(frame)
+                } else {
+                    Locate::NotYet
+                }
+            }
+            Err(error) => {
+                let _ = tx.send(UiEvent::Failed(error.to_string()));
+                Locate::Absent
+            }
+        },
+    )
+}
+
+/// 等黄键台真的可以动手：面板可定位 **且** 亮键像素 ≥3000px@720p，返回就绪的那一帧。
+fn wait_keys_ready(
+    session: &mut CaptureSession,
+    full: PxRect,
+    cancel: &AtomicBool,
+    tx: &mpsc::Sender<UiEvent>,
+) -> Locate<Frame> {
+    let mut clock = delta_flow_az3::SystemClock::new();
+    wait_ready(&mut clock, cancel, READY_BUDGET_MS, 1, || {
+        match session.grab(full) {
+            Ok(frame) => match delta_scene::locate::keys_ready(&frame) {
+                Locate::Found(()) => Locate::Found(frame),
+                Locate::NotYet => Locate::NotYet,
+                Locate::Absent => Locate::Absent,
+            },
+            Err(error) => {
+                let _ = tx.send(UiEvent::Failed(error.to_string()));
+                Locate::Absent
+            }
+        }
+    })
+}
+
+/// Q5 第二道闸的三种结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiGate {
+    /// 模板命中：这就是某个解锁界面 ⇒ 免掉场景投票，直接按它开跑。
+    Strong(delta_scene::Scene),
+    /// 说不清（灰带 / 模板库为空 / 抓不到帧）⇒ 原路径完全不变。
+    Pass,
+    /// 一张都不像 ⇒ 不是解锁界面，零注入。
+    Reject(&'static str),
+}
+
+/// Q5 第二道闸：先看一眼这是不是**某个解锁界面**（正样本模板）。
+///
+/// 抓帧只抓**一帧**、且用独立会话（不占任务配额）；模板库为空 / 抓帧失败一律 `Pass`
+/// （缺素材绝不拒绝识别，抓不到帧也交给后面的正式路径报错）。
+fn ui_gate(guard: &ui_guard::UiGuard, snapshot: &Config, monitor: MonitorInfo) -> UiGate {
+    if guard.is_empty() {
+        return UiGate::Pass;
+    }
+    let Ok(frame) = grab_full(monitor, snapshot.capture_backend) else {
+        return UiGate::Pass;
+    };
+    match guard.verdict(&frame) {
+        ui_guard::UiVerdict::Target(scene) => UiGate::Strong(scene),
+        ui_guard::UiVerdict::Reject(reason) => {
+            save_evidence(
+                "reject",
+                reason,
+                monitor,
+                snapshot.capture_backend,
+                "Q5 第二道闸（UI 模板未命中任何解锁界面）",
+            );
+            UiGate::Reject(reason)
+        }
+        ui_guard::UiVerdict::Gray => UiGate::Pass,
+    }
+}
+
+/// 就绪判别的依据 —— 前两种都**不必**等结构判别，直接抓当前帧。
+#[derive(Debug, Clone, Copy)]
+enum ReadyBasis {
+    /// UI 模板已确认是某个解锁界面（面板已经画出来了，再等只是白等 1.2s）。
+    Template(delta_scene::Scene),
+    /// 强制模式（F5/F6/F7）：用户按键就是命令。
+    Forced,
+    /// 自动模式：等结构判别长起来（原路径）。
+    Detect,
+}
+
+impl ReadyBasis {
+    /// 已知场景或强制模式 ⇒ 场景投票整段不参与。
+    fn skips_detect(self) -> bool {
+        !matches!(self, ReadyBasis::Detect)
+    }
+
+    /// 模板确认过的场景（给免投票的场景分类用）。
+    fn confirmed(self) -> Option<delta_scene::Scene> {
+        match self {
+            ReadyBasis::Template(scene) => Some(scene),
+            ReadyBasis::Forced | ReadyBasis::Detect => None,
+        }
+    }
+}
+
+/// 失败留证需要的两样东西：哪块屏、哪个采集后端。
+#[derive(Debug, Clone, Copy)]
+struct Evidence {
+    monitor: MonitorInfo,
+    backend: CaptureBackend,
+}
+
+/// 等到一帧**真的可以动手**的画面；拿不到就当场把拒绝/失败原因发出去并返回 `None`。
+///
+/// 三件事收在这一个函数里（调用点不必知道先等什么后等什么）：
+/// 1. 等场景判别出结果（Q3：`Unknown` 连续 3 帧且 ≥1.2s 才判失败，spec B12）；
+/// 2. 模板命中 / 强制模式跳过判别（前者已经知道是哪个界面，后者用户按键就是命令）；
+/// 3. 取消位在同一轮里生效（用户关掉总开关不该还干等）。
+fn await_frame(
+    session: &mut CaptureSession,
+    full: PxRect,
+    view: &PxView,
+    cancel: &AtomicBool,
+    basis: ReadyBasis,
+    evidence: Evidence,
+    tx: &mpsc::Sender<UiEvent>,
+) -> Option<Frame> {
+    if basis.skips_detect() || wait_scene_ready(session, full, view, cancel, tx).is_found() {
+        return grab_now(session, full, tx);
+    }
+    if cancel.load(Ordering::SeqCst) {
+        let _ = tx.send(UiEvent::Failed("已取消".to_owned()));
+        return None;
+    }
+    let reason = format!("{SCENE_UNKNOWN_MIN_MS}ms / {SCENE_UNKNOWN_FRAMES} 帧内没认出界面");
+    save_evidence(
+        "reject",
+        &reason,
+        evidence.monitor,
+        evidence.backend,
+        "场景判别失败",
+    );
+    let _ = tx.send(UiEvent::Rejected("未检测到游戏界面".to_owned()));
+    None
+}
+
+/// 补抓一帧；失败即报错。
+fn grab_now(
+    session: &mut CaptureSession,
+    full: PxRect,
+    tx: &mpsc::Sender<UiEvent>,
+) -> Option<Frame> {
+    match session.grab(full) {
+        Ok(frame) => Some(frame),
+        Err(error) => {
+            let _ = tx.send(UiEvent::Failed(error.to_string()));
+            None
+        }
+    }
+}
+
+/// 开跑前的最后一道复核：变体必须还是同一个，且（黄键台的）就绪判据必须成立。
+///
+/// 返回 `Err(文案)` = 必须拒绝（调用方零注入退出）。
+fn confirm_az3(
+    verdict: Locate<Frame>,
+    view: &PxView,
+    expected: delta_scene::Az3Kind,
+    config: &Config,
+    monitor: MonitorInfo,
+) -> Result<(), String> {
+    let frame = match verdict {
+        Locate::Found(frame) => frame,
+        Locate::NotYet => {
+            let reason = format!(
+                "{} {}ms 内没亮起来（面板已定位，但亮键像素不足 {}px）",
+                expected.label(),
+                READY_BUDGET_MS,
+                delta_scene::locate::READY_LIT_MIN_PX
+            );
+            save_evidence("reject", &reason, monitor, config.capture_backend, "就绪等待超时");
+            return Err(reason);
+        }
+        Locate::Absent => {
+            let reason = format!("{} 面板已消失", expected.label());
+            save_evidence("reject", &reason, monitor, config.capture_backend, "就绪等待失败");
+            return Err(reason);
+        }
+    };
+    let confirmed = delta_scene::az3_variant(&frame, view);
+    if confirmed == expected {
+        return Ok(());
+    }
+    let reason = format!(
+        "界面复核不一致（判别为 {}，复核为 {}）",
+        expected.label(),
+        confirmed.label()
+    );
+    save_evidence("reject", &reason, monitor, config.capture_backend, "变体复核");
+    Err(reason)
+}
+
 /// 只读检查：找窗 + 场景判别，**零输入**。
 fn probe(config: &Arc<Mutex<Config>>, monitor: MonitorInfo, tx: &mpsc::Sender<UiEvent>) {
     let _ = tx.send(UiEvent::Started);
@@ -467,6 +731,35 @@ fn run_once(
         return;
     }
 
+    // Q5 第二道闸（用户拍板：解锁界面用 UI 判定模板）：先看一眼这是不是**某个解锁界面**。
+    // 命中 ⇒ 免掉场景投票直接按它开跑；一张都不像 ⇒ 零注入当场拒绝；说不清 ⇒ 一切照旧。
+    // 放在 `focus_game_window()` 之前：先把「不该动的界面」挡掉，再谈激活游戏。
+    // 强制模式（F5/F6/F7）不参与这道闸 —— 用户按键就是命令，连模板都不必读。
+    //
+    // 注意这里每轮都重新扫目录 + 解码模板：当前 3 张 200×112（约 33KB）合计远低于 1ms，
+    // 改模板后立刻生效，不值得为它引入缓存失效逻辑。
+    // shortcut: 模板 ≤ ~20 张时直读；超过就该加「目录 mtime 命中即复用」的缓存。
+    let guard = match forced {
+        Some(_) => ui_guard::UiGuard::default(),
+        None => ui_guard::UiGuard::load(&crate::ui_images_dir()),
+    };
+    let strong = match forced {
+        Some(_) => None,
+        None => match ui_gate(&guard, &snapshot, monitor) {
+            UiGate::Strong(scene) => Some(scene),
+            UiGate::Reject(reason) => {
+                let _ = tx.send(UiEvent::Rejected(reason.to_owned()));
+                return;
+            }
+            UiGate::Pass => None,
+        },
+    };
+    let basis = match strong {
+        Some(scene) => ReadyBasis::Template(scene),
+        None if forced.is_some() => ReadyBasis::Forced,
+        None => ReadyBasis::Detect,
+    };
+
     if let Err(reason) = platform::focus_game_window() {
         let _ = tx.send(UiEvent::Rejected(reason));
         return;
@@ -480,19 +773,45 @@ fn run_once(
     let Some(mut session) = open_session(&snapshot, tx) else {
         return;
     };
+    let full = full_rect(monitor);
 
-    let frame = match session.grab(full_rect(monitor)) {
-        Ok(frame) => frame,
-        Err(error) => {
-            let _ = tx.send(UiEvent::Failed(error.to_string()));
-            return;
-        }
+    // Q1/Q3：面板 0.4s 才淡入、首颗亮键 1.8s 才出现 —— 单帧判别必然判失败，
+    // 这就是「第一次按 F 没用、要按两次」的根因。这里等画面真的长起来再判。
+    let Some(frame) = await_frame(
+        &mut session,
+        full,
+        &view,
+        cancel,
+        basis,
+        Evidence {
+            monitor,
+            backend: snapshot.capture_backend,
+        },
+        tx,
+    ) else {
+        return;
+    };
+    // 第二帧复核（spec B15/B17）：用**本来就要用的这一帧**再判一次，零额外抓帧。
+    // 单帧命中不足以下手：两帧不一致就说明界面在变，宁可交回判别/拒绝。
+    let hint = match basis.confirmed() {
+        Some(expected) => match ui_guard::recheck(
+            ui_guard::UiVerdict::Target(expected),
+            guard.verdict(&frame),
+        ) {
+            ui_guard::Recheck::Keep(scene) => Some(scene),
+            ui_guard::Recheck::Downgrade => None,
+            ui_guard::Recheck::Changed => {
+                let _ = tx.send(UiEvent::Rejected(CHANGED_NOTICE.to_owned()));
+                return;
+            }
+        },
+        None => None,
     };
     // 强制模式（上游 F5/F6 的等价物）：跳过判别直接用指定场景。
     // Console 有两条实现路径（v5 旧操作台 / AZ3 4 类玩法），所以必须先问 AZ3：
     // 命中才走 `run_az3`，未命中一律留给旧 `run_console` —— 否则旧操作台会被 AZ3 顶掉。
-    // 自动模式下若常规判别为 Unknown，再进一步检查是否为 AZ3 4 类玩法之一；
-    // 仍为 Az3Kind::None 时立即拒绝，零输入（spec D6）。
+    // 自动模式：UI 模板命中就直接采信；否则常规判别，仍为 Unknown 时再问 AZ3 4 类玩法，
+    // 都没有就立即拒绝，零输入（spec D6）。
     let (scene, az3_kind, actionable, reason) = match forced {
         Some(SceneKind::Console) => (
             SceneKind::Console,
@@ -501,30 +820,7 @@ fn run_once(
             "",
         ),
         Some(kind) => (kind, delta_scene::Az3Kind::None, true, ""),
-        None => {
-            let verdict = delta_scene::detect(&frame, &view);
-            if verdict.is_actionable() {
-                let mapped = map_scene(verdict.scene);
-                let az3 = if mapped == SceneKind::Console {
-                    delta_scene::az3_variant(&frame, &view)
-                } else {
-                    delta_scene::Az3Kind::None
-                };
-                (mapped, az3, true, verdict.reason)
-            } else {
-                let az3 = delta_scene::az3_variant(&frame, &view);
-                if az3.is_known() {
-                    (SceneKind::Console, az3, true, "检测到 AZ3 操作台界面")
-                } else {
-                    (
-                        SceneKind::Unknown,
-                        delta_scene::Az3Kind::None,
-                        false,
-                        verdict.reason,
-                    )
-                }
-            }
-        }
+        None => auto_classify(&frame, &view, hint),
     };
     let sequence = if scene == SceneKind::Console && reads_led_sequence(az3_kind) {
         read_sequence(&mut session, led_region_for(&view, az3_kind))
@@ -554,8 +850,24 @@ fn run_once(
         return;
     }
 
+    // Q1/Q5：**真开跑前再抓一帧**。
+    // - 黄键台：必须「面板可定位 **且** 亮键 ≥3000px」两条同时成立（spec B2/B3、P1）；
+    // - 同时复核 AZ3 变体，不一致立即拒绝 —— 把「误判 × 上百次乱点」压到 ≤1 帧。
+    if scene == SceneKind::Console && az3_kind.is_known() {
+        let verdict = if az3_kind == delta_scene::Az3Kind::ModuleKeys {
+            wait_keys_ready(&mut session, full, cancel, tx)
+        } else {
+            // 其余 AZ3 玩法没有「亮键像素」这条判据，复核用的就是刚判别过的那一帧。
+            Locate::Found(frame.clone())
+        };
+        if let Err(reason) = confirm_az3(verdict, &view, az3_kind, &snapshot, monitor) {
+            let _ = tx.send(UiEvent::Rejected(reason));
+            return;
+        }
+    }
+
     match scene {
-        SceneKind::Morse => run_morse(&snapshot, &view, &mut session, tx),
+        SceneKind::Morse => run_morse(&snapshot, &view, &mut session, cancel, tx),
         SceneKind::Fingerprint => run_fingerprint(&snapshot, &view, &mut session, tx),
         SceneKind::Console => {
             if az3_kind.is_known() {
@@ -571,6 +883,54 @@ fn run_once(
         SceneKind::Unknown => {
             let _ = tx.send(UiEvent::Rejected("检查游戏".to_owned()));
         }
+    }
+}
+
+/// 自动模式的场景分类：**UI 模板优先**（它已经回答了「是哪个界面」），否则结构判别 + AZ3 兜底。
+///
+/// 返回 `(场景, AZ3 变体, 是否可执行, 原因)`。
+fn auto_classify(
+    frame: &Frame,
+    view: &PxView,
+    hint: Option<delta_scene::Scene>,
+) -> (SceneKind, delta_scene::Az3Kind, bool, &'static str) {
+    // 模板命中就不必投票：结构分数只可能把已经确定的事情投乱。
+    if let Some(known) = hint {
+        let scene = map_scene(known);
+        return (
+            scene,
+            az3_variant_of(scene, frame, view),
+            true,
+            "UI 模板确认解锁界面",
+        );
+    }
+    let verdict = delta_scene::detect(frame, view);
+    if verdict.is_actionable() {
+        let scene = map_scene(verdict.scene);
+        return (scene, az3_variant_of(scene, frame, view), true, verdict.reason);
+    }
+    let az3 = delta_scene::az3_variant(frame, view);
+    if az3.is_known() {
+        return (SceneKind::Console, az3, true, "检测到 AZ3 操作台界面");
+    }
+    (
+        SceneKind::Unknown,
+        delta_scene::Az3Kind::None,
+        false,
+        verdict.reason,
+    )
+}
+
+/// 只有 `Console` 有 AZ3 子玩法（v5 旧操作台 / AZ3 四类玩法），其余场景恒 `None`。
+fn az3_variant_of(
+    scene: SceneKind,
+    frame: &Frame,
+    view: &PxView,
+) -> delta_scene::Az3Kind {
+    if scene == SceneKind::Console {
+        delta_scene::az3_variant(frame, view)
+    } else {
+        delta_scene::Az3Kind::None
     }
 }
 
@@ -611,18 +971,26 @@ fn read_sequence(session: &mut CaptureSession, led_region: PxRect) -> Result<Str
 }
 
 /// 摩斯流程（薄适配：`LiveScreen` / `LiveInput` 由 flow crate 提供）。
-fn run_morse(config: &Config, view: &PxView, session: &mut CaptureSession, tx: &mpsc::Sender<UiEvent>) {
+fn run_morse(
+    config: &Config,
+    view: &PxView,
+    session: &mut CaptureSession,
+    cancel: &AtomicBool,
+    tx: &mpsc::Sender<UiEvent>,
+) {
     let mut input = delta_flow_morse::LiveInput;
     let job = delta_flow_morse::MorseRun {
         view,
         timings: &config.timings,
         // 上游 morse_auto_click 的等价物：控制输入完成后是否自动点确认。
         auto_click: config.auto_confirm,
+        // 输入横条 ROI：输错接力的观察窗口（未标定 ⇒ 零面积 ⇒ 不做错误态观察）。
+        panel: delta_flow_morse::panel_roi(view),
     };
     // 适配层只借用会话：跑完即释放借用，才能读 `frames_taken` 判配额。
     let outcome = {
         let mut screen = delta_flow_morse::LiveScreen::new(session);
-        delta_flow_morse::run(&mut screen, &mut input, &job)
+        delta_flow_morse::run(&mut screen, &mut input, &job, cancel)
     };
     if over_budget(session, tx, view.monitor, config.capture_backend) {
         return;
@@ -633,7 +1001,7 @@ fn run_morse(config: &Config, view: &PxView, session: &mut CaptureSession, tx: &
         total,
         note: "已输入数字".to_owned(),
     });
-    if outcome.digits_complete() {
+    if outcome.is_complete() {
         let _ = tx.send(UiEvent::Result(delta_ui::morse_result(
             &outcome.password,
             config.auto_confirm,
@@ -644,7 +1012,13 @@ fn run_morse(config: &Config, view: &PxView, session: &mut CaptureSession, tx: &
             &outcome.password,
             config.auto_confirm,
         )));
-        let _ = tx.send(UiEvent::Failed(format!("未识别 {}", outcome.password)));
+        // 输错接力失败也说清是哪一档失败：解码失败 vs 连续敲错。
+        let detail = outcome
+            .errors
+            .last()
+            .cloned()
+            .unwrap_or_else(|| format!("未识别 {}", outcome.password));
+        let _ = tx.send(UiEvent::Failed(detail));
     }
 }
 
@@ -1241,5 +1615,51 @@ mod tests {
             view.console.led_region,
             "旧操作台必须读 v5 的 LED 区"
         );
+    }
+
+    /// 纯黑画面：模板命中路径根本不看内容（`detect` 不参与），正好用来证明这一点。
+    fn black_frame() -> Frame {
+        Frame::new(
+            128,
+            96,
+            vec![0u8; 128 * 96 * 4],
+            std::time::Instant::now(),
+        )
+        .expect("合成帧")
+    }
+
+    #[test]
+    fn a_template_hit_routes_without_asking_the_scene_detector() {
+        // 「UI 模板确认解锁界面」这句原因只有 `ReadyBasis::Template` 分支会产生，
+        // 拿到它 = 场景投票确实没跑（全黑帧也不可能靠结构分数认出任何界面）。
+        let (scene, az3, actionable, reason) = auto_classify(
+            &black_frame(),
+            &led_view(),
+            Some(delta_scene::Scene::Morse),
+        );
+        assert_eq!(scene, SceneKind::Morse);
+        assert_eq!(az3, delta_scene::Az3Kind::None);
+        assert!(actionable, "模板命中 ⇒ 可以直接开跑");
+        assert_eq!(reason, "UI 模板确认解锁界面");
+    }
+
+    #[test]
+    fn an_unknown_screen_without_a_template_stays_zero_injection() {
+        let (scene, _, actionable, _) = auto_classify(&black_frame(), &led_view(), None);
+        assert_eq!(scene, SceneKind::Unknown);
+        assert!(!actionable, "既没模板命中又认不出界面 ⇒ 必须零注入");
+    }
+
+    #[test]
+    fn only_a_confirmed_template_or_force_mode_skips_scene_detection() {
+        assert!(ReadyBasis::Template(delta_scene::Scene::Console).skips_detect());
+        assert!(ReadyBasis::Forced.skips_detect());
+        assert!(!ReadyBasis::Detect.skips_detect(), "灰带 / 无模板必须照旧走 detect");
+        assert_eq!(
+            ReadyBasis::Template(delta_scene::Scene::Morse).confirmed(),
+            Some(delta_scene::Scene::Morse)
+        );
+        assert_eq!(ReadyBasis::Forced.confirmed(), None);
+        assert_eq!(ReadyBasis::Detect.confirmed(), None);
     }
 }

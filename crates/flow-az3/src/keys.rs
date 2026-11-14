@@ -1,17 +1,21 @@
-//! 黄键台 / 模块按键台（`ModuleKeys`）：右侧 4×4 按键阵亮一个点一个，左侧屏幕里 5 个进度框。
+//! 黄键台 / 模块按键台（`ModuleKeys`）：右侧 4×4 按键阵亮一个点一个，左侧屏幕里 5 个进度格。
 //!
 //! 几何**每帧自适应**（[`locate_keys`]）：固定百分比坐标已证伪 —— 换一版界面布局，
 //! 旧配置的矩形就整体偏出去，四等分切出来的格子落在键缝里（点空）。
 //!
-//! 闭环：
-//! 1. 每帧整帧抓**一次**，`locate_keys` 量出 16 颗键的**实测矩形**与屏幕里的进度框；
-//! 2. 逐格统计黄/绿高亮像素，选得分最高、≥ [`MIN_GLOW_PIXELS`]、**未点过 / 未判死**的格，点其中心；
-//! 3. 点完等 [`CLICK_ACK_TIMEOUT_MS`]：进度 +1 视为有效，超时判该键无效（`dead`）；
-//! 4. 进度勾满 [`TOTAL_STAGES`] → Done；16 格点完仍不满 → Abort。
+//! 闭环（全部判据都来自实测录像，见 `.scratch/az3-fix-batch/spec.md`）：
+//! 1. 每帧整帧抓**一次**，`locate_keys` 量出 16 颗键的**实测矩形**与屏幕里的进度格；
+//! 2. **同一帧亮着的模块按钮全都要点**（用户拍板：不要求顺序、点过的记 `clicked`）；
+//! 3. 点完等 [`CLICK_ACK_TIMEOUT_MS`]：进度推进 / 亮光熄灭视为吃下，连续 2 轮无效判 `dead`；
+//! 4. 左侧进度格读到 **5 个 ✓** → Done。
 //!
-//! **零值/退化边界**：进度框少于 [`MIN_PROGRESS_BOXES`] 个时读不到进度 —— 此时不判进度、
-//! 不判死任何键，只等游戏吃下每次点击，靠「16 格点完」收尾，并在文案里写明用的是退化判据。
-//! 绝不假装读到了进度，也绝不因为读不到进度就盲点。
+//! **靶点只有一类可以点**：[`KeyTarget::ModuleButton`]。屏幕内那 5 格是**只读**进度指示器，
+//! 永远不发点击（[`KeyTarget::ProgressBox`]）—— 旧实现在屏幕格里挑最亮的去点，
+//! 点的是进度指示器本身，一辈子都点不亮。
+//!
+//! **零值/退化边界**：进度格少于 [`MIN_PROGRESS_BOXES`] 个就读不到进度 —— 此时不判进度、
+//! 不判死任何键，只等游戏吃下每次点击，靠「16 格点完 / 亮光全熄灭」收尾，
+//! 并在文案里写明用的是退化判据。绝不假装读到了进度，也绝不因为读不到进度就盲点。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -31,18 +35,36 @@ const CELLS: usize = GRID_SIDE * GRID_SIDE;
 const TOTAL_STAGES: usize = 5;
 /// 单格高亮像素数下限（滤掉反光与描边）。
 const MIN_GLOW_PIXELS: u32 = 40;
-/// 单格进度勾选的绿色像素数下限。
-const MIN_CHECK_PIXELS: u32 = 10;
-/// 点击后等待进度推进的上限；超时判定该键无效。
+/// 单格进度勾选的绿色像素数下限（实测 ✓ 约 100~170px，留余量）。
+const MIN_CHECK_PIXELS: u32 = 30;
+/// 点击后等待游戏吃下的上限；超时判定这一轮无效。
 const CLICK_ACK_TIMEOUT_MS: u64 = 400;
+/// 同一颗键连续这么多轮「点了还亮且进度没动」才判死（spec B6）。
+const DEAD_STRIKES: u8 = 2;
 /// 连续多少帧定位失败才放弃（50ms 轮询下 ≈0.3s 容错）。
 const LOCATE_FAIL_LIMIT: u32 = 6;
-/// 少于这么多个进度框就读不到进度（退化判据）。
+/// 少于这么多个进度格就读不到进度（退化判据）。
 const MIN_PROGRESS_BOXES: usize = 3;
 /// 定位失败时给用户的下一步动作。
 const POSE_HINT: &str = "（请正对按键面板，让屏幕和 4×4 按键都进入画面）";
-/// 进度框读不到时的收尾说明（这台机器常态：屏幕整体亮度太低）。
-const PROGRESS_NOTE: &str = "；进度格未识别，本条结论依据「亮光熄灭」判据";
+/// 进度格读不到时的收尾说明（这台机器可能真的读不出来）。
+const PROGRESS_NOTE: &str = "；退化判据：进度格未识别，本条结论依据「亮光熄灭」";
+
+/// 靶点分类：**只有 [`KeyTarget::ModuleButton`] 允许发点击**，[`KeyTarget::ProgressBox`] 只读。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyTarget {
+    /// 右侧 4×4 模块按钮（会发黄绿光，点它才推进）。
+    ModuleButton,
+    /// 屏幕内那 5 格进度指示（只读）。
+    ProgressBox,
+}
+
+impl KeyTarget {
+    /// 查表：可点击的靶点只有一种。新增靶点默认**不可点**（fail-closed）。
+    fn clickable(self) -> bool {
+        matches!(self, Self::ModuleButton)
+    }
+}
 
 pub fn run(
     screen: &mut impl Screen,
@@ -79,7 +101,7 @@ pub fn run(
             }
         };
         // `locate_keys` 内部把帧归一到 720p 判定、坐标再乘回原图，所以这里拿到的是
-        // **原图坐标**，必须配**原帧**统计像素。像素数阈值（40 / 10）是 720p 口径，
+        // **原图坐标**，必须配**原帧**统计像素。像素数阈值是 720p 口径，
         // 1080p 下同一块区域像素多 2.25 倍 —— 按 `scale²` 放大才对得上。
         if let Some(outcome) = state.step(&frame, scale, pointer, clock) {
             return outcome;
@@ -102,9 +124,12 @@ pub fn run(
 struct State {
     clicked: [bool; CELLS],
     dead: [bool; CELLS],
-    pending: Option<usize>,
+    /// 同一颗键「点了还亮且进度不动」的轮数（到 [`DEAD_STRIKES`] 判死）。
+    strikes: [u8; CELLS],
+    /// 本轮已点、还没得到游戏回应的键。
+    pending: Vec<usize>,
     baseline: usize,
-    /// 本帧读到的进度；`None` = 进度框不足，处于退化判据。
+    /// 本帧读到的进度；`None` = 进度格不足，处于退化判据。
     checked: Option<usize>,
     click_ms: u64,
     clicks: usize,
@@ -126,6 +151,7 @@ impl State {
                 self.locate_misses = 0;
                 located
             }
+            // 定位失败 → 本帧**零注入**（`on_locate_miss` 只会返回「继续等」或「收尾」）。
             Err(error) => return self.on_locate_miss(pointer.event_count(), error),
         };
 
@@ -136,38 +162,33 @@ impl State {
             return Some(done(pointer.event_count(), &summary, self.clicks));
         }
 
-        // 上一次点击还没有结论 → 本帧先别再点。
-        // 第二判据「亮光熄灭」：这台机器的进度框读不出来（屏幕整体 luma 中位数只有 48，
-        // 5 个格子的亮度差仅 5~10，任何绝对阈值都分不开）。而**点对了游戏就会收掉
-        // 那个模块的高亮**——这条通道永远可用，且比进度更直接。
-        let still_lit = self
-            .pending
-            .is_some_and(|index| glow_of(frame, &located.cells, index) >= min_glow / 2);
-        if self.waiting(checked, still_lit, clock.now_ms()) {
+        // 上一轮点击还没有结论 → 本帧先别再点。
+        let lit = lit_cells(frame, &located.cells, min_glow);
+        if self.waiting(checked, &lit, clock.now_ms()) {
             return None;
         }
 
-        let Some((index, at)) =
-            pick_lit_cell(frame, &located.cells, &self.clicked, &self.dead, min_glow)
-        else {
+        let targets = pick_lit_targets(frame, &located, &self.clicked, &self.dead, min_glow);
+        if targets.is_empty() {
             return self.on_no_target(checked, pointer.event_count());
-        };
-
-        if let Err(error) = pointer.click(at) {
-            return Some(aborted(
-                pointer.event_count(),
-                format!("黄键台点击失败：{error}"),
-            ));
         }
-        self.clicked[index] = true;
-        self.clicks += 1;
+        for (index, at) in targets {
+            if let Err(error) = pointer.click(at) {
+                return Some(aborted(
+                    pointer.event_count(),
+                    format!("黄键台点击失败：{error}"),
+                ));
+            }
+            self.clicked[index] = true;
+            self.clicks += 1;
+            self.pending.push(index);
+        }
         self.baseline = checked.unwrap_or(0);
         self.click_ms = clock.now_ms();
-        self.pending = Some(index);
         None
     }
 
-    /// 进度已勾选数；进度框不足 [`MIN_PROGRESS_BOXES`] 个 → `None`（退化，不判进度）。
+    /// 进度已勾选数；进度格不足 [`MIN_PROGRESS_BOXES`] 个 → `None`（退化，不判进度）。
     fn checked_in(&self, frame: &Frame, located: &LocatedKeys, min_check: u32) -> Option<usize> {
         if located.progress.len() < MIN_PROGRESS_BOXES {
             return None;
@@ -175,34 +196,40 @@ impl State {
         Some(count_checked(frame, &located.progress, min_check))
     }
 
-    /// 处理上一次点击的回应；返回 `true` = 本帧还没有结论，先别再点。
-    fn waiting(&mut self, checked: Option<usize>, still_lit: bool, now: u64) -> bool {
-        let Some(index) = self.pending else {
+    /// 处理上一轮点击的回应；返回 `true` = 本帧还没有结论，先别再点。
+    fn waiting(&mut self, checked: Option<usize>, lit: &[usize], now: u64) -> bool {
+        if self.pending.is_empty() {
             return false;
-        };
+        }
         let elapsed = now.saturating_sub(self.click_ms) >= CLICK_ACK_TIMEOUT_MS;
-        // 判据一（最可靠，能读到进度框时）：进度推进就算这一键吃下了。
+        // 判据一（最可靠，能读到进度格时）：进度推进就算这一轮吃下了。
         if checked.is_some_and(|checked| checked > self.baseline) {
-            self.pending = None;
+            self.pending.clear();
             return false;
         }
         // 判据二（永远可用）：**亮光熄灭**。点对了游戏会收掉该模块高亮；
-        // 亮光还在说明这一键没生效（或点错了模块）。
+        // 亮光还在说明这一轮没生效（或点错了模块）。
+        let still_lit = self.pending.iter().any(|index| lit.contains(index));
         if !still_lit {
-            self.pending = None;
+            self.pending.clear();
             return false;
         }
         if !elapsed {
             return true;
         }
-        // 超时仍亮着 → 这一格点错了，判死换下一个。
-        // 只在「真能观测到高亮」时才判死：整屏都没高亮时 `still_lit` 恒假，走不到这里。
-        self.dead[index] = true;
-        self.pending = None;
+        // 超时仍亮着：累计无效轮数，到上限判死；没到上限的放回可点池重试（spec B5/B6）。
+        for index in std::mem::take(&mut self.pending) {
+            self.strikes[index] = self.strikes[index].saturating_add(1);
+            if self.strikes[index] >= DEAD_STRIKES {
+                self.dead[index] = true;
+            } else {
+                self.clicked[index] = false;
+            }
+        }
         false
     }
 
-    /// 没有可点的亮键：要么等下一帧，要么（16 格都点过 / 判死）收尾。
+    /// 没有可点的亮键：要么等下一帧，要么（不能再期待任何亮键）收尾。
     fn on_no_target(&self, checked: Option<usize>, events: u64) -> Option<Az3Outcome> {
         let exhausted = (0..CELLS).all(|index| self.clicked[index] || self.dead[index]);
         if !exhausted {
@@ -210,8 +237,8 @@ impl State {
         }
         match checked {
             None => {
-                let summary =
-                    format!("黄键台 {CELLS} 键已全部点过（进度框未识别，按退化判据收尾）");
+                // 退化判据：进度读不到，以「16 格点完」收尾，且必须写明用的是哪条判据。
+                let summary = format!("黄键台 {CELLS} 键已全部点过{PROGRESS_NOTE}");
                 Some(done(events, &summary, self.clicks))
             }
             Some(checked) => Some(aborted(
@@ -221,54 +248,98 @@ impl State {
         }
     }
 
-    /// 定位失败：允许抖动几帧，超了才收尾（全程零输入）。
+    /// 定位失败：允许抖动几帧，超了**立刻收尾且此后零注入**（fail-closed）。
     ///
-    /// **面板消失有两种含义**，必须分开：
-    /// - 已经点过键 → 大概率是解完了、面板被游戏收走 ⇒ `Done`（否则每次成功都报失败）；
-    /// - 一次都没点过 → 是「没对准 / 走开了」⇒ `Aborted`，并告诉用户怎么站。
+    /// 面板消失有两种含义，只能按**看得见的证据**分开，不许猜：
+    /// - 进度读到 `5/5` → 真的完成了 ⇒ `Done`；
+    /// - 进度读不到、但已经点过键 → 大概率解完被游戏收走 ⇒ `Done`（否则每次成功都报失败）；
+    /// - 其余（一次没点过，或进度明明只到 `x/5`）⇒ `Abort`，并说清卡在哪。
     fn on_locate_miss(&mut self, events: u64, error: LocateError) -> Option<Az3Outcome> {
         self.locate_misses += 1;
         if self.locate_misses < LOCATE_FAIL_LIMIT {
             return None;
         }
-        if self.clicks > 0 {
-            let summary = format!(
-                "黄键台面板已消失（已点击 {} 次），判定已完成{PROGRESS_NOTE}",
-                self.clicks
-            );
-            return Some(done(events, &summary, self.clicks));
+        match (self.checked, self.clicks > 0) {
+            (Some(checked), _) if checked >= TOTAL_STAGES => Some(done(
+                events,
+                &format!("黄键台 {TOTAL_STAGES}/{TOTAL_STAGES} 完成"),
+                self.clicks,
+            )),
+            (None, true) => Some(done(
+                events,
+                &format!(
+                    "黄键台面板已消失（已点击 {} 次），判定已完成{PROGRESS_NOTE}",
+                    self.clicks
+                ),
+                self.clicks,
+            )),
+            (checked, _) => {
+                let progress = match checked {
+                    Some(checked) => format!("进度只有 {checked}/{TOTAL_STAGES}，"),
+                    None => String::new(),
+                };
+                Some(aborted(
+                    events,
+                    format!("{error}{POSE_HINT}（{progress}面板已消失，已停止注入）"),
+                ))
+            }
         }
-        Some(aborted(events, format!("{error}{POSE_HINT}")))
     }
 
     /// 进度文案：读不到进度时说清「读不到」，不编数字。
     fn progress_text(&self) -> String {
         match self.checked {
             Some(checked) => format!("进度 {checked}/{TOTAL_STAGES}"),
-            None => "进度框未识别，未判进度".to_owned(),
+            None => "进度格未识别，未判进度".to_owned(),
         }
     }
 }
 
-/// 选当前最亮的未点格：返回（格序号，全局点击坐标）。
-fn pick_lit_cell(
+/// 这一格属于哪一类靶点：**落在进度格上的矩形一律是只读进度指示器**。
+///
+/// 这是「进度行坐标零点击」的结构性保证 —— 不靠调用点自觉，靠类型筛。
+fn classify(target: PxRect, progress: &[PxRect]) -> KeyTarget {
+    if progress.iter().any(|slot| intersects(*slot, target)) {
+        KeyTarget::ProgressBox
+    } else {
+        KeyTarget::ModuleButton
+    }
+}
+
+/// 两个矩形是否有交叠（任一面积为 0 即视为不交叠）。
+fn intersects(left: PxRect, right: PxRect) -> bool {
+    let overlap_w = left.right().min(right.right()) - left.x.max(right.x);
+    let overlap_h = left.bottom().min(right.bottom()) - left.y.max(right.y);
+    overlap_w > 0 && overlap_h > 0
+}
+
+/// 本帧**亮着**的格序号（含已点过的，供 ack 判据用）。
+fn lit_cells(frame: &Frame, cells: &[PxRect], min_glow: u32) -> Vec<usize> {
+    (0..cells.len())
+        .filter(|&index| glow_of(frame, cells, index) >= min_glow)
+        .collect()
+}
+
+/// 本帧要点的**全部**亮键：亮的、没点过、没判死、且属于可点击靶点。
+///
+/// 用户拍板：同一帧亮着的模块按钮**全都要点，不要求顺序**（实测同亮 5 个）；
+/// 只挑「最亮的一个」会让 5 个亮键互相等待，最后卡在 4/5。
+fn pick_lit_targets(
     frame: &Frame,
-    cells: &[PxRect],
+    located: &LocatedKeys,
     clicked: &[bool; CELLS],
     dead: &[bool; CELLS],
     min_glow: u32,
-) -> Option<(usize, PxPoint)> {
-    cells
+) -> Vec<(usize, PxPoint)> {
+    located
+        .cells
         .iter()
         .enumerate()
         .filter(|(index, _)| !is_spent(*index, clicked, dead))
-        .map(|(index, cell)| {
-            let glow = geom::count_in(frame, geom::clip(frame, *cell), geom::is_yellow_or_green_glow);
-            (index, *cell, glow)
-        })
-        .filter(|(_, _, glow)| *glow >= min_glow)
-        .max_by_key(|(_, _, glow)| *glow)
-        .map(|(index, cell, _)| (index, center_of(cell)))
+        .filter(|(_, cell)| classify(**cell, &located.progress).clickable())
+        .filter(|(index, _)| glow_of(frame, &located.cells, *index) >= min_glow)
+        .map(|(index, cell)| (index, center_of(*cell)))
+        .collect()
 }
 
 /// 某一格的黄/绿高亮像素数（越界返回 0）。
@@ -292,14 +363,11 @@ fn center_of(rect: PxRect) -> PxPoint {
     }
 }
 
-/// 进度框里已勾选的个数（绿色/黄色像素 ≥ [`MIN_CHECK_PIXELS`]）。
+/// 进度格里已勾选的个数（**绿 ✓ 像素** ≥ `min_check`）。
 fn count_checked(frame: &Frame, boxes: &[PxRect], min_check: u32) -> usize {
     boxes
         .iter()
-        .filter(|&&rect| {
-            geom::count_in(frame, geom::clip(frame, rect), geom::is_yellow_or_green_glow)
-                >= min_check
-        })
+        .filter(|&&rect| geom::count_in(frame, geom::clip(frame, rect), geom::is_check_green) >= min_check)
         .count()
 }
 

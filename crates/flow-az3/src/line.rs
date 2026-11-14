@@ -40,6 +40,8 @@ const SETTLE_MS: u64 = 500;
 const DRAG_STEPS: i32 = 8;
 /// 单列最多拖几次；到次数仍未到位就记 `dead`，不再碰它。
 const MAX_ATTEMPTS: u32 = 3;
+/// 拖完复读后允许**补拖**的次数（spec B17：最多 1 次，仍偏就记 failed）。
+const MAX_CORRECTIONS: u32 = 1;
 /// 定位失败时给用户的下一步动作。
 const POSE_HINT: &str = "（请正对操作台、让屏幕和红旋钮都进入画面）";
 
@@ -53,6 +55,8 @@ struct Progress {
     /// 这一列**历史上**是否读到过档位（决定读不出时能否安全走归零兜底）。
     evidence: [bool; LINE_COLUMNS],
     attempts: [u32; LINE_COLUMNS],
+    /// 已经补拖过几次（每列最多 [`MAX_CORRECTIONS`] 次）。
+    corrections: [u32; LINE_COLUMNS],
     dead: [bool; LINE_COLUMNS],
     calibrated: [bool; LINE_COLUMNS],
     aligned_since: [Option<u64>; LINE_COLUMNS],
@@ -487,6 +491,16 @@ impl Progress {
             self.dead[column] = true;
             return self.on_column_dead(pointer.event_count());
         }
+        // 拖后复读（B17）：复读发现**仍然偏**就补拖，但**只补一次**；补完还偏就记 failed。
+        // 每列最多 2 次拖动（1 主 + 1 补），因此不存在来回抖动的可能。
+        let dragged_before = self.attempts[column] > 0;
+        if dragged_before && self.corrections[column] >= MAX_CORRECTIONS {
+            self.dead[column] = true;
+            return self.on_column_dead(pointer.event_count());
+        }
+        if dragged_before {
+            self.corrections[column] += 1;
+        }
         let (Some(from), Some(to)) = (
             line.slot_center(column, row),
             line.slot_center(column, self.targets[column]),
@@ -716,6 +730,8 @@ mod tests {
         events: u64,
         /// 模拟「拖动无效」：位移被游戏吃掉。
         stuck: bool,
+        /// 模拟「拖不到位」：无论拖多远，线只挪一档。
+        partial: bool,
     }
 
     impl Game {
@@ -773,6 +789,13 @@ mod tests {
             }
             let gap = f32::from((ROWS[1] - ROWS[0]) as i16);
             let current = f32::from(game.selected[column].unwrap_or(0) as i16);
+            if game.partial {
+                // 拖不到位：无论拖多远，线只挪一档。
+                let shift = if moved > 0 { 1 } else if moved < 0 { -1 } else { 0 };
+                let next = (current as i32 + shift).clamp(0, 3) as usize;
+                game.selected[column] = Some(next);
+                return Ok(());
+            }
             let next = (current + (moved as f32 / gap)).round().clamp(0.0, 3.0) as usize;
             game.selected[column] = Some(next);
             Ok(())
@@ -990,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn a_column_that_never_moves_is_given_up_after_three_drags() {
+    fn a_column_that_never_moves_is_given_up_after_one_correction() {
         let mut game = Game::new([Some(3); 4]);
         game.stuck = true;
         let (outcome, game) = play(game);
@@ -998,10 +1021,46 @@ mod tests {
         assert!(!outcome.is_done(), "{outcome:?}");
         assert_eq!(
             game.begin_points.len(),
-            (MAX_ATTEMPTS as usize) * LINE_COLUMNS,
-            "4 列各拖满 {MAX_ATTEMPTS} 次才放弃"
+            (1 + MAX_CORRECTIONS as usize) * LINE_COLUMNS,
+            "每列 1 次主拖 + 最多 {MAX_CORRECTIONS} 次补拖就放弃（B17：不许无限重试）"
         );
         assert!(reason_of(&outcome).contains("4 列都没能对齐"), "{outcome:?}");
+    }
+
+    #[test]
+    fn a_drag_that_lands_short_is_corrected_exactly_once() {
+        // 拖不到位（每拖一次只挪一档）：每列 1 次主拖 + 最多 1 次补拖，仍偏就记 failed。
+        let mut game = Game::new([Some(3); 4]);
+        game.partial = true;
+        let (outcome, shared) = play(game);
+        let game = shared.borrow();
+        assert!(!outcome.is_done(), "{outcome:?}");
+        let budget = 1 + MAX_CORRECTIONS as usize;
+        for (index, &column) in COLUMNS.iter().enumerate() {
+            let drags = game
+                .begin_points
+                .iter()
+                .filter(|point| (point.x - column).abs() <= 8)
+                .count();
+            assert!(drags >= 1, "第 {} 列一次都没拖", index + 1);
+            assert!(
+                drags <= budget,
+                "第 {} 列拖了 {drags} 次，超过 1 主拖 + {MAX_CORRECTIONS} 次补拖",
+                index + 1
+            );
+        }
+        assert!(
+            game.begin_points.len() > LINE_COLUMNS,
+            "至少要有一列用上补拖：{:?}",
+            game.begin_points
+        );
+        // 拖动全程只有纵向、且每子步 ≤20px（步长没被放宽）。
+        assert!(game.steps.iter().all(|&(dx, dy)| dx == 0 && dy.abs() <= 20));
+        let reason = reason_of(&outcome);
+        assert!(
+            reason.contains("列") && reason.contains("没能对齐"),
+            "放弃时要说清是哪几列没搞定：{reason}"
+        );
     }
 
     #[test]

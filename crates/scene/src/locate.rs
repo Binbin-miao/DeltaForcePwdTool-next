@@ -231,6 +231,35 @@ const KEY_BOX_FILL: (f32, f32) = (0.05, 0.70);
 /// 进度框最多 5 个。
 pub const KEY_PROGRESS_MAX: usize = 5;
 
+/// 进度行的实测百分比矩形（spec §0②：整行 `x[28.28..48.20%], y[47.22..51.39%]`）。
+///
+/// 这组数字是**逐帧量出来的**，不是猜的：`annot` 帧上 5 个格子的并集。
+/// 它只作**退化兜底** —— 自适应找框（[`find_progress_boxes`]）够 3 格时优先用自适应的。
+const PROGRESS_ROW: (f32, f32, f32, f32) = (0.2828, 0.4722, 0.4820, 0.5139);
+/// 单格宽度占整帧宽的比例（spec §0②：2.19%）。
+const PROGRESS_SLOT_W: f32 = 0.0219;
+/// 单格高度占整帧高的比例（spec §0②：2.78% ⇒ 720p 下 20px）。
+///
+/// 注意它**不等于** [`PROGRESS_ROW`] 的高：那是 5 格并集的整行 bbox 高
+/// `51.39% - 47.22% = 4.17%`（30px @720）。把行高当格高会让每格多吞 10px 灰边。
+const PROGRESS_SLOT_H: f32 = 0.0278;
+/// 格距占整帧宽的比例（spec §0②：4.375% = 56px @1280）。
+const PROGRESS_SLOT_PITCH: f32 = 0.04375;
+/// 一个格子至少要有这么多个绿 ✓ 像素才算「已勾选」。
+const SLOT_CHECK_PIXELS: u32 = 6;
+/// 少于这么多格「可辨」= 读不到进度（退化）。
+const PROGRESS_MIN_READABLE: usize = 3;
+/// 空槽判据：深灰空槽 `V < 90`（spec §0③）。
+const SLOT_DARK_V: u8 = 90;
+/// 空槽的「有边」亮度差：槽内深灰 + 浅色细边，纯背景两者一样亮。
+const SLOT_RING_DELTA: i32 = 12;
+
+/// 绿 ✓ 判据：绿分量明显压过红蓝（`#3ddc4a` 一族）。
+fn is_check_green([b, g, r]: [u8; 3]) -> bool {
+    let (b, g, r) = (i32::from(b), i32::from(g), i32::from(r));
+    g >= 120 && g >= r + 30 && g >= b + 30
+}
+
 /// 定位结果：信号线台的全部几何都由这一帧量出来。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocatedLine {
@@ -284,6 +313,101 @@ pub enum LocateError {
     Columns,
     #[error("没找到右侧的 4×4 按键阵（能对上号的暗色键块不足 12 个）")]
     Keys,
+}
+
+/// 定位三态：**「还没长齐」与「真没有」必须分开**。
+///
+/// 这是本轮 Q1 的根因：面板 0.400s 才淡入、第一颗亮键 1.800s 才出现，
+/// 而旧接口用 `Result<_, LocateError>` 把这两段时间里的「结构还没长齐」和
+/// 「这个界面根本不存在」压成同一个 `Err` —— 于是按 F 的第一下必然判失败，
+/// 用户只能按第二次。`NotYet` 存在的唯一理由就是**不消耗失败预算、继续等**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Locate<T> {
+    /// 结构齐全，可以动手。
+    Found(T),
+    /// 面板底色已经在画面里，但结构/亮键还没长齐 —— 继续等，**不计失败**。
+    NotYet,
+    /// 连面板底色都没有 —— 真的不在这个界面。
+    Absent,
+}
+
+impl<T> Locate<T> {
+    /// 是否已经就绪。
+    pub fn is_found(&self) -> bool {
+        matches!(self, Self::Found(_))
+    }
+
+    /// 就绪时取出定位结果（否则 `None`）。
+    pub fn found(self) -> Option<T> {
+        match self {
+            Self::Found(value) => Some(value),
+            Self::NotYet | Self::Absent => None,
+        }
+    }
+
+    /// 诊断用：三态名字（日志里区分「还没好」与「不在界面」）。
+    pub fn state_name(&self) -> &'static str {
+        match self {
+            Self::Found(_) => "Found",
+            Self::NotYet => "NotYet",
+            Self::Absent => "Absent",
+        }
+    }
+}
+
+/// 面板底色（深蓝）的 HSV 区间，spec §0④ H3'：`H 95..135 ∧ S 45..120 ∧ V 70..125`。
+const PANEL_BASE_V: (i32, i32) = (70, 125);
+/// 面板底色一定落在这块 ROI 里（spec §0④ 同一组实测百分比）。
+const PANEL_ROI: (f32, f32, f32, f32) = (0.25, 0.15, 0.75, 0.60);
+/// 底色占比下限：低于 3% 说明画面里根本没有面板（spec H3' 的反向判据）。
+const PANEL_MIN_RATIO: f32 = 0.03;
+/// 探底色的采样步长（这一步只回答「在不在」，不需要逐像素）。
+const PANEL_SAMPLE_STEP: i32 = 4;
+
+/// 画面里有没有「蓝色面板」这一层底 —— **只看底色，不看结构**。
+///
+/// 用来把 [`Locate::NotYet`]（底色已在、结构未齐）与 [`Locate::Absent`]
+/// （连底色都没有）分开；不做任何结构判定，所以淡入的中间态也能量到。
+pub fn panel_present(frame: &Frame) -> bool {
+    if frame.w < MIN_FRAME_SIDE || frame.h < MIN_FRAME_SIDE {
+        return false;
+    }
+    let (small, _) = normalize_frame(frame);
+    let roi = percent_rect_of(small.w, small.h, PANEL_ROI);
+    let mut hit = 0u32;
+    let mut total = 0u32;
+    let mut y = roi.y;
+    while y < roi.bottom() {
+        let mut x = roi.x;
+        while x < roi.right() {
+            total += 1;
+            if is_panel_base(small.pixel(x as u32, y as u32)) {
+                hit += 1;
+            }
+            x += PANEL_SAMPLE_STEP;
+        }
+        y += PANEL_SAMPLE_STEP;
+    }
+    total > 0 && hit as f32 / total as f32 >= PANEL_MIN_RATIO
+}
+
+/// 深蓝面板底色（整数比较，等价于 OpenCV 标度 `H 95..135 ∧ S 45..120 ∧ V 70..125`）。
+///
+/// 展开成整数是因为这条判据每次轮询都要过一万多个采样点：蓝为最大分量 ⇒
+/// `H = 215..270°`，等价于 `|r−g| ≤ delta/6`；`S = 255·delta/max`。
+fn is_panel_base([b, g, r]: [u8; 3]) -> bool {
+    let (b, g, r) = (i32::from(b), i32::from(g), i32::from(r));
+    let max = b.max(g).max(r);
+    if b != max || !within_i32(PANEL_BASE_V, max) {
+        return false;
+    }
+    let delta = max - r.min(g).min(b);
+    // S ∈ [45,120] ⇒ 255·delta/max ⇒ delta ∈ [0.176·max, 0.471·max]
+    delta * 100 >= max * 18 && delta * 100 <= max * 47 && (r - g).abs() * 6 <= delta
+}
+
+fn within_i32(range: (i32, i32), value: i32) -> bool {
+    range.0 <= value && value <= range.1
 }
 
 /// 一帧定位：全部几何都由 `frame` 决定，不读配置、不碰 IO。
@@ -1059,7 +1183,8 @@ pub fn locate_keys(frame: &Frame) -> Result<LocatedKeys, LocateError> {
         return Err(LocateError::Keys);
     }
     let screen = find_key_screen(&gray, keys.grid).ok_or(LocateError::Screen)?;
-    let progress = find_progress_boxes(&gray, screen);
+    // 进度格里有「绿 ✓」判据 ⇒ 彩色帧必须一起带下去（灰度图上判绿恒假）。
+    let progress = readable_progress(frame, &gray, screen);
     Ok(LocatedKeys {
         grid: scale_rect(keys.grid, scale),
         cells: keys
@@ -1073,6 +1198,62 @@ pub fn locate_keys(frame: &Frame) -> Result<LocatedKeys, LocateError> {
             .map(|rect| scale_rect(*rect, scale))
             .collect(),
     })
+}
+
+/// 黄键台三态定位：`locate_keys` 成功 = [`Locate::Found`]；失败但**面板底色已在** =
+/// [`Locate::NotYet`]（继续等，不计失败）；连底色都没有 = [`Locate::Absent`]。
+pub fn locate_keys_state(frame: &Frame) -> Locate<LocatedKeys> {
+    match locate_keys(frame) {
+        Ok(keys) => Locate::Found(keys),
+        Err(LocateError::Frame { .. }) => Locate::Absent,
+        Err(_) if panel_present(frame) => Locate::NotYet,
+        Err(_) => Locate::Absent,
+    }
+}
+
+/// ready 判据里的亮键像素下限（spec §0①：噪声基线 950、首颗亮键 3767，取 3000 作中线）。
+pub const READY_LIT_MIN_PX: u32 = 3000;
+/// 亮键像素判据：够亮 + 饱和 + 蓝分量最小（黄绿高光）。暗键面近黑，不会命中。
+fn is_lit_key([b, g, r]: [u8; 3]) -> bool {
+    let (b, g, r) = (i32::from(b), i32::from(g), i32::from(r));
+    let max = b.max(g).max(r);
+    if max < 150 || g < 110 {
+        return false;
+    }
+    let delta = max - r.min(g).min(b);
+    delta * 100 >= max * 45 && b <= r.min(g)
+}
+
+/// 16 颗键里「亮键」像素的总数（**720p 世界**，因为 [`READY_LIT_MIN_PX`] 是 720p 口径）。
+pub fn lit_key_pixels(frame: &Frame, cells: &[PxRect]) -> u32 {
+    let mut total = 0u32;
+    for cell in cells {
+        for y in cell.y.max(0)..cell.bottom().min(frame.h as i32) {
+            for x in cell.x.max(0)..cell.right().min(frame.w as i32) {
+                if is_lit_key(frame.pixel(x as u32, y as u32)) {
+                    total += 1;
+                }
+            }
+        }
+    }
+    total
+}
+
+/// 黄键台 ready：**面板可定位 且 亮键像素 ≥ [`READY_LIT_MIN_PX`]**，两条同时成立才算。
+///
+/// 只判「可定位」会把 0.4–1.8s 那段「面板已出现、一颗键都没亮」的空窗当成可以动手，
+/// 于是点了个寂寞；只判亮键则会被别的界面上的黄绿光骗到。
+pub fn keys_ready(frame: &Frame) -> Locate<()> {
+    let (small, _) = normalize_frame(frame);
+    match locate_keys_state(&small) {
+        Locate::Found(keys) if lit_key_pixels(&small, &keys.cells) >= READY_LIT_MIN_PX => {
+            Locate::Found(())
+        }
+        // 面板已在、亮键还没长齐：这段必须继续等（spec B2），不许判失败。
+        Locate::Found(_) => Locate::NotYet,
+        Locate::NotYet => Locate::NotYet,
+        Locate::Absent => Locate::Absent,
+    }
 }
 
 /// 缩放世界坐标 → 原图坐标（`scale == 1` 时原样返回，零开销）。
@@ -1394,11 +1575,126 @@ fn overlaps_vertically(rect: PxRect, grid: PxRect) -> bool {
 
 // ── 4. 进度框 ──
 
+/// 进度行的读法：**先用自适应找框，读不到才退回实测百分比行**。
+///
+/// 返回 `< 3` 个格子 = 读不到进度（调用方据此退化，不猜）。
+/// 颜色判据（绿 ✓）必须用彩色 `frame`：灰度图里 `r == g == b`，判绿恒假。
+fn readable_progress(frame: &Frame, gray: &GrayImage, screen: PxRect) -> Vec<PxRect> {
+    let adaptive = find_progress_boxes(gray, screen);
+    if adaptive.len() >= PROGRESS_MIN_READABLE {
+        return adaptive;
+    }
+    let spec = spec_progress_slots(frame, gray);
+    if spec.len() >= PROGRESS_MIN_READABLE {
+        return spec;
+    }
+    adaptive
+}
+
+/// 按 spec §0② 的实测百分比切出 5 个进度格；**只有 ≥3 格可辨才算读到**。
+///
+/// 「可辨」= 里面有绿 ✓，或者是一圈浅色细边的深灰空槽。纯背景两块都不满足，
+/// 因此整片同色区域不会被误当成进度行（那会凭空报出 `0/5` 的假进度）。
+fn spec_progress_slots(frame: &Frame, gray: &GrayImage) -> Vec<PxRect> {
+    (0..KEY_PROGRESS_MAX)
+        .map(|index| spec_slot_rect(gray.w, gray.h, index))
+        .filter(|slot| slot_readable(frame, gray, *slot))
+        .collect()
+}
+
+/// 实测百分比行上的第 `index` 个进度格（720p 世界，1280 宽时单格 28×20px、格距 56px）。
+pub(crate) fn spec_slot_rect(w: u32, h: u32, index: usize) -> PxRect {
+    let row = percent_rect_of(w, h, PROGRESS_ROW);
+    let slot_w = (w as f32 * PROGRESS_SLOT_W).round().max(2.0) as i32;
+    let slot_h = (h as f32 * PROGRESS_SLOT_H).round().max(2.0) as i32;
+    let pitch = (w as f32 * PROGRESS_SLOT_PITCH).round().max(1.0) as i32;
+    PxRect {
+        x: row.x + index as i32 * pitch,
+        y: row.y,
+        w: slot_w,
+        h: slot_h,
+    }
+}
+
+/// 一个格子是否「可辨」：有绿 ✓，或是带浅色细边的深灰空槽。
+fn slot_readable(frame: &Frame, gray: &GrayImage, slot: PxRect) -> bool {
+    let (x0, y0, x1, y1) = match clip_to(gray.w, gray.h, slot) {
+        Some(clipped) => clipped,
+        None => return false,
+    };
+    if green_pixels(frame, (x0, y0, x1, y1)) >= SLOT_CHECK_PIXELS {
+        return true;
+    }
+    // 空格子：外圈（边）比内圈（槽）亮 ⇒ 这是一个有边框的空槽，而不是背景。
+    let (inner, ring) = slot_ring_contrast(gray, (x0, y0, x1, y1));
+    ring - inner >= SLOT_RING_DELTA && inner < i32::from(SLOT_DARK_V)
+}
+
+/// 矩形内绿 ✓ 的像素数（**必须读 BGRA**：灰度图三通道相等，判绿恒假）。
+fn green_pixels(frame: &Frame, bounds: (u32, u32, u32, u32)) -> u32 {
+    let (x0, y0, x1, y1) = bounds;
+    let stride = frame.stride.max(frame.w * 4) as usize;
+    let mut green = 0u32;
+    for y in y0..y1 {
+        let row = y as usize * stride;
+        for x in x0..x1 {
+            let index = row + x as usize * 4;
+            let Some(pixel) = frame.data.get(index..index + 3) else {
+                continue;
+            };
+            if is_check_green([pixel[0], pixel[1], pixel[2]]) {
+                green += 1;
+            }
+        }
+    }
+    green
+}
+
+/// 格子的「边框平均亮度 − 槽内平均亮度」。
+fn slot_ring_contrast(gray: &GrayImage, bounds: (u32, u32, u32, u32)) -> (i32, i32) {
+    let (x0, y0, x1, y1) = bounds;
+    let (w, h) = ((x1 - x0).max(1) as i32, (y1 - y0).max(1) as i32);
+    let band = (w.min(h) / 5).max(1);
+    let (mut inner, mut inner_n) = (0i64, 0i64);
+    let (mut ring, mut ring_n) = (0i64, 0i64);
+    for y in y0..y1 {
+        let row = gray.row(y);
+        for x in x0..x1 {
+            let (dx, dy) = ((x - x0) as i32, (y - y0) as i32);
+            let edge = dx < band || dy < band || dx >= w - band || dy >= h - band;
+            let luma = i64::from(row[x as usize]);
+            if edge {
+                ring += luma;
+                ring_n += 1;
+            } else {
+                inner += luma;
+                inner_n += 1;
+            }
+        }
+    }
+    (
+        (inner / inner_n.max(1)) as i32,
+        (ring / ring_n.max(1)) as i32,
+    )
+}
+
+/// 百分比矩形 → 像素矩形（只用到宽高，不需要 `Frame`）。
+fn percent_rect_of(w: u32, h: u32, pct: (f32, f32, f32, f32)) -> PxRect {
+    let (left, top, right, bottom) = pct;
+    let x = (w as f32 * left) as i32;
+    let y = (h as f32 * top) as i32;
+    PxRect {
+        x,
+        y,
+        w: ((w as f32 * right) as i32 - x).max(1),
+        h: ((h as f32 * bottom) as i32 - y).max(1),
+    }
+}
+
 /// 屏幕内排成一行、最多 [`KEY_PROGRESS_MAX`] 个浅色细边框矩形。
 ///
 /// 少于 3 个不算失败：进度判据会退化（见 `flow_az3::keys`），绝不猜进度。
-fn find_progress_boxes(gray: &GrayImage, screen: PxRect) -> Vec<PxRect> {
-    let Some(mask) = gray_mask(gray, screen, |luma| {
+fn find_progress_boxes(gray: &GrayImage, screen: PxRect) -> Vec<PxRect> {    let Some(mask) = gray_mask(gray, screen, |luma| {
         within_u8(KEY_BOX_LUMA, luma)
     }) else {
         return Vec::new();
@@ -2079,6 +2375,122 @@ mod keys_tests {
         let frame =
             Frame::new(64, 64, vec![0u8; 64 * 64 * 4], std::time::Instant::now()).expect("合法帧");
         assert_eq!(locate_keys(&frame), Err(LocateError::Frame { w: 64, h: 64 }));
+    }
+
+    // ── t1：三态定位（NotYet 与 Absent 必须分开）──
+
+    #[test]
+    fn blue_panel_base_is_present_but_a_bare_wall_is_not() {
+        // 面板底色（深蓝）：spec §0④ H3' 区间内。
+        let panel_base = Canvas::new([68, 70, 110]);
+        assert!(panel_present(&panel_base.frame()), "整屏深蓝底色必须判「面板已在」");
+        // 纯灰墙面：没有任何蓝色面板。
+        assert!(!panel_present(&Canvas::new(MACHINE).frame()), "灰墙不是面板");
+        // 画面太小（判不了）：宁可说「没有」，也不许 panic。
+        let tiny = Frame::new(32, 32, vec![0u8; 32 * 32 * 4], std::time::Instant::now())
+            .expect("合法帧");
+        assert!(!panel_present(&tiny));
+    }
+
+    #[test]
+    fn key_state_is_absent_when_there_is_no_panel_base_at_all() {
+        // 灰墙：既定位不到键阵，也没有面板底色 ⇒ Absent（立刻可以拒绝，不必等 2.1s）。
+        assert_eq!(locate_keys_state(&Canvas::new(MACHINE).frame()).state_name(), "Absent");
+    }
+
+    #[test]
+    fn key_state_is_not_yet_while_the_panel_base_is_up_but_the_keys_are_missing() {
+        // 面板底色已淡入、16 颗键还没长出来 —— 这正是「首开慢」的那 1.4s。
+        let frame = Canvas::new([68, 70, 110]).frame();
+        assert_eq!(locate_keys_state(&frame).state_name(), "NotYet");
+    }
+
+    #[test]
+    fn keys_ready_needs_both_geometry_and_enough_lit_pixels() {
+        // 面板可定位、但一颗亮键都没有 ⇒ 还没就绪（spec B2：0.4–1.8s 必须继续等）。
+        assert_eq!(keys_ready(&panel(&[], 0).frame()).state_name(), "NotYet");
+        // 一颗键的发光图标只有几百像素，仍不到 3000px 中线 ⇒ 继续等。
+        assert_eq!(keys_ready(&panel(&[5], 0).frame()).state_name(), "NotYet");
+        // 16 颗全亮（约 7000px）⇒ 真的可以动手了。
+        let all: Vec<usize> = (0..16).collect();
+        assert!(keys_ready(&panel(&all, 0).frame()).is_found());
+    }
+
+    // ── t2：进度行（实测百分比行的兜底读法）──
+
+    #[test]
+    fn spec_progress_row_reads_five_check_marks() {
+        // 只画绿 ✓、不画细边框 ⇒ 自适应找框必然失败，只能靠实测百分比行。
+        let mut canvas = panel_without_boxes();
+        for stage in 0..KEY_PROGRESS_MAX {
+            let slot = spec_slot_rect(W, H, stage);
+            canvas.rect(inset(slot, 2), CHECK);
+        }
+        let frame = canvas.frame();
+        let slots = spec_progress_slots(&frame, &frame.luma());
+        assert_eq!(slots.len(), KEY_PROGRESS_MAX, "{slots:?}");
+        let blank = Canvas::new(MACHINE).frame();
+        assert_eq!(spec_progress_slots(&blank, &blank.luma()), Vec::new(),
+            "整片同色背景不是进度行，绝不能报出假进度");
+    }
+
+    #[test]
+    fn a_green_check_is_readable_in_colour_and_never_in_grey() {
+        // 判绿必须读 BGRA：灰度图里三通道相等，`g >= r+30` 永远不成立。
+        let slot = spec_slot_rect(W, H, 0);
+        let mut colour = Canvas::new(PANEL);
+        colour.rect(inset(slot, 2), CHECK);
+
+        let mut grey = Canvas::new([40, 40, 40]);
+        grey.rect(inset(slot, 2), [142, 142, 142]);
+
+        let colour_frame = colour.frame();
+        assert!(
+            slot_readable(&colour_frame, &colour_frame.luma(), slot),
+            "彩色帧里的绿 ✓ 必须算作已勾选"
+        );
+        let grey_frame = grey.frame();
+        assert!(
+            !slot_readable(&grey_frame, &grey_frame.luma(), slot),
+            "三通道相等的灰块不是绿 ✓，不许当成已勾选"
+        );
+    }
+
+    #[test]
+    fn progress_falls_back_to_the_spec_row_when_no_border_is_found() {
+        let mut canvas = panel_without_boxes();
+        for stage in 0..KEY_PROGRESS_MAX {
+            canvas.rect(inset(spec_slot_rect(W, H, stage), 2), CHECK);
+        }
+        let keys = locate_keys(&canvas.frame()).expect("几何完整");
+        assert_eq!(keys.progress.len(), KEY_PROGRESS_MAX, "兜底必须给出 5 格");
+        assert_eq!(
+            keys.progress[0],
+            spec_slot_rect(W, H, 0),
+            "兜底格就是实测百分比行上的第一格"
+        );
+    }
+
+    #[test]
+    fn adaptive_boxes_win_over_the_spec_row() {
+        let keys = locate_keys(&panel(&[], 3).frame()).expect("几何完整");
+        assert_eq!(
+            keys.progress,
+            (0..KEY_PROGRESS_MAX).map(box_rect).collect::<Vec<_>>(),
+            "自适应框够 3 格时不许退到百分比行"
+        );
+    }
+
+    #[test]
+    fn spec_row_geometry_matches_the_measured_pitch() {
+        // spec §0②：1280 宽下单格 28px、格距 56px。
+        let first = spec_slot_rect(1280, 720, 0);
+        let second = spec_slot_rect(1280, 720, 1);
+        assert_eq!(second.x - first.x, 56, "格距 4.375% × 1280 = 56px");
+        assert_eq!(first.w, 28, "单格 2.19% × 1280 = 28px");
+        assert_eq!(first.h, 20, "单格 2.78% × 720 = 20px");
+        // 百分比行必须落在整帧左半侧（屏幕里），不能跑到右侧模块键区。
+        assert!(first.x < 640 && first.right() < 640);
     }
 }
 

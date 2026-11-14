@@ -35,6 +35,13 @@ impl Role {
     }
 }
 
+/// `images/` 下**不是角色模板**的程序自带资源目录（`images/<名字>/`）。
+///
+/// 这些目录里的图片不是 `1..N.png` 编号模板，若当成角色目录加载会凭空报
+/// 「跳过角色 …：没有任何可用的连续编号模板」，用户看到只会一头雾水。
+/// 将来新增资源目录（例如更多界面判定模板）加在这里。
+const RESOURCE_DIRS: [&str; 1] = ["ui"];
+
 /// 角色模板库。加载期间的退化情况（单张读失败、编号空洞）全部记入 `warnings`，
 /// 不静默吞掉。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,7 +61,8 @@ impl RoleLibrary {
     pub fn load_from_dir(root: impl AsRef<Path>) -> Result<Self, TemplateError> {
         let root = root.as_ref();
         let mut entries = read_dir_sorted(root)?;
-        entries.retain(|path| path.is_dir());
+        // 是目录且不是程序自带资源目录（同名**文件**照旧被这条目录判断挡掉）。
+        entries.retain(|path| path.is_dir() && !is_resource_dir(path));
         if entries.is_empty() {
             return Err(TemplateError::NoRoles { root: root.to_path_buf() });
         }
@@ -180,6 +188,13 @@ fn is_png(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
 }
 
+/// 这个目录是不是 [`RESOURCE_DIRS`] 里的程序自带资源目录。
+fn is_resource_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| RESOURCE_DIRS.contains(&name))
+}
+
 /// PNG → 灰度。BT.601 整数近似，与 `GrayImage::from_bgra` 保持同一亮度公式。
 pub fn decode_png_gray(path: &Path) -> Result<GrayImage, TemplateError> {
     let file = File::open(path).map_err(|source| TemplateError::Io {
@@ -298,6 +313,34 @@ mod tests {
         assert_eq!(role.templates[1].no, 2);
         let warnings = lib.warnings().join("|");
         assert!(warnings.contains("编号 3 缺失"), "{warnings}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 资源目录（`images/ui/`）不是角色目录：既不告警也不占角色位；真坏的目录照旧告警。
+    #[test]
+    fn resource_directories_are_skipped_without_a_warning() {
+        let root = scratch_dir("resource");
+        let role_dir = root.join("测试角色");
+        std::fs::create_dir_all(&role_dir).expect("建角色目录");
+        write_png(
+            &role_dir.join("1.png"),
+            &GrayImage::filled(4, 4, 90).expect("合法图"),
+        );
+        let resource_dir = root.join("ui");
+        std::fs::create_dir_all(&resource_dir).expect("建资源目录");
+        write_png(
+            &resource_dir.join("morse.png"),
+            &GrayImage::filled(4, 4, 40).expect("合法图"),
+        );
+        std::fs::create_dir_all(root.join("坏角色")).expect("建空目录");
+
+        let lib = RoleLibrary::load_from_dir(&root).expect("加载成功");
+        assert_eq!(lib.roles().len(), 1, "只有「测试角色」是角色");
+        assert_eq!(lib.roles()[0].name, "测试角色");
+        let warnings = lib.warnings().join("|");
+        assert!(!warnings.contains("ui"), "资源目录不许报「跳过角色」：{warnings}");
+        assert!(warnings.contains("坏角色"), "真空目录仍要告警：{warnings}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

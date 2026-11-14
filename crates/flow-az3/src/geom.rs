@@ -95,6 +95,14 @@ pub(crate) fn is_yellow_or_green_glow(color: [u8; 3]) -> bool {
     is_green_glow(color) || is_yellow
 }
 
+/// 绿 ✓（进度格「已完成」的标志）：绿分量明显压过红蓝。
+///
+/// 与 [`is_green_glow`] 的区别：✓ 是**实心亮绿字形**，比半透明绿罩更饱和、更亮，
+/// 且不允许偏黄（黄键台的亮键是黄绿，不能算成勾选）。
+pub(crate) fn is_check_green([b, g, r]: [u8; 3]) -> bool {
+    g >= 120 && g >= r.saturating_add(30) && g >= b.saturating_add(30)
+}
+
 /// 满足谓词的像素数。
 pub(crate) fn count_in(frame: &Frame, clip: Clip, pred: impl Fn([u8; 3]) -> bool) -> u32 {
     if clip.is_empty() {

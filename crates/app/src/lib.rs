@@ -3,6 +3,7 @@
 pub mod app;
 pub mod keyhook;
 pub mod platform;
+pub mod ui_guard;
 pub mod worker;
 
 pub use app::DeltaApp;
@@ -30,6 +31,15 @@ pub fn images_dir() -> PathBuf {
     } else {
         PathBuf::from(delta_templates::IMAGES_DIR)
     }
+}
+
+/// UI 判定模板目录（`images/ui/`）：**解锁界面本体**的正样本缩略图
+/// （`morse` / `keys` / `line`），命中即认定是该解锁界面并免掉场景投票。
+///
+/// 与角色模板同一条解析规则；目录不存在时 [`ui_guard::UiGuard::load`] 返回空库，
+/// 这道闸自动失效（绝不因为缺素材而拒绝识别）。
+pub fn ui_images_dir() -> PathBuf {
+    images_dir().join("ui")
 }
 
 /// 任务留证目录（`exe 同级 / logs`）。

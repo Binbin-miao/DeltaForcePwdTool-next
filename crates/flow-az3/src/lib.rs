@@ -731,23 +731,55 @@ mod tests {
     }
 
     #[test]
-    fn module_keys_never_reclicks_a_key_that_stays_lit() {
-        // 同一颗键一直亮、进度永不推进 → 只许点一次（点后 400ms 判死换下一格）。
+    fn module_keys_tries_a_stuck_key_twice_then_marks_it_dead() {
+        // 同一颗键一直亮、进度永不推进 → 连点 2 轮（spec B6）就判死，不许无限重试。
         let mut screen = panel_screen(vec![panel_frame(&[3], 0, 16, true)]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
         assert!(!outcome.is_done(), "{outcome:?}");
-        assert_eq!(pointer.clicks, vec![panel_key_center(3)], "{outcome:?}");
+        assert_eq!(
+            pointer.clicks,
+            vec![panel_key_center(3); 2],
+            "同一颗键最多试 2 次：{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn module_keys_clicks_every_lit_button_and_never_the_progress_row() {
+        // 用户拍板：同一帧亮着的模块按钮**全都要点**，不要求顺序（实测同亮 5 个）。
+        // 屏幕内那 5 格是只读进度指示器 —— 任何一次点击都不许落在它们身上。
+        let lit = [1usize, 4, 6, 11, 14];
+        let mut screen = panel_screen(vec![panel_frame(&lit, 0, 16, true)]);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
+        assert!(!outcome.is_done(), "{outcome:?}");
+        for &index in &lit {
+            assert!(
+                pointer.clicks.contains(&panel_key_center(index)),
+                "第 {index} 颗亮键必须被点：{:?}",
+                pointer.clicks
+            );
+        }
+        for stage in 0..5 {
+            let box_ = panel_box(stage);
+            let hit = pointer.clicks.iter().any(|point| {
+                point.x >= box_.x
+                    && point.x < box_.right()
+                    && point.y >= box_.y
+                    && point.y < box_.bottom()
+            });
+            assert!(!hit, "第 {stage} 个进度格只读，绝不许点击：{:?}", pointer.clicks);
+        }
     }
 
     #[test]
     fn module_keys_aborts_once_all_sixteen_keys_are_spent() {
-        // 16 格全亮、进度始终 0：每格只点一次，全点完立即 Abort，不烧满 15s 超时。
+        // 16 格全亮、进度始终 0：每格最多试 2 轮（B6），之后立即 Abort，不烧满 15s 超时。
         let mut screen = panel_screen(vec![panel_frame(&(0..16).collect::<Vec<_>>(), 0, 16, true)]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
         assert!(!outcome.is_done(), "{outcome:?}");
-        assert_eq!(pointer.clicks.len(), 16, "{outcome:?}");
+        assert_eq!(pointer.clicks.len(), 16 * 2, "{outcome:?}");
         let mut centres: Vec<(i32, i32)> = pointer.clicks.iter().map(|p| (p.x, p.y)).collect();
         centres.sort_unstable();
         centres.dedup();
@@ -799,10 +831,12 @@ mod tests {
     fn module_keys_treats_a_vanished_panel_after_clicking_as_done() {
         // 点过键之后面板消失 = 解完了（游戏会把面板收走）。
         // 不区分的话，**每次成功都会被报成「找不到 4×4 按键阵」失败**。
+        // 这里刻意用「进度格读不到」的退化机台（实机常态，见 LESSON-002）：
+        // 读不到进度时唯一能依据的就是「点过键 + 面板消失」。
         let mut frames = vec![
-            panel_frame(&[0], 0, 16, true),
-            panel_frame(&[0], 0, 16, true),
-            panel_frame(&[], 0, 16, true),
+            panel_frame(&[0], 0, 16, false),
+            panel_frame(&[0], 0, 16, false),
+            panel_frame(&[], 0, 16, false),
         ];
         // 之后面板整个消失（只剩灰底）。
         for _ in 0..8 {
@@ -813,6 +847,27 @@ mod tests {
         let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
         assert!(outcome.is_done(), "面板消失应判完成，而不是报定位失败：{outcome:?}");
         assert!(!pointer.clicks.is_empty());
+    }
+
+    #[test]
+    fn module_keys_does_not_claim_done_when_progress_never_moved() {
+        // 反例钉死（fail-closed）：进度**明确读到** 0/5、面板却消失了 ⇒ 不许谎报完成。
+        let mut frames = vec![
+            panel_frame(&[0], 0, 16, true),
+            panel_frame(&[0], 0, 16, true),
+            panel_frame(&[], 0, 16, true),
+        ];
+        for _ in 0..8 {
+            frames.push(blank_panel_frame());
+        }
+        let mut screen = panel_screen(frames);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert!(
+            abort_reason(&outcome).contains("进度只有 0/5"),
+            "必须说清进度没动：{outcome:?}"
+        );
     }
 
     #[test]
@@ -849,13 +904,17 @@ mod tests {
 
     #[test]
     fn module_keys_falls_back_to_the_degraded_criterion_without_progress_boxes() {
-        // 进度框读不出来（退化）→ 不判进度、不判死键；16 格点完按退化判据收尾，
+        // 进度框读不出来（退化）→ 不判进度；16 格都试过之后按退化判据收尾，
         // 且文案必须说明「用的是退化判据」，不许假装读到了进度。
         let mut screen = panel_screen(vec![panel_frame(&(0..16).collect::<Vec<_>>(), 0, 16, false)]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
         assert!(outcome.is_done(), "{outcome:?}");
-        assert_eq!(pointer.clicks.len(), 16, "{outcome:?}");
+        assert_eq!(pointer.clicks.len(), 16 * 2, "{outcome:?}");
+        let mut centres: Vec<(i32, i32)> = pointer.clicks.iter().map(|p| (p.x, p.y)).collect();
+        centres.sort_unstable();
+        centres.dedup();
+        assert_eq!(centres.len(), 16, "16 颗键都要点到");
         assert!(abort_reason(&outcome).contains("退化判据"), "{outcome:?}");
     }
 }

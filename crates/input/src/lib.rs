@@ -3,7 +3,8 @@
 //! 硬约束（浮光实测结论，不得"优化"）：
 //!
 //! 1. 游戏收 raw input，**`MOUSEEVENTF_ABSOLUTE` 的瞬移收不到** —— 拖动只能靠
-//!    `MOUSEEVENTF_MOVE` 的相对增量，且每子步 ≤20px、子步间隔 2ms，大跳会被丢；
+//!    `MOUSEEVENTF_MOVE` 的相对增量，且每子步 ≤20px，大跳会被丢；
+//!    （子步之间不再固定 sleep 2ms：靠「步长不变 + 拖后复读校正」提速，见 `drag.rs`）
 //! 2. 键盘用 `KEYEVENTF_SCANCODE`，不用 VK（游戏按物理键位读）；
 //! 3. spec D12：注入事件必然带 `LLMHF_INJECTED` 标记，无法伪装真实输入。
 //!    本模块给所有事件的 `dwExtraInfo` 打统一标记，便于上层与真实输入区分。
@@ -15,7 +16,7 @@ mod key;
 pub use drag::Drag;
 pub use inject::{
     event_count, plan_click_events, plan_digit_events, reset_event_count, split_steps, Injected,
-    RecordHandle, CLICK_GAP, CLICK_HOLD, INJECTION_TAG, MAX_SUBSTEP_PX, SUBSTEP_DELAY,
+    RecordHandle, CLICK_GAP, CLICK_HOLD, INJECTION_TAG, MAX_SUBSTEP_PX,
 };
 pub use key::{
     key_digit, key_digits, key_space, plan_key_digits, plan_key_space, scancode_for_digit,

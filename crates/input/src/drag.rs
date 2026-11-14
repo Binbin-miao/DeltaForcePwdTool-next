@@ -2,17 +2,21 @@
 //!
 //! ```text
 //! begin(at)   绝对定位到起点 → LEFTDOWN
-//! step(dx,dy) 相对 MOVE 分步，每子步 ≤20px、间隔 2ms
+//! step(dx,dy) 相对 MOVE 分步，每子步 ≤20px
 //! end()       LEFTUP
 //! Drop        兜底 LEFTUP（异常路径不得把鼠标键卡死）
 //! ```
 //!
 //! 拖动全程**不使用** `SetCursorPos`（会和相对移动打架），也不使用
 //! `MOUSEEVENTF_ABSOLUTE` 做位移 —— 绝对定位只出现在 `begin` 的归位那一步。
+//!
+//! `shortcut:` 子步之间**不再 sleep**（原为每子步 2ms）。步长 ≤20px 的硬约束不变；
+//! 8 个子步 ≈ 8 条 MOVE，系统的输入队列（约 200Hz 合并）吃得下。若某台机器
+//! 出现「拖不到位」，升级路径是「每 4 个子步 sleep 1ms」，而不是加大步长。
 
 use delta_geom::PxPoint;
 
-use crate::inject::{screen_size, split_steps, Injected, RecordHandle, Sink, SUBSTEP_DELAY};
+use crate::inject::{screen_size, split_steps, Injected, RecordHandle, Sink};
 use crate::InputError;
 
 /// 保持左键按下状态的拖动手柄。
@@ -62,7 +66,7 @@ impl Drag {
         Ok(())
     }
 
-    /// 相对位移一步。内部拆成 ≤20px 的子步，子步之间等 2ms。
+    /// 相对位移一步。内部拆成 ≤20px 的子步，子步之间**不等待**。
     pub fn step(&mut self, dx: i32, dy: i32) -> Result<(), InputError> {
         if !self.pressed {
             return Err(InputError::NotPressed);
@@ -72,10 +76,6 @@ impl Drag {
                 dx: step_x,
                 dy: step_y,
             })?;
-            // 录制模式跳过等待：测试要快、要确定。
-            if !self.sink.is_recording() {
-                std::thread::sleep(SUBSTEP_DELAY);
-            }
         }
         Ok(())
     }
