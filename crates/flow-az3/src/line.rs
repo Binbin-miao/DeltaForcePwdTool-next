@@ -50,6 +50,8 @@ struct Progress {
     locate_misses: u32,
     led_misses: u32,
     select_misses: [u32; LINE_COLUMNS],
+    /// 这一列**历史上**是否读到过档位（决定读不出时能否安全走归零兜底）。
+    evidence: [bool; LINE_COLUMNS],
     attempts: [u32; LINE_COLUMNS],
     dead: [bool; LINE_COLUMNS],
     calibrated: [bool; LINE_COLUMNS],
@@ -180,18 +182,19 @@ fn read_led_digits(strip: &GrayImage) -> Result<String, String> {
         .into_iter()
         .filter(|region| region.h * 3 >= tallest * 2)
         .collect();
-    if digits.len() < LED_DIGITS {
+    // **必须恰好 8 位**：短横已被高度过滤掉，8 是唯一合法个数。
+    // 多检出的（边框碎块、按钮高光）一律报错而不是「取最左 8 个」——
+    // 静默截断会让 8 位序列整体错位，接着按错误序列拖满 4 列，还全程报「成功」。
+    if digits.len() != LED_DIGITS {
         return Err(format!(
-            "LED 只找到 {} 个数字（应为 {LED_DIGITS}）",
+            "LED 找到 {} 个数字（应为 {LED_DIGITS} 个）",
             digits.len()
         ));
     }
     let mut sorted = digits;
     sorted.sort_by_key(|region| region.x);
-    // 多检出的（光晕碎块）取最左 8 个：LED 条是左对齐排布的。
     Ok(sorted
         .iter()
-        .take(LED_DIGITS)
         .map(|region| if has_hole(&binary, *region) { '0' } else { '1' })
         .collect())
 }
@@ -455,10 +458,18 @@ impl Progress {
         cancel: &AtomicBool,
     ) -> Option<Az3Outcome> {
         let Some(row) = line.selected.get(column).copied().flatten() else {
-            // 读不出当前档位 —— 实机很常见：信号线是**连续**可调的，经常停在两档之间
-            // （实测 t112：线在 y=204，距最近档位 104px，而档距只有 109px）。
-            // 这时「按差值拖」无从算起，但「先把线拖到顶、再往下数 N 档」只依赖相对位移，
-            // 永远成立。先给它几次归零的机会，实在不行才判死这一列。
+            // 读不出当前档位。**这里必须区分两种情形**，否则就是「没有证据也动手」：
+            //
+            // - 这一列**曾经**读到过档位（信号线在连续可调过程中暂时停在两档之间，
+            //   实测 y=204 距最近档位 104px、档距 109px）⇒ 归零兜底是安全的：
+            //   我们已经确认过这块屏幕、这一列确实存在；
+            // - 这一列**从来没读到过**（静止未开始画面、过场、判别层误判别的界面）
+            //   ⇒ 屏幕内容都不确定，还要按下去拖 5 个行距，就是纯盲拖。
+            //   维持旧行为：判死这一列，零输入退出。
+            if !self.evidence[column] {
+                self.dead[column] = true;
+                return self.on_column_dead(pointer.event_count());
+            }
             self.select_misses[column] += 1;
             if self.select_misses[column] <= SELECT_FAIL_LIMIT {
                 return self.homing_drag(line, column, pointer, clock, cancel);
@@ -466,6 +477,7 @@ impl Progress {
             self.dead[column] = true;
             return self.on_column_dead(pointer.event_count());
         };
+        self.evidence[column] = true;
         self.select_misses[column] = 0;
         if row == self.targets[column] {
             // 已经在这一列的目标行上：只等「停住 600ms」，绝不再拖（否则会把对齐好的线拖走）。
@@ -843,30 +855,24 @@ mod tests {
     }
 
     #[test]
-    fn column_without_marker_falls_back_to_homing_drag() {
-        // 第 2 列读不出当前档位（信号线停在两档之间，或游戏还没给它画框）。
+    fn column_never_readable_is_never_touched() {
+        // 第 2 列**从来没读到过档位**（游戏没给它画框、信号线也没落到过任何一行）。
         //
-        // **旧行为是直接判死这一列** —— 实机上那等于「明明能修却不动手」，
-        // 用户看到的就是「控制台不动」。现在改成归零兜底：
-        // 先把线拖到顶（游戏会夹住），再往下数到目标行，全程只用相对位移。
+        // 这种情况必须零输入退出：一块「不确定是什么内容」的屏幕，还要按下去拖 5 个行距，
+        // 就是纯盲拖（实机上曾在摩斯面板上拖出 64 个乱事件）。
+        // 归零兜底只在「这一列曾经读到过」时才允许 —— 那时才确认过屏幕和列位都真实存在。
         let (outcome, game) = play(Game::new([Some(3), None, Some(2), Some(0)]));
         let game = game.borrow();
-        let second: Vec<_> = game
-            .begin_points
-            .iter()
-            .filter(|point| point.x == COLUMNS[1])
-            .collect();
         assert!(
-            !second.is_empty(),
-            "读不出档位的列必须走归零兜底，而不是放弃：{:?}",
+            game.begin_points.iter().all(|point| point.x != COLUMNS[1]),
+            "从未读到过档位的列一次都不许碰：{:?}",
             game.begin_points
         );
+        assert!(!outcome.is_done(), "读不全就不该报完成：{outcome:?}");
         assert!(
-            game.steps.iter().all(|&(dx, _)| dx == 0),
-            "归零也必须只纵拖：{:?}",
-            game.steps
+            reason_of(&outcome).contains("第 2 列没能对齐"),
+            "{outcome:?}"
         );
-        let _ = outcome;
     }
 
     #[test]

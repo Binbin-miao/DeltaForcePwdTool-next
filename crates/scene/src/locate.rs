@@ -666,7 +666,8 @@ fn amber_selected(frame: &Frame, columns: &[i32], rows: &[i32]) -> Vec<Option<us
     columns
         .iter()
         .map(|&column| {
-            rows.iter()
+            let mut scored: Vec<(usize, u32)> = rows
+                .iter()
                 .enumerate()
                 .map(|(row, &y)| {
                     let window = PxRect {
@@ -677,9 +678,15 @@ fn amber_selected(frame: &Frame, columns: &[i32], rows: &[i32]) -> Vec<Option<us
                     };
                     (row, count_in(frame, window, is_marker_amber))
                 })
-                .max_by_key(|&(_, count)| count)
-                .filter(|&(_, count)| count >= MARKER_MIN_PIXELS)
-                .map(|(row, _)| row)
+                .collect();
+            scored.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+            let (best_row, best) = *scored.first()?;
+            let second = scored.get(1).map_or(0, |&(_, count)| count);
+            // **必须单峰**（峰值 ≥ 次峰 ×3）才采信。
+            // 受控那一列的整列档条是米黄（实测 R220/G200/B150），它同时满足琥珀判据
+            // （delta=70 ≥ 0.275·R=60.5），于是 4 行计数几乎一样高 —— 取哪个都可能是错的。
+            // 此时让位给信号线通道（它读的是线高度，不受颜色影响）。
+            (best >= MARKER_MIN_PIXELS && best >= second.saturating_mul(3)).then_some(best_row)
         })
         .collect()
 }
