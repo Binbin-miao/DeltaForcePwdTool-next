@@ -1262,6 +1262,10 @@ pub fn locate_keys_state(frame: &Frame) -> Locate<LocatedKeys> {
 }
 
 /// ready 判据里的亮键像素下限（spec §0①：噪声基线 950、首颗亮键 3767，取 3000 作中线）。
+///
+/// **仅 720p 口径的参考值**：就绪闸已改成只看面板结构（[`keys_panel_ready`]），
+/// 亮键像素只作为 flow 内部的点击判据（[`lit_key_pixels`]）、以及 [`keys_ready`] 这条
+/// 组合判据的组成部分，**不再决定「能不能开跑」**。
 pub const READY_LIT_MIN_PX: u32 = 3000;
 /// 亮键像素判据：够亮 + 饱和 + 蓝分量最小（黄绿高光）。暗键面近黑，不会命中。
 fn is_lit_key([b, g, r]: [u8; 3]) -> bool {
@@ -1302,10 +1306,31 @@ fn ready_lit_min_px(scale: f32) -> u32 {
     (READY_LIT_MIN_PX as f32 * scale * scale).round() as u32
 }
 
+/// 黄键台“开跑就绪”：**面板结构量得出来**就算就绪，亮键像素不参与。
+///
+/// 就绪闸（`worker::wait_keys_ready`）只认这一条。用它而不是 [`keys_ready`] 的原因：
+/// 面板刚打开是 **1% 进度、一颗键都没亮**，把「亮键像素 ≥ 阈值」并进就绪闸等于要求
+/// 「先亮起来才算打开」—— 于是整段 2100ms 都 `NotYet`、必然超时，日志里报成
+/// 「就绪等待失败 / 面板已消失」，而同一帧的模板分是 0.95。
+///
+/// 亮键仍然是 flow 内部的判据（点哪颗、是否吃下），只是**不再决定能不能开跑**。
+pub fn keys_panel_ready(frame: &Frame) -> Locate<()> {
+    match locate_keys_state(frame) {
+        Locate::Found(_) => Locate::Found(()),
+        // 面板底色已在、键阵/进度格还没量全：这是「还没画完」，继续等，不判失败。
+        Locate::NotYet => Locate::NotYet,
+        Locate::Absent => Locate::Absent,
+    }
+}
+
 /// 黄键台 ready：**面板可定位 且 亮键像素 ≥ [`ready_lit_min_px`]**，两条同时成立才算。
 ///
 /// 只判「可定位」会把 0.4–1.8s 那段「面板已出现、一颗键都没亮」的空窗当成可以动手，
 /// 于是点了个寂寞；只判亮键则会被别的界面上的黄绿光骗到。
+///
+/// **就绪闸已改用 [`keys_panel_ready`]**（亮键判据会让「1% 进度、零亮键」的真面板永远
+/// 等不到就绪）。本函数保留为组合判据：需要「面板已在 **且** 已经亮起来」的场合
+/// （例如无模板退化路径下的开跑确认）仍可用它。
 ///
 /// **必须在原帧上判**：`locate_keys` 内部自己归一化一次并把坐标乘回原图，所以
 /// `keys.cells` 是**原图坐标**、亮键像素也必须是原图口径。旧实现先 `normalize_frame` 拿
@@ -2839,6 +2864,24 @@ mod keys_tests {
             1,
             "换成松散带宽后同一块绿会被放行 —— 证明放行只在 1080p 世界生效"
         );
+    }
+
+    #[test]
+    fn a_1080p_panel_with_zero_lit_keys_is_ready_to_start() {
+        // 就绪闸（`worker::wait_keys_ready`）只等面板结构：面板已在、一颗键都没亮（1% 进度）
+        // 才是真面板刚打开的样子。旧闸把「亮键像素」并进就绪 ⇒ 这一帧永远 NotYet ⇒ 2100ms
+        // 超时，日志里报「就绪等待失败 / 面板已消失」，而模板分是 0.95。
+        let frame = hd_frame(&[], 0, 3);
+        assert_eq!(
+            keys_panel_ready(&frame),
+            Locate::Found(()),
+            "1080p 面板在、零亮键 ⇒ 就绪"
+        );
+        // 对照：组合判据（面板 + 亮键）在同一帧上仍是 NotYet —— 差别就是本轮修的东西。
+        assert_eq!(keys_ready(&frame).state_name(), "NotYet");
+        // 面板彻底不在时仍然必须说清（fail-closed，绝不放行）。
+        let blank = Canvas::new(MACHINE).frame();
+        assert_eq!(keys_panel_ready(&blank), Locate::Absent);
     }
 
     #[test]

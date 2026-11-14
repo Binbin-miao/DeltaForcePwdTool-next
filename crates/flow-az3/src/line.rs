@@ -448,6 +448,9 @@ impl Progress {
         }
         self.attempts[column] += 1;
         self.drags += 2;
+        if self.over_drag_cap() {
+            return Some(aborted(pointer.event_count(), over_cap_reason()));
+        }
         clock.sleep_ms(SETTLE_MS);
         None
     }
@@ -512,8 +515,20 @@ impl Progress {
         }
         self.attempts[column] += 1;
         self.drags += 1;
+        if self.over_drag_cap() {
+            return Some(aborted(pointer.event_count(), over_cap_reason()));
+        }
         clock.sleep_ms(SETTLE_MS);
         None
+    }
+
+    /// 拖动次数是否到了硬上限（跑飞时立刻收手；正常一轮最多约 28 次）。
+    ///
+    /// **为什么不用事件数**：一次拖动 = 按下 + 8 子步 + 抬起 = 10 个输入事件，
+    /// 60 个事件只有 6 次拖动 —— 会在正常一轮（4 列各 1~2 拖 + 补拖）里误报「疑似误判」。
+    /// 所以这一档的单位是**拖动次数**，不是事件数。
+    fn over_drag_cap(&self) -> bool {
+        self.drags >= delta_config::AZ3_MAX_DRAG_ACTIONS
     }
 
     /// 一列被判死之后：4 列全死才收工，否则继续推进剩下的列。
@@ -542,6 +557,14 @@ fn aborted(events: u64, reason: String) -> Az3Outcome {
         reason: format!("信号线台：{reason}"),
         events,
     }
+}
+
+/// 撞拖动上限时的收尾文案：必须说清「这是疑似误判」，不是「这局解不完」。
+fn over_cap_reason() -> String {
+    format!(
+        "疑似误判：已达拖动次数上限（{}），已停止注入",
+        delta_config::AZ3_MAX_DRAG_ACTIONS
+    )
 }
 
 /// 完成判据：屏幕里出现「黄框 + 45° 黄黑斜纹」浮层。

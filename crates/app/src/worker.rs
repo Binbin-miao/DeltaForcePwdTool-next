@@ -23,9 +23,6 @@ const HOTKEY_POLL: Duration = Duration::from_millis(200);
 /// 总开关关掉时给用户的唯一一句解释（检查入口与识别入口共用，防两处文案漂移）。
 const NOTICE_MASTER_PAUSED: &str = "识别已暂停（设置里可重新打开）";
 
-/// 两帧认出的界面不一致时的解释（界面在识别过程中变了 ⇒ 零注入）。
-const CHANGED_NOTICE: &str = "界面在识别过程中变了，请重新按 F";
-
 /// 后台 → UI 的事件。
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -395,20 +392,31 @@ fn open_session(config: &Config, tx: &mpsc::Sender<UiEvent>) -> Option<CaptureSe
 
 // ── 就绪等待（Q1/Q3：面板 0.4s 才淡入、首颗亮键 1.8s 才出现）──
 
-/// ready 等待的总预算：面板出现到第一颗可识别亮键实测 1.4s × 1.5（spec P1）。
-pub const READY_BUDGET_MS: u64 = 2100;
-/// 等待期间的抓帧间隔（40ms ≈ 25fps；2.1s 约 52 帧，任务会话 300 帧装得下）。
-const READY_POLL_MS: u64 = 40;
-/// 场景判别的容忍线：连续这么多帧 `Unknown` **且** 已耗这么久才允许拒绝（spec P6）。
-const SCENE_UNKNOWN_FRAMES: u32 = 3;
-const SCENE_UNKNOWN_MIN_MS: u64 = 1200;
-/// 快速拒绝的时间线：面板淡入实测 0.400s（`.scratch/az3-fix-batch/spec.md` §0⑤ 锚点表 · 帧 12）。
+/// 就绪轮询的**总预算**：既是 [`wait_keys_ready`] 等面板的余额，也是场景等待的上界。
 ///
-/// 0~`QUICK_REJECT_MS` 之间「一帧都不像任何解锁界面」是**正常现象**（面板还在淡入），
-/// 一律不得拒绝；超过这条线仍不像、且结构判别也没命中，就立刻按
-/// [`ui_guard::NOT_UNLOCK_SCREEN`] 收手。它把 v6.7「干等 1.2s 报『未检测到游戏界面』」
-/// 压成 0.4s 报出**准确**文案。
-const QUICK_REJECT_MS: u64 = 400;
+/// 必须 > [`QUICK_REJECT_MS`]，否则拒绝分支等不满、退化成 `Exhausted`。
+/// 3500 = 3000 拒绝时限 + 500 抓帧/编码余量（40ms 一帧 ⇒ 12 帧余量）。
+/// 历史上这里是 2100（「面板出现到第一颗亮键 1.4s × 1.5」），就绪闸不再看亮键后
+/// 这个依据已失效，改为服从上面的不等式。
+pub const READY_BUDGET_MS: u64 = 3500;
+/// 等待期间的抓帧间隔（40ms ≈ 25fps；3.5s 约 88 帧，任务会话 300 帧装得下）。
+const READY_POLL_MS: u64 = 40;
+/// 场景判别的容忍线：连续这么多帧 `Unknown` 才允许判「预算耗尽」（spec P6）。
+const SCENE_UNKNOWN_FRAMES: u32 = 3;
+/// 快速拒绝的时间线：**3 秒**（用户拍板：「模板没命中时先等 3 秒再拒绝」）。
+///
+/// 0~`QUICK_REJECT_MS` 之间「一帧都不像任何解锁界面」是**正常现象**，一律不得拒绝。
+/// 这个窗必须容得下两件事，缺一条就会误拒真面板：
+/// 1. 面板淡入实测 0.400~1.400s（`.scratch/az3-fix-batch/spec.md` §0⑤ 锚点表）；
+/// 2. 玩家镜头在**靠近过程中会移动**，同一块面板在画面里会漂、会虚 —— 实测录屏 92.00~92.75s
+///    整段模板分掉到 <0.60（其余时段 0.894~0.955），随后又恢复。
+///
+/// 旧的 400ms 太短：40ms 一帧、400ms 只有 10 帧，镜头一动就整段落在「一帧都不像」，
+/// 于是一个**已确认存在**的面板被当场拒掉 —— 这就是「按一次 F 没用」的直接原因。
+///
+/// **必须 < [`READY_BUDGET_MS`]**：轮询预算是拒绝时限的上界，预算短于时限时
+/// 这条拒绝永远等不满，所有非解锁界面都会退化成「预算耗尽」的错归因。
+const QUICK_REJECT_MS: u64 = 3000;
 
 /// 通用就绪等待：每轮取一次 `probe`，`Found` 立刻返回；预算用尽返回最后一次的三态。
 ///
@@ -444,65 +452,63 @@ fn wait_ready<T>(
 /// 一次轮询帧的三分类结论（**同一帧**同时喂给结构判别与 UI 模板）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollVerdict {
-    /// 结构判别或模板命中，可以动手；`hint` = 模板两帧复核确认过的场景。
+    /// 可以动手；`hint` = 模板确认过的场景（`None` = 交给结构判别/投票）。
     Ready(Option<delta_scene::Scene>),
-    /// 还说不清，继续等（覆盖 0~400ms 淡入期与模板灰带）。
+    /// 还说不清，继续等（覆盖淡入期、镜头移动期与模板灰带）。
     NotYet,
-    /// 明确不是解锁界面（已耗 ≥ [`QUICK_REJECT_MS`] 且模板 `Reject` 且结构未命中）。
+    /// 明确不是解锁界面（已耗 ≥ [`QUICK_REJECT_MS`] 且模板 `Reject`）。
     Reject(&'static str),
 }
 
-/// 单帧综合探测：**先结构后模板**（先便宜后昂贵），两种判据共享同一帧。
+/// 单帧综合探测：**模板优先，结构判别只在模板库为空时兜底**。
 ///
-/// `recheck_frame` 只在模板命中时被调用一次：两帧必须有**明确的时间间隔**，
-/// 拿同一帧复核自己是自欺（它一定通过）。
+/// 顺序不可交换（实测依据：全片 1125 采样点里面板在时 NCC 0.894~0.955，
+/// 其余 p90 只有 0.206 —— 模板的分离度远大于结构判别，它该说了算）：
+///
+/// 1. 模板库非空 ⇒ **模板 verdict 就是结论**：
+///    - `Target(scene)` → 立刻 [`PollVerdict::Ready`]，**不再补抓第二帧复核**。
+///      两帧复核会让镜头移动时把**已经确认**的面板撤回（`Downgrade` → `NotYet`），
+///      实测 92.00~92.75s 就是这样把 90s 已确认的结论推翻的；
+///    - `Reject` 且已过 [`QUICK_REJECT_MS`] → [`PollVerdict::Reject`]；
+///    - 其余（`Reject` 未到时限 / 灰带）→ [`PollVerdict::NotYet`]。
+///      这里**绝不**回落到结构判别：走廊/背包上结构判别常判出 `Console`，
+///      一旦回落就是拿模板已经否掉的画面去按键盘。
+/// 2. 模板库为空（素材被删/没打包）⇒ 只剩结构判别可用，命中即动手（fail-open 到 v6.7 行为），
+///    并在 `run_once` 打一行「模板库为空，退化到结构判别」。
 fn classify_poll_frame(
     guard: &ui_guard::UiGuard,
     frame: &Frame,
     view: &PxView,
     elapsed_ms: u64,
-    recheck_frame: impl FnOnce() -> Option<Frame>,
 ) -> PollVerdict {
-    // 1. 结构判别：原路径一字不改 —— 命中就动手，模板只用来补「免投票的场景」。
-    let structural = delta_scene::detect(frame, view).is_actionable()
-        || delta_scene::az3_variant(frame, view).is_known();
-    if structural {
-        return PollVerdict::Ready(None);
-    }
-    // 2. 模板库为空 = 没有素材可判 ⇒ 说不清，绝不因此拒绝识别。
+    // 1. 没有可用模板：结构判别是唯一判据（命中即动手）。
     if guard.is_empty() {
-        return PollVerdict::NotYet;
+        let structural = delta_scene::detect(frame, view).is_actionable()
+            || delta_scene::az3_variant(frame, view).is_known();
+        return match structural {
+            true => PollVerdict::Ready(None),
+            false => PollVerdict::NotYet,
+        };
     }
+    // 2. 有模板：模板说了算（结构判别不参与，见上方 1. 的注释）。
     match guard.verdict(frame) {
-        ui_guard::UiVerdict::Target(scene) => match recheck_frame() {
-            Some(second) => match ui_guard::recheck(
-                ui_guard::UiVerdict::Target(scene),
-                guard.verdict(&second),
-            ) {
-                ui_guard::Recheck::Keep(scene) => PollVerdict::Ready(Some(scene)),
-                // 模板掉了，但结构判别还有机会长起来 ⇒ 继续等。
-                ui_guard::Recheck::Downgrade => PollVerdict::NotYet,
-                ui_guard::Recheck::Changed => PollVerdict::Reject(CHANGED_NOTICE),
-            },
-            // 补抓失败：说不清就继续等，交给下一轮/预算耗尽收尾。
-            None => PollVerdict::NotYet,
-        },
+        ui_guard::UiVerdict::Target(scene) => PollVerdict::Ready(Some(scene)),
         ui_guard::UiVerdict::Reject(reason) if elapsed_ms >= QUICK_REJECT_MS => {
             PollVerdict::Reject(reason)
         }
-        // 淡入期 / 灰带：一帧不像不算证据，等时间给出答案。
         ui_guard::UiVerdict::Reject(_) | ui_guard::UiVerdict::Gray => PollVerdict::NotYet,
     }
 }
 
 /// 等场景就绪的收尾结论（`Locate<T>` 表达不了「明确拒绝」这一态）。
+#[derive(Debug)]
 enum ReadyOutcome {
-    /// 可以动手了；`hint` = 模板两帧复核确认过的场景（`None` = 交给结构判别/投票）。
+    /// 可以动手了；`hint` = 模板确认过的场景（`None` = 交给结构判别/投票）。
     Ready {
         frame: Frame,
         hint: Option<delta_scene::Scene>,
     },
-    /// 明确不是解锁界面（模板一张都不像，且结构判别也没命中）。
+    /// 明确不是解锁界面（模板库非空、且模板一张都不像；这一态已不参考结构判别）。
     Rejected(&'static str),
     /// 预算耗尽：等不到任何判据，一帧都不像已知界面。
     Exhausted,
@@ -523,39 +529,68 @@ fn wait_scene_ready(
     tx: &mpsc::Sender<UiEvent>,
 ) -> ReadyOutcome {
     let mut clock = delta_flow_az3::SystemClock::new();
+    match poll_scene_ready(&mut clock, cancel, guard, view, READY_BUDGET_MS, || {
+        session.grab(full).map_err(|error| error.to_string())
+    }) {
+        Ok(outcome) => outcome,
+        Err(reason) => {
+            let _ = tx.send(UiEvent::Failed(reason));
+            ReadyOutcome::Stopped
+        }
+    }
+}
+
+/// 轮询主体：**抓帧与判定分离**，判定（就绪 / 拒绝 / 耗尽）可以零真实等待地跑。
+///
+/// `budget_ms` 必须大于拒绝时限 [`QUICK_REJECT_MS`]：预算先到就直接 `Exhausted`，
+/// 「这不是解锁界面」这条**准确**文案永远发不出去，所有走廊/背包/地图都会被错归因成
+/// 「未检测到游戏界面」。生产上由 [`READY_BUDGET_MS`] 提供，测试用它钉住这个不等式。
+fn poll_scene_ready(
+    clock: &mut impl Clock,
+    cancel: &AtomicBool,
+    guard: &ui_guard::UiGuard,
+    view: &PxView,
+    budget_ms: u64,
+    mut probe: impl FnMut() -> Result<Frame, String>,
+) -> Result<ReadyOutcome, String> {
     let began = clock.now_ms();
     let mut probes = 0u32;
     loop {
         // 每轮读一次取消位：关掉总开关后不许还干等。
         if cancel.load(Ordering::SeqCst) {
-            let _ = tx.send(UiEvent::Failed("已取消".to_owned()));
-            return ReadyOutcome::Stopped;
+            return Err("已取消".to_owned());
         }
         probes += 1;
-        let frame = match session.grab(full) {
-            Ok(frame) => frame,
-            Err(error) => {
-                let _ = tx.send(UiEvent::Failed(error.to_string()));
-                return ReadyOutcome::Stopped;
-            }
-        };
+        let frame = probe()?;
         let elapsed = clock.now_ms().saturating_sub(began);
-        let verdict =
-            classify_poll_frame(guard, &frame, view, elapsed, || session.grab(full).ok());
-        match verdict {
-            PollVerdict::Ready(hint) => return ReadyOutcome::Ready { frame, hint },
-            PollVerdict::Reject(reason) => return ReadyOutcome::Rejected(reason),
+        match classify_poll_frame(guard, &frame, view, elapsed) {
+            PollVerdict::Ready(hint) => return Ok(ReadyOutcome::Ready { frame, hint }),
+            PollVerdict::Reject(reason) => return Ok(ReadyOutcome::Rejected(reason)),
             PollVerdict::NotYet => {}
         }
         // 预算耗尽仍说不清 ⇒ 交给上层报「未检测到游戏界面」。
-        if elapsed >= SCENE_UNKNOWN_MIN_MS && probes >= SCENE_UNKNOWN_FRAMES {
-            return ReadyOutcome::Exhausted;
+        if elapsed >= budget_ms && probes >= SCENE_UNKNOWN_FRAMES {
+            return Ok(ReadyOutcome::Exhausted);
         }
-        clock.sleep_ms(READY_POLL_MS.min(SCENE_UNKNOWN_MIN_MS.saturating_sub(elapsed).max(1)));
+        clock.sleep_ms(READY_POLL_MS.min(budget_ms.saturating_sub(elapsed).max(1)));
     }
 }
 
-/// 等黄键台真的可以动手：面板可定位 **且** 亮键像素 ≥3000px@720p，返回就绪的那一帧。
+/// 黄键台就绪探针：**面板结构量得出来**就带着这一帧就绪（亮键像素不参与）。
+fn keys_ready_probe(frame: Frame) -> Locate<Frame> {
+    match delta_scene::locate::keys_panel_ready(&frame) {
+        Locate::Found(()) => Locate::Found(frame),
+        Locate::NotYet => Locate::NotYet,
+        Locate::Absent => Locate::Absent,
+    }
+}
+
+/// 等黄键台真的可以动手：**面板结构量得出来**就算就绪（亮键像素不参与），返回就绪的那一帧。
+///
+/// 旧的判据是「面板可定位 **且** 亮键像素 ≥3000px@720p」—— 但面板刚开是 **1% 进度、零亮键**，
+/// 于是这条闸要求「先亮起来才算打开」，必然一路 `NotYet` 到 2100ms 超时，
+/// 日志里报成「就绪等待失败 / 面板已消失」，而模板分明明 0.95。
+/// 亮键只作为 flow 内部的点击判据（`lit_key_pixels`），不决定「能不能开跑」。
 fn wait_keys_ready(
     session: &mut CaptureSession,
     full: PxRect,
@@ -563,17 +598,11 @@ fn wait_keys_ready(
     tx: &mpsc::Sender<UiEvent>,
 ) -> Locate<Frame> {
     let mut clock = delta_flow_az3::SystemClock::new();
-    wait_ready(&mut clock, cancel, READY_BUDGET_MS, 1, || {
-        match session.grab(full) {
-            Ok(frame) => match delta_scene::locate::keys_ready(&frame) {
-                Locate::Found(()) => Locate::Found(frame),
-                Locate::NotYet => Locate::NotYet,
-                Locate::Absent => Locate::Absent,
-            },
-            Err(error) => {
-                let _ = tx.send(UiEvent::Failed(error.to_string()));
-                Locate::Absent
-            }
+    wait_ready(&mut clock, cancel, READY_BUDGET_MS, 1, || match session.grab(full) {
+        Ok(frame) => keys_ready_probe(frame),
+        Err(error) => {
+            let _ = tx.send(UiEvent::Failed(error.to_string()));
+            Locate::Absent
         }
     })
 }
@@ -618,7 +647,7 @@ struct ReadyContext<'a> {
     tx: &'a mpsc::Sender<UiEvent>,
 }
 
-/// 就绪的那一帧 + 模板两帧复核确认过的场景。
+/// 就绪的那一帧 + 模板确认过的场景。
 struct ReadyFrame {
     frame: Frame,
     hint: Option<delta_scene::Scene>,
@@ -658,7 +687,7 @@ fn await_frame(ctx: ReadyContext<'_>, basis: ReadyBasis) -> Option<ReadyFrame> {
             None
         }
         ReadyOutcome::Exhausted => {
-            let reason = format!("{SCENE_UNKNOWN_MIN_MS}ms / {SCENE_UNKNOWN_FRAMES} 帧内没认出界面");
+            let reason = format!("{READY_BUDGET_MS}ms / {SCENE_UNKNOWN_FRAMES} 帧内没认出界面");
             save_evidence(
                 "reject",
                 &reason,
@@ -701,11 +730,11 @@ fn confirm_az3(
     let frame = match verdict {
         Locate::Found(frame) => frame,
         Locate::NotYet => {
+            // 面板底色已在、挡位/按键阵还没量全：这是「还没画完」，不是「没亮」。
             let reason = format!(
-                "{} {}ms 内没亮起来（面板已定位，但亮键像素不足 {}px）",
+                "{} {}ms 内没能量出完整面板（底色已在，按键阵/进度格认不全）",
                 expected.label(),
-                READY_BUDGET_MS,
-                delta_scene::locate::READY_LIT_MIN_PX
+                READY_BUDGET_MS
             );
             save_evidence("reject", &reason, monitor, config.capture_backend, "就绪等待超时");
             return Err(reason);
@@ -828,6 +857,11 @@ fn run_once(
     } else {
         ReadyBasis::Detect
     };
+    // 素材被删/没打包 ⇒ 模板闸整段失效，退化到结构判别。这里**每次任务只打一行**：
+    // 轮询里逐帧打印会让一次 F8 刷 30 行（同 `ui_guard::should_log` 的理由）。
+    if !basis.skips_detect() && guard.is_empty() {
+        eprintln!("[ui] 模板库为空，退化到结构判别");
+    }
 
     if let Err(reason) = platform::focus_game_window() {
         let _ = tx.send(UiEvent::Rejected(reason));
@@ -908,13 +942,13 @@ fn run_once(
     }
 
     // Q1/Q5：**真开跑前再抓一帧**。
-    // - 黄键台：必须「面板可定位 **且** 亮键 ≥3000px」两条同时成立（spec B2/B3、P1）；
+    // - 黄键台：只等「面板结构量得出来」（spec B2/B3、P1；亮键像素不是就绪判据）；
     // - 同时复核 AZ3 变体，不一致立即拒绝 —— 把「误判 × 上百次乱点」压到 ≤1 帧。
     if scene == SceneKind::Console && az3_kind.is_known() {
         let verdict = if az3_kind == delta_scene::Az3Kind::ModuleKeys {
             wait_keys_ready(&mut session, full, cancel, tx)
         } else {
-            // 其余 AZ3 玩法没有「亮键像素」这条判据，复核用的就是刚判别过的那一帧。
+            // 其余 AZ3 玩法没有「面板量不全」这条就绪判据，复核用的就是刚判别过的那一帧。
             Locate::Found(frame.clone())
         };
         if let Err(reason) = confirm_az3(verdict, &view, az3_kind, &snapshot, monitor) {
@@ -1727,6 +1761,126 @@ mod tests {
         Frame::new(128, 96, vec![128u8; 128 * 96 * 4], std::time::Instant::now()).expect("合成帧")
     }
 
+    /// 把 `images/ui/<name>.png` 按 [`ui_guard::ROI`] 铺回一帧整屏画面（等价于「屏幕上就是这张界面」）。
+    ///
+    /// ROI 与 [`ui_guard`] 内部同一块区域：贴进去之后模板分≈1.0，与实机命中同口径。
+    fn frame_showing(name: &str) -> Frame {
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        let source = delta_templates::decode_png_gray(&ui_templates_dir().join(format!("{name}.png")))
+            .expect("模板必须能解码")
+            .resize_to(ui_guard::TEMPLATE_W, ui_guard::TEMPLATE_H)
+            .expect("模板口径");
+        let (left, top, right, bottom) = ui_guard::ROI;
+        let (x0, y0) = ((W as f32 * left) as u32, (H as f32 * top) as u32);
+        let (x1, y1) = ((W as f32 * right) as u32, (H as f32 * bottom) as u32);
+        let mut data = vec![0u8; (W * H * 4) as usize];
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let tx = (x - x0) * ui_guard::TEMPLATE_W / (x1 - x0);
+                let ty = (y - y0) * ui_guard::TEMPLATE_H / (y1 - y0);
+                let value = source.as_slice()[(ty * ui_guard::TEMPLATE_W + tx) as usize];
+                let index = ((y * W + x) * 4) as usize;
+                data[index..index + 4].copy_from_slice(&[value, value, value, 255]);
+            }
+        }
+        Frame::new(W, H, data, std::time::Instant::now()).expect("合成帧")
+    }
+
+    /// 往 BGRA 缓冲里画一个实色矩形（越界自动裁掉）。
+    fn paint(data: &mut [u8], w: u32, rect: PxRect, rgb: [u8; 3]) {
+        for y in rect.y.max(0)..rect.bottom() {
+            for x in rect.x.max(0)..rect.right() {
+                let index = ((y as u32 * w + x as u32) * 4) as usize;
+                data[index..index + 4].copy_from_slice(&[rgb[2], rgb[1], rgb[0], 255]);
+            }
+        }
+    }
+
+    /// 旧操作台画面（右上 LED `01-00-01-11` + 面板 4 条等距竖列 + 米黄旋钮）。
+    ///
+    /// 结构判别会判成 `Console`，而模板库里的三张解锁界面（morse/keys/line）都对不上 ——
+    /// 正是「走廊/背包上结构像操作台、模板一张都不像」的合成版。
+    fn console_frame() -> Frame {
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        let mut data = vec![0u8; (W * H * 4) as usize];
+        let rect = |x: i32, y: i32, w: i32, h: i32| PxRect { x, y, w, h };
+        let mut cursor = 870;
+        for (group, digits) in ["01", "00", "01", "11"].iter().enumerate() {
+            for digit in digits.chars() {
+                let width = if digit == '1' { 6 } else { 12 };
+                paint(&mut data, W, rect(cursor, 92, width, 40), [255, 255, 255]);
+                cursor += width + 6;
+            }
+            if group < 3 {
+                paint(&mut data, W, rect(cursor, 108, 14, 8), [255, 255, 255]);
+                cursor += 14 + 8;
+            }
+        }
+        for x in [160, 300, 440, 580] {
+            paint(&mut data, W, rect(x, 200, 8, 300), [255, 255, 255]);
+        }
+        paint(&mut data, W, rect(725, 320, 40, 40), [235, 205, 80]);
+        Frame::new(W, H, data, std::time::Instant::now()).expect("合成帧")
+    }
+
+    /// 与 [`console_frame`] 配套的校准视图：面板/LED/旋钮都按 1280×720 口径给齐。
+    fn console_view() -> PxView {
+        let rect = |x: i32, y: i32, w: i32, h: i32| PxRect { x, y, w, h };
+        PxView {
+            console: delta_config::PxConsole {
+                led_region: rect(855, 85, 390, 55),
+                panel_region: rect(85, 90, 595, 515),
+                col_x: vec![160, 300, 440, 580],
+                row_y: vec![200, 300, 400, 500],
+                knob_center: PxPoint { x: 745, y: 340 },
+            },
+            ..led_view()
+        }
+    }
+
+    #[test]
+    fn a_confirmed_panel_is_not_revoked_by_a_following_corridor_frame() {
+        // 实测：面板在时模板分 0.894~0.955，走廊/镜头移动时 p90 只有 0.206 —— 分离度足够。
+        // 旧实现拿到 `Target` 后补抓第二帧复核，镜头一动第二帧掉回灰带就 `Downgrade` 撤回，
+        // 于是 90s 已确认的黄键台在 92s 被推翻（用户看到的就是「按一次 F 没用」）。
+        let guard = ui_guard::UiGuard::load(&ui_templates_dir());
+        let panel = frame_showing("keys");
+        let corridor = flat_frame();
+        assert_eq!(
+            guard.verdict(&panel),
+            ui_guard::UiVerdict::Target(delta_scene::Scene::Console),
+            "前提：面板帧在模板口径下就是黄键台"
+        );
+        assert_eq!(
+            guard.verdict(&corridor),
+            ui_guard::UiVerdict::Reject(ui_guard::NOT_UNLOCK_SCREEN),
+            "前提：走廊帧一张都不像（旧实现正是拿它把面板撤回的）"
+        );
+
+        // 复刻 `wait_scene_ready` 的收尾顺序：非 `NotYet` 当帧返回，后面的帧根本不参与。
+        let frames = [panel, corridor];
+        let mut decided = PollVerdict::NotYet;
+        let mut stopped_at = 0usize;
+        for (index, frame) in frames.iter().enumerate() {
+            stopped_at = index;
+            decided = classify_poll_frame(&guard, frame, &led_view(), index as u64 * 40);
+            if decided != PollVerdict::NotYet {
+                break;
+            }
+        }
+        assert_eq!(
+            decided,
+            PollVerdict::Ready(Some(delta_scene::Scene::Console)),
+            "模板命中就必须一路 Ready 到动手：{decided:?}"
+        );
+        assert_eq!(
+            stopped_at, 0,
+            "面板确认当帧收尾，走廊帧一次都不许读（补抓第二帧就是撤回的来源）"
+        );
+    }
+
     #[test]
     fn fading_panel_at_300ms_is_not_rejected() {
         // B7：面板淡入要 0.4s。300ms 那一刻「一帧都不像」是正常现象，必须继续等。
@@ -1737,7 +1891,7 @@ mod tests {
             ui_guard::UiVerdict::Reject(ui_guard::NOT_UNLOCK_SCREEN),
             "前提：这一帧在模板口径下就是「一张都不像」"
         );
-        let verdict = classify_poll_frame(&guard, &flat_frame(), &led_view(), 300, || None);
+        let verdict = classify_poll_frame(&guard, &flat_frame(), &led_view(), 300);
         assert_eq!(
             verdict,
             PollVerdict::NotYet,
@@ -1747,7 +1901,7 @@ mod tests {
 
     #[test]
     fn an_inventory_screen_is_quick_rejected_after_quick_reject_ms() {
-        // B8：背包/仓库（模板全 < MAX_REJECT_NCC、结构未命中）⇒ 400ms 后立刻拒绝，
+        // B8：背包/仓库（模板全 < MAX_REJECT_NCC、结构未命中）⇒ 过了 QUICK_REJECT_MS 立刻拒绝，
         // 文案必须是「这不是解锁界面」，不是干等 1.2s 后的「未检测到游戏界面」。
         let guard = ui_guard::UiGuard::load(&ui_templates_dir());
         let verdict = classify_poll_frame(
@@ -1755,12 +1909,11 @@ mod tests {
             &flat_frame(),
             &led_view(),
             QUICK_REJECT_MS,
-            || None,
         );
         assert_eq!(
             verdict,
             PollVerdict::Reject(ui_guard::NOT_UNLOCK_SCREEN),
-            "400ms 之后必须报准确的文案：{verdict:?}"
+            "过了时限必须报准确的文案：{verdict:?}"
         );
     }
 
@@ -1773,8 +1926,191 @@ mod tests {
             &flat_frame(),
             &led_view(),
             QUICK_REJECT_MS * 3,
-            || None,
         );
         assert_eq!(verdict, PollVerdict::NotYet, "没有模板就不许拒绝");
+    }
+
+    /// 零真实等待的时钟：`sleep_ms` 只推进虚拟时间（判定逻辑可零阻塞实测）。
+    struct MockClock {
+        now: u64,
+    }
+
+    impl Clock for MockClock {
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+
+        fn sleep_ms(&mut self, ms: u64) {
+            self.now += ms;
+        }
+    }
+
+    #[test]
+    fn ready_budget_must_exceed_quick_reject() {
+        // 两个常量各自合理但相乘会变死代码（3000 的拒绝时限 > 2100 的预算 ⇒ Reject 分支永不触发）。
+        // 经局部变量比较：直接写 `assert!(CONST > CONST)` 会被 clippy 的
+        // `assertions_on_constants` 判为无意义断言，而本项目禁用 `#[allow]`。
+        let budget = READY_BUDGET_MS;
+        let reject_deadline = QUICK_REJECT_MS;
+        assert!(
+            budget > reject_deadline,
+            "预算 {budget}ms 必须大于拒绝时限 {reject_deadline}ms，否则「这不是解锁界面」\
+             这句准确文案永远发不出去，全被错归因成「未检测到游戏界面」"
+        );
+        assert!(
+            budget - reject_deadline >= 400,
+            "还要留出抓帧/编码余量（40ms 一帧 ⇒ 至少 400ms ≈ 10 帧）"
+        );
+    }
+
+    #[test]
+    fn an_unlockable_screen_is_rejected_not_exhausted() {
+        // 全黑帧 + 真实模板库：模板判 Reject、结构判不命中。
+        // 过了拒绝时限必须报**准确**文案，而不是等预算耗尽报「未检测到游戏界面」——
+        // 后者会把「这不是解锁界面」这条证据整条抹掉（留证里就再也看不到它）。
+        let guard = ui_guard::UiGuard::load(&ui_templates_dir());
+        assert!(!guard.is_empty(), "前提：模板库必须加载到素材");
+        let frame = flat_frame();
+        let cancel = AtomicBool::new(false);
+
+        let mut clock = MockClock { now: 0 };
+        let outcome = poll_scene_ready(
+            &mut clock,
+            &cancel,
+            &guard,
+            &led_view(),
+            READY_BUDGET_MS,
+            || Ok(frame.clone()),
+        )
+        .expect("抓帧不失败");
+        assert!(
+            matches!(
+                outcome,
+                ReadyOutcome::Rejected(reason) if reason == ui_guard::NOT_UNLOCK_SCREEN
+            ),
+            "必须是「这不是解锁界面」，实际 {outcome:?}"
+        );
+        assert!(
+            clock.now >= QUICK_REJECT_MS,
+            "拒绝必须发生在拒绝时限之后，实际 {}ms",
+            clock.now
+        );
+
+        // 反向验证：预算压回旧值 2100 ⇒ 同一帧只能报「预算耗尽」，拒绝文案根本走不到。
+        // 这条是 `READY_BUDGET_MS > QUICK_REJECT_MS` 的行为级证据（改回 2100 必红）。
+        let mut clock = MockClock { now: 0 };
+        let outcome = poll_scene_ready(
+            &mut clock,
+            &cancel,
+            &guard,
+            &led_view(),
+            2100,
+            || Ok(frame.clone()),
+        )
+        .expect("抓帧不失败");
+        assert!(
+            matches!(outcome, ReadyOutcome::Exhausted),
+            "预算短于拒绝时限时必须退化成 Exhausted（2100 就是这个错），实际 {outcome:?}"
+        );
+    }
+
+    /// 1080p 黄键台（合成）：金属台面 + 左侧近黑屏幕 + 16 颗**未点亮**的暗键。
+    ///
+    /// 几何按 720p 实测口径 × 1.5 放大，与 locate 层的 1080p 用例同一套相对结构；
+    /// 故意不画任何亮键 —— 面板刚打开就是「1% 进度、零亮键」。
+    fn hd_panel_frame() -> Frame {
+        const W: u32 = 1920;
+        const H: u32 = 1080;
+        let mut data = vec![0u8; (W * H * 4) as usize];
+        for pixel in data.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&[150, 152, 152, 255]);
+        }
+        let scale = |value: i32| (value as f32 * 1.5).round() as i32;
+        let hd = |x: i32, y: i32, w: i32, h: i32| PxRect {
+            x: scale(x),
+            y: scale(y),
+            w: scale(w),
+            h: scale(h),
+        };
+        // 左侧屏幕（近黑）：面板底色在 ⇒ locate 才会给 `Found` 而不是 `Absent`。
+        paint(&mut data, W, hd(80, 100, 200, 180), [30, 32, 34]);
+        // 4×4 暗键阵：全部是「未点亮的键面」颜色，一颗都不亮。
+        for x in [322, 382, 442, 502] {
+            for y in [92, 147, 202, 257] {
+                paint(&mut data, W, hd(x, y, 44, 40), [36, 38, 40]);
+            }
+        }
+        Frame::new(W, H, data, std::time::Instant::now()).expect("合成帧")
+    }
+
+    #[test]
+    fn a_zero_lit_panel_is_ready_for_module_keys() {
+        // D 项：就绪闸只等面板结构。这一帧面板齐全、亮键像素为 0（1% 进度），
+        // 旧判据（面板 + 亮键 ≥ 阈值）必然 NotYet 到预算耗尽 —— 日志里报成「面板已消失」。
+        let frame = hd_panel_frame();
+        let cells = delta_scene::locate::locate_keys(&frame)
+            .expect("合成面板必须定位成功")
+            .cells;
+        assert_eq!(
+            delta_scene::locate::lit_key_pixels(&frame, &cells),
+            0,
+            "前提：这一帧一颗亮键都没有"
+        );
+
+        let located = keys_ready_probe(frame.clone());
+        assert!(located.is_found(), "面板结构在、零亮键 ⇒ 就绪，实际 {located:?}");
+
+        // 合成就绪等待：第一轮就该放行（不许把「没亮」当成「没打开」）。
+        let cancel = AtomicBool::new(false);
+        let mut clock = MockClock { now: 0 };
+        let verdict = wait_ready(&mut clock, &cancel, READY_BUDGET_MS, 1, || {
+            keys_ready_probe(frame.clone())
+        });
+        assert!(verdict.is_found(), "就绪等待必须第一轮放行：{verdict:?}");
+        assert_eq!(clock.now, 0, "就绪不该消耗任何等待时间");
+    }
+
+    #[test]
+    fn a_low_score_frame_never_acts_even_if_structure_says_console() {
+        // 实测模板分：走廊 0.000、地图 0.048、办公室 0.001~0.126、背包 0.147、信号线 0.197，
+        // 全部远低于 `MAX_REJECT_NCC` 0.30；而结构判别的分数用的是另一把尺子。
+        let guard = ui_guard::UiGuard::load(&ui_templates_dir());
+        let frame = console_frame();
+        let view = console_view();
+        assert!(
+            delta_scene::detect(&frame, &view).is_actionable(),
+            "前提：结构判别在这一帧上就是可动手的操作台"
+        );
+        assert!(
+            matches!(guard.verdict(&frame), ui_guard::UiVerdict::Reject(_)),
+            "前提：模板分落在拒绝区（一张都不像）"
+        );
+
+        for elapsed in (0..=QUICK_REJECT_MS + 500).step_by(250) {
+            let verdict = classify_poll_frame(&guard, &frame, &view, elapsed);
+            assert!(
+                !matches!(verdict, PollVerdict::Ready(_)),
+                "模板分极低时任何时刻都不许 Ready（elapsed={elapsed}ms）：{verdict:?}"
+            );
+            if elapsed < QUICK_REJECT_MS {
+                assert_eq!(
+                    verdict,
+                    PollVerdict::NotYet,
+                    "淡入/镜头移动窗内只能继续等（elapsed={elapsed}ms）"
+                );
+            } else {
+                assert_eq!(
+                    verdict,
+                    PollVerdict::Reject(ui_guard::NOT_UNLOCK_SCREEN),
+                    "过了时限必须拒绝（elapsed={elapsed}ms）"
+                );
+            }
+        }
+        // 对照：没有素材可判时才允许退回结构判别（fail-open，不许把工具变成永久失效）。
+        assert_eq!(
+            classify_poll_frame(&ui_guard::UiGuard::default(), &frame, &view, 0),
+            PollVerdict::Ready(None),
+            "模板库为空时必须退化到结构判别"
+        );
     }
 }

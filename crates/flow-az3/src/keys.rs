@@ -89,6 +89,8 @@ pub fn run(
     let began = clock.now_ms();
     // 实机分辨率系数（1080p → 1.5）：像素数阈值按它的平方放大。
     let scale = crate::screen_scale(screen);
+    // 全局事件计数是**进程级累计量**，必须减基线才是「本任务发了多少」。
+    let event_baseline = pointer.event_count();
     let mut state = State::default();
 
     for _ in 0..az3.frame_budget.max(1) {
@@ -107,7 +109,7 @@ pub fn run(
         // `locate_keys` 内部把帧归一到 720p 判定、坐标再乘回原图，所以这里拿到的是
         // **原图坐标**，必须配**原帧**统计像素。像素数阈值是 720p 口径，
         // 1080p 下同一块区域像素多 2.25 倍 —— 按 `scale²` 放大才对得上。
-        if let Some(outcome) = state.step(&frame, scale, pointer, clock) {
+        if let Some(outcome) = state.step(&frame, scale, pointer, clock, event_baseline) {
             return outcome;
         }
         clock.sleep_ms(poll);
@@ -146,12 +148,15 @@ struct State {
 
 impl State {
     /// 推进一帧；返回 `Some` 表示这一帧就该收尾。
+    ///
+    /// `event_baseline` = 本任务开始时的进程级事件计数，用来算「本任务发了多少」。
     fn step(
         &mut self,
         frame: &Frame,
         scale: f32,
         pointer: &mut impl Pointer,
         clock: &mut impl Clock,
+        event_baseline: u64,
     ) -> Option<Az3Outcome> {
         let min_glow = crate::scaled_area(MIN_GLOW_PIXELS, scale);
         let located = match locate_keys(frame) {
@@ -190,6 +195,10 @@ impl State {
             return self.on_no_target(checked, reset_candidate, pointer.event_count());
         }
 
+        // 用**当帧**的可读性选档（不缓存第一次的结论）：退化中途进度突然读到了，
+        // 立刻切回更严的正常档。误判路径通常「什么都读不全」⇒ 落进退化档；
+        // 真面板一定读得到进度格 ⇒ 正常档。分层是为了不误杀「真面板但进度格读不清」。
+        let cap = event_cap(checked);
         for (index, at) in targets {
             if let Err(error) = pointer.click(at) {
                 return Some(aborted(
@@ -200,6 +209,11 @@ impl State {
             self.clicked[index] = true;
             self.clicks += 1;
             self.pending.push(index);
+            // 每发一次点击就判一次上限：真跑飞时（误判成黄键台）必须当场停手，
+            // 不能等这一帧把剩余黄键全点完。
+            if over_input_cap(pointer.event_count(), event_baseline, cap) {
+                return Some(aborted(pointer.event_count(), over_cap_reason(cap)));
+            }
         }
         self.baseline = checked.unwrap_or(0);
         self.click_ms = clock.now_ms();
@@ -456,6 +470,27 @@ fn aborted(events: u64, reason: String) -> Az3Outcome {
     }
 }
 
+/// 本帧适用的输入事件上限：进度格读得到 ⇒ 正常档；读不到 ⇒ 退化档。
+///
+/// 退化档宽松（16 格点完才算一轮，还要允许重扫），正常档收紧（一屏只点几颗键）。
+/// **必须按当帧状态判**：退化中途进度突然读到了就立刻切回正常档，绝不沿用旧结论。
+fn event_cap(checked: Option<usize>) -> u32 {
+    match checked {
+        Some(_) => delta_config::AZ3_MAX_INPUT_EVENTS,
+        None => delta_config::AZ3_MAX_INPUT_EVENTS_DEGRADED,
+    }
+}
+
+/// 本任务已发出的输入事件是否到了本帧档位的硬上限（`baseline` = 任务开始时的进程级计数）。
+fn over_input_cap(events: u64, baseline: u64, cap: u32) -> bool {
+    events.saturating_sub(baseline) >= u64::from(cap)
+}
+
+/// 撞上限时的收尾文案：必须说清「这是疑似误判」，不是「这局解不完」。
+fn over_cap_reason(cap: u32) -> String {
+    format!("疑似误判：已达输入事件上限（{cap}），已停止注入")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +643,294 @@ mod tests {
         assert!(
             !has_unspent_yellow(&[0], &located, &[true; CELLS]),
             "已判死的键不算「还有黄键亮着」"
+        );
+    }
+
+    // ── 输入事件硬上限（分层安全网：正常档 / 退化档）──
+
+    #[test]
+    fn the_event_cap_follows_the_current_frame_readability() {
+        // 进度格读得到 ⇒ 正常档（一屏只点几颗键）；读不到 ⇒ 退化档（16 格点完才算一轮）。
+        assert_eq!(
+            event_cap(Some(0)),
+            delta_config::AZ3_MAX_INPUT_EVENTS,
+            "读得到进度就必须用紧的那一档"
+        );
+        assert_eq!(
+            event_cap(None),
+            delta_config::AZ3_MAX_INPUT_EVENTS_DEGRADED,
+            "读不到进度只能用松的那一档，否则会误杀退化场景"
+        );
+        // 经局部变量比较：直接写 `assert!(CONST < CONST)` 会被 clippy 的
+        // `assertions_on_constants` 判为无意义断言，而本项目禁用 `#[allow]`。
+        let normal = delta_config::AZ3_MAX_INPUT_EVENTS;
+        let degraded = delta_config::AZ3_MAX_INPUT_EVENTS_DEGRADED;
+        assert!(
+            normal < degraded,
+            "分层方向必须是「退化更松」（{normal} < {degraded}），写反等于两种场景全误杀"
+        );
+    }
+
+    #[test]
+    fn a_cap_is_only_reached_at_or_above_its_own_limit() {
+        // 两档各自在自己的界线上触发：少一个事件不许收手，正好到达必须收手。
+        for cap in [
+            delta_config::AZ3_MAX_INPUT_EVENTS,
+            delta_config::AZ3_MAX_INPUT_EVENTS_DEGRADED,
+        ] {
+            let baseline = 1_000u64;
+            let limit = u64::from(cap);
+            assert!(
+                !over_input_cap(baseline + limit - 1, baseline, cap),
+                "差一个事件时不许收手（cap={cap}）"
+            );
+            assert!(
+                over_input_cap(baseline + limit, baseline, cap),
+                "正好到上限必须收手（cap={cap}）"
+            );
+        }
+        // 基线必须被减掉：进程级累计计数（含前面几十次任务）不许把新任务顶到上限。
+        assert!(
+            !over_input_cap(
+                100_000,
+                100_000 - 1,
+                delta_config::AZ3_MAX_INPUT_EVENTS
+            ),
+            "只看本任务发出的事件数，绝不看进程累计"
+        );
+    }
+
+    #[test]
+    fn the_cap_reason_names_the_misjudgement_and_the_limit() {
+        let reason = over_cap_reason(delta_config::AZ3_MAX_INPUT_EVENTS_DEGRADED);
+        assert!(
+            reason.contains("疑似误判") && reason.contains("300"),
+            "文案必须让用户看出「这是疑似误判」并说清上限：{reason}"
+        );
+    }
+
+    // ── 合成黄键台 + 三种桩：让两档上限都能在真实 `run` 循环里各触发一次 ──
+    //
+    // 100% 脱敏的假几何，只复刻「相对结构」（暗键阵 / 左侧屏幕 / 一行进度框）。
+
+    const PANEL_W: u32 = 480;
+    const PANEL_H: u32 = 320;
+    const MACHINE: [u8; 3] = [152, 152, 150];
+    const SCREEN_DARK: [u8; 3] = [30, 32, 34];
+    const DARK_KEY: [u8; 3] = [36, 38, 40];
+    const BOX_BORDER: [u8; 3] = [200, 200, 200];
+    const SCREEN: PxRect = PxRect {
+        x: 40,
+        y: 60,
+        w: 160,
+        h: 140,
+    };
+    const KEY_SIZE: (i32, i32) = (34, 30);
+    const COL_X: [i32; 4] = [240, 284, 328, 372];
+    const ROW_Y: [i32; 4] = [50, 96, 142, 188];
+    const BOX_SIZE: (i32, i32) = (24, 18);
+    const BOX_X: [i32; 5] = [48, 76, 104, 132, 160];
+    const BOX_Y: i32 = 132;
+
+    fn key_rect(index: usize) -> PxRect {
+        PxRect {
+            x: COL_X[index % 4],
+            y: ROW_Y[index / 4],
+            w: KEY_SIZE.0,
+            h: KEY_SIZE.1,
+        }
+    }
+
+    fn box_rect(stage: usize) -> PxRect {
+        PxRect {
+            x: BOX_X[stage],
+            y: BOX_Y,
+            w: BOX_SIZE.0,
+            h: BOX_SIZE.1,
+        }
+    }
+
+    fn fill(data: &mut [u8], rect: PxRect, rgb: [u8; 3]) {
+        for y in rect.y.max(0)..rect.bottom().min(PANEL_H as i32) {
+            for x in rect.x.max(0)..rect.right().min(PANEL_W as i32) {
+                let i = ((y as u32 * PANEL_W + x as u32) * 4) as usize;
+                data[i..i + 4].copy_from_slice(&[rgb[2], rgb[1], rgb[0], 255]);
+            }
+        }
+    }
+
+    /// 合成黄键台帧；`boxes = false` ⇒ 进度框不存在 ⇒ 走**退化档**。
+    fn panel_frame(lit: &[usize], boxes: bool) -> Frame {
+        let mut data = vec![0u8; (PANEL_W * PANEL_H * 4) as usize];
+        fill(
+            &mut data,
+            PxRect {
+                x: 0,
+                y: 0,
+                w: PANEL_W as i32,
+                h: PANEL_H as i32,
+            },
+            MACHINE,
+        );
+        fill(&mut data, SCREEN, SCREEN_DARK);
+        if boxes {
+            for stage in 0..BOX_X.len() {
+                let frame = box_rect(stage);
+                // 细边框（空框 = 未勾选）：够 `readable_progress` 认出 5 个进度格。
+                for edge in [
+                    PxRect { h: 2, ..frame },
+                    PxRect {
+                        y: frame.bottom() - 2,
+                        h: 2,
+                        ..frame
+                    },
+                    PxRect { w: 2, ..frame },
+                    PxRect {
+                        x: frame.right() - 2,
+                        w: 2,
+                        ..frame
+                    },
+                ] {
+                    fill(&mut data, edge, BOX_BORDER);
+                }
+            }
+        }
+        for index in 0..CELLS {
+            let key = key_rect(index);
+            fill(&mut data, key, DARK_KEY);
+            if lit.contains(&index) {
+                fill(
+                    &mut data,
+                    PxRect {
+                        x: key.x + key.w / 4,
+                        y: key.y + key.h / 4,
+                        w: key.w / 2,
+                        h: key.h / 2,
+                    },
+                    LIT_YELLOW,
+                );
+            }
+        }
+        Frame::new(PANEL_W, PANEL_H, data, Instant::now()).expect("合法测试帧")
+    }
+
+    /// 固定帧屏幕桩。
+    struct FixedScreen {
+        frame: Frame,
+    }
+
+    impl Screen for FixedScreen {
+        fn grab(&mut self, _rect: PxRect) -> Result<Frame, String> {
+            Ok(self.frame.clone())
+        }
+
+        fn frame_rect(&self) -> PxRect {
+            PxRect {
+                x: 0,
+                y: 0,
+                w: PANEL_W as i32,
+                h: PANEL_H as i32,
+            }
+        }
+    }
+
+    /// 「每次点击计多少个事件」可调的假指针。
+    ///
+    /// 生产一次点击 = 按下 + 抬起 = 2 个事件；这里允许调高，就能在几次点击内跨到上限，
+    /// 从而在**真实 `run` 循环**里验证两档上限各自生效，而不必真点 60 次。
+    struct CountingPointer {
+        per_click: u64,
+        emitted: u64,
+    }
+
+    impl Pointer for CountingPointer {
+        fn click(&mut self, _at: PxPoint) -> Result<(), String> {
+            self.emitted += self.per_click;
+            Ok(())
+        }
+
+        fn key_space(&mut self) -> Result<(), String> {
+            self.emitted += self.per_click;
+            Ok(())
+        }
+
+        fn begin(&mut self, _at: PxPoint) -> Result<(), String> {
+            self.emitted += 1;
+            Ok(())
+        }
+
+        fn step(&mut self, _dx: i32, _dy: i32) -> Result<(), String> {
+            self.emitted += 1;
+            Ok(())
+        }
+
+        fn end(&mut self) -> Result<(), String> {
+            self.emitted += 1;
+            Ok(())
+        }
+
+        fn event_count(&self) -> u64 {
+            self.emitted
+        }
+    }
+
+    struct StepClock {
+        now: u64,
+    }
+
+    impl Clock for StepClock {
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+
+        fn sleep_ms(&mut self, ms: u64) {
+            self.now += ms;
+        }
+    }
+
+    fn play_keys(frame: &Frame, per_click: u64, az3: &delta_config::PxAz3) -> Az3Outcome {
+        let mut screen = FixedScreen {
+            frame: frame.clone(),
+        };
+        let mut pointer = CountingPointer {
+            per_click,
+            emitted: 0,
+        };
+        let mut clock = StepClock { now: 0 };
+        let cancel = AtomicBool::new(false);
+        run(&mut screen, &mut pointer, &mut clock, az3, &cancel)
+    }
+
+    #[test]
+    fn each_cap_tier_stops_at_its_own_limit_in_a_real_run() {
+        let az3 = crate::tests_support::az3();
+        let normal = delta_config::AZ3_MAX_INPUT_EVENTS;
+        let degraded = delta_config::AZ3_MAX_INPUT_EVENTS_DEGRADED;
+
+        // ① 正常档：进度格读得到，一次点击就跨到 normal ⇒ 当场收手并报「疑似误判」。
+        let outcome = play_keys(&panel_frame(&[0, 1, 2, 3, 4], true), u64::from(normal), &az3);
+        assert!(
+            matches!(&outcome, Az3Outcome::Aborted { reason, .. }
+                if reason.contains("疑似误判") && reason.contains(&normal.to_string())),
+            "正常档必须在 {normal} 处收手：{outcome:?}"
+        );
+
+        // ② 同一个点击成本，但**进度格读不到** ⇒ 退化档更松，不许在 normal 处收手
+        //    （证明分档真的按当帧可读性选，而不是写死一个数）。
+        let mut quick = az3.clone();
+        quick.max_duration_ms = 600;
+        let outcome = play_keys(&panel_frame(&[0], false), u64::from(normal), &quick);
+        assert!(
+            !format!("{outcome:?}").contains("疑似误判"),
+            "刚过 {normal} 个事件时退化档必须放行：{outcome:?}"
+        );
+
+        // ③ 退化档在自己的界线上收手。
+        let outcome = play_keys(&panel_frame(&[0, 1, 2, 3, 4], false), u64::from(degraded), &az3);
+        assert!(
+            matches!(&outcome, Az3Outcome::Aborted { reason, .. }
+                if reason.contains("疑似误判") && reason.contains(&degraded.to_string())),
+            "退化档必须在 {degraded} 处收手：{outcome:?}"
         );
     }
 }
