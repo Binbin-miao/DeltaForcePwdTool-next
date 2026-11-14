@@ -34,6 +34,97 @@ pub const LINE_ROWS: usize = 4;
 /// 低于这个边长的帧直接判「画面太小」，不做任何探测。
 const MIN_FRAME_SIDE: u32 = 160;
 
+/// 归一化基准高度：**所有像素阈值都按这个高度实测**。
+///
+/// 本文件里的 `KEY_SIDE = 18..70`、`KNOB_MIN_AREA = 300` 这类数字都是**绝对像素**，
+/// 只有 720p 口径才成立。1080p 下同一颗键实测 86×83px，直接超出 `18..70` 上限 →
+/// 定位全废、场景判 `Unknown`（实机日志 38/38 条 `场景: Unknown`，截图里明明就是黄键台）。
+///
+/// 与其给每个阈值乘一遍 `h/720`（几十处、极易漏），不如把帧统一缩到 720p 世界做判定，
+/// 结果坐标乘回 `scale`。阈值只维护一套，且下采样本身还让定位更快。
+pub const REFERENCE_HEIGHT: u32 = 720;
+
+/// 等比缩放到 [`REFERENCE_HEIGHT`]，返回 `(缩放后帧, 原图/缩放 比例)`。
+///
+/// 幂等：帧高已 ≤ 720 时原样返回、`scale = 1.0`。比例恒 ≥ 1，调用方用
+/// `x * scale` 把缩放世界坐标换回原图坐标。
+pub fn normalize_frame(frame: &Frame) -> (Frame, f32) {
+    let target_h = REFERENCE_HEIGHT;
+    if frame.h <= target_h || frame.h == 0 {
+        return (frame.clone(), 1.0);
+    }
+    let scale = frame.h as f32 / target_h as f32;
+    let target_w = ((frame.w as f32) / scale).round().max(1.0) as u32;
+    let Some(data) = downscale_bgra(frame, target_w, target_h) else {
+        // 缓冲不自洽（不该发生）：宁可不动，也不要喂一张半成品给定位。
+        return (frame.clone(), 1.0);
+    };
+    match Frame::new(target_w, target_h, data, frame.captured_at) {
+        Ok(small) => (small, scale),
+        Err(_) => (frame.clone(), 1.0),
+    }
+}
+
+/// 按 `1/scale` 缩小一帧，其中 `scale = 全屏高 / 720`。
+///
+/// 给「只抓小区域」的流程用（大保险抓高亮带、任务保险抓滑槽）：区域帧的高度只有几十
+/// 像素，直接 [`normalize_frame`] 会把它当成整屏**放大**到 720，判据全乱。这里按全屏
+/// 比例缩，区域在 720p 世界里就是它在实机上该有的大小。
+pub fn denormalize_region(frame: &Frame, scale: f32) -> Frame {
+    if scale <= 1.0 {
+        return frame.clone();
+    }
+    let target_w = ((frame.w as f32) / scale).round().max(1.0) as u32;
+    let target_h = ((frame.h as f32) / scale).round().max(1.0) as u32;
+    let Some(data) = downscale_bgra(frame, target_w, target_h) else {
+        return frame.clone();
+    };
+    Frame::new(target_w, target_h, data, frame.captured_at).unwrap_or_else(|_| frame.clone())
+}
+
+/// BGRA 区域平均下采样（box filter）。
+///
+/// 不用最近邻：1.5 倍下采样时最近邻会整列丢弃，键块边缘与 4px 细白线会断裂，
+/// 连通域数目虚高；box filter 对纯色块无损、对细线只做灰化，两者都更接近肉眼尺寸。
+fn downscale_bgra(frame: &Frame, target_w: u32, target_h: u32) -> Option<Vec<u8>> {
+    let (tw, th) = (target_w as usize, target_h as usize);
+    let (sw, sh) = (frame.w as usize, frame.h as usize);
+    let stride = frame.stride as usize;
+    if tw == 0 || th == 0 || sw == 0 || sh == 0 {
+        return None;
+    }
+    if frame.data.len() < stride * sh {
+        return None;
+    }
+    let data = &frame.data;
+    let mut out = Vec::with_capacity(tw * th * 4);
+    for dy in 0..th {
+        let y0 = dy * sh / th;
+        let y1 = ((dy + 1) * sh / th).min(sh).max(y0 + 1);
+        for dx in 0..tw {
+            let x0 = dx * sw / tw;
+            let x1 = ((dx + 1) * sw / tw).min(sw).max(x0 + 1);
+            let mut sum = [0u32; 4];
+            let mut count = 0u32;
+            for y in y0..y1 {
+                let base = y * stride;
+                for x in x0..x1 {
+                    let index = base + x * 4;
+                    for channel in 0..4 {
+                        sum[channel] += u32::from(data[index + channel]);
+                    }
+                    count += 1;
+                }
+            }
+            let count = count.max(1);
+            for channel in sum {
+                out.push((channel / count) as u8);
+            }
+        }
+    }
+    Some(out)
+}
+
 /// 旋钮粗扫的目标采样列数（分辨率无关：1920 宽 → 步长 4）。
 const KNOB_SAMPLES: u32 = 480;
 /// 粗扫最多精修多少个候选块（HUD 罗盘等大面积暗红会排在最前）。
@@ -103,6 +194,8 @@ const KEY_ASPECT: (f32, f32) = (0.6, 1.7);
 const KEY_MIN_FILL: f32 = 0.40;
 /// 单颗键的最小面积。
 const KEY_MIN_AREA: u32 = 200;
+/// 4×4 键阵外接框的宽高比区间（键是方的、间距均匀 ⇒ 整阵近似正方形）。
+const KEY_GRID_ASPECT: (f32, f32) = (0.72, 1.40);
 /// 行/列聚类容差 = 该方向中位键边长 × 此系数。
 const KEY_CLUSTER_TOL: f32 = 0.4;
 /// 键块尺寸一致性区间（相对中位边长）：4×4 键阵的键大小一致。
@@ -125,7 +218,11 @@ const KEY_SCREEN_GAP: f32 = 0.5;
 /// 进度框（屏幕内浅色细边框）的亮度区间。
 const KEY_BOX_LUMA: (u8, u8) = (150, 230);
 /// 进度框的宽高比区间。
-const KEY_BOX_ASPECT: (f32, f32) = (1.2, 3.0);
+///
+/// 实机实测（1080p 截屏）5 个输入格是**近方形**：70×77px ⇒ 0.91。
+/// 旧下限 1.2 把它们全滤掉，于是 `progress` 恒为空、闭环退化成「16 格点完才算完」——
+/// 那会多点一倍以上的键。下限放到 0.75 才容得下方格。
+const KEY_BOX_ASPECT: (f32, f32) = (0.75, 3.0);
 /// 进度框在屏幕内的宽/高占比区间。
 const KEY_BOX_W: (f32, f32) = (0.06, 0.45);
 const KEY_BOX_H: (f32, f32) = (0.05, 0.60);
@@ -197,17 +294,24 @@ pub fn locate_line(frame: &Frame) -> Result<LocatedLine, LocateError> {
             h: frame.h,
         });
     }
+    // 统一在 720p 世界判定（阈值全是绝对像素），结果再乘回原图比例。
+    let (small, scale) = normalize_frame(frame);
+    let frame = &small;
     let knob = find_knob(frame).ok_or(LocateError::Knob)?;
     let screen = find_screen(frame, knob).ok_or(LocateError::Screen)?;
     let led = find_led(frame, knob, screen).ok_or(LocateError::Led)?;
     let grid = find_grid(frame, screen).ok_or(LocateError::Columns)?;
     Ok(LocatedLine {
-        screen,
-        led,
-        knob,
-        columns: grid.columns,
-        rows: grid.rows,
-        targets: grid.targets,
+        screen: scale_rect(screen, scale),
+        led: scale_rect(led, scale),
+        knob: scale_point(knob, scale),
+        columns: grid.columns.iter().map(|x| scale_axis(*x, scale)).collect(),
+        rows: grid.rows.iter().map(|y| scale_axis(*y, scale)).collect(),
+        targets: grid
+            .targets
+            .iter()
+            .map(|rect| scale_rect(*rect, scale))
+            .collect(),
         selected: grid.selected,
     })
 }
@@ -822,17 +926,63 @@ pub fn locate_keys(frame: &Frame) -> Result<LocatedKeys, LocateError> {
             h: frame.h,
         });
     }
+    // 统一在 720p 世界判定（`KEY_SIDE = 18..70` 是 720p 口径，1080p 的键 86px 会被滤光）。
+    let (small, scale) = normalize_frame(frame);
+    let frame = &small;
     // 只做一次灰度转换：三步判定全部复用同一份灰度图。
     let gray = frame.luma();
     let keys = find_key_grid(&gray).ok_or(LocateError::Keys)?;
+    // 4×4 键阵近似正方形。环境里的墙面暗格阵多是长条形，这条把装饰物挡在门外，
+    // 免得「误判成黄键台 → 拿暗格坐标去点背景」。
+    let aspect = keys.grid.w as f32 / keys.grid.h.max(1) as f32;
+    if !(KEY_GRID_ASPECT.0..=KEY_GRID_ASPECT.1).contains(&aspect) {
+        return Err(LocateError::Keys);
+    }
     let screen = find_key_screen(&gray, keys.grid).ok_or(LocateError::Screen)?;
     let progress = find_progress_boxes(&gray, screen);
     Ok(LocatedKeys {
-        grid: keys.grid,
-        cells: keys.cells,
-        screen,
-        progress,
+        grid: scale_rect(keys.grid, scale),
+        cells: keys
+            .cells
+            .iter()
+            .map(|rect| scale_rect(*rect, scale))
+            .collect(),
+        screen: scale_rect(screen, scale),
+        progress: progress
+            .iter()
+            .map(|rect| scale_rect(*rect, scale))
+            .collect(),
     })
+}
+
+/// 缩放世界坐标 → 原图坐标（`scale == 1` 时原样返回，零开销）。
+fn scale_axis(value: i32, scale: f32) -> i32 {
+    if scale <= 1.0 {
+        return value;
+    }
+    (value as f32 * scale).round() as i32
+}
+
+fn scale_rect(rect: PxRect, scale: f32) -> PxRect {
+    if scale <= 1.0 {
+        return rect;
+    }
+    PxRect {
+        x: scale_axis(rect.x, scale),
+        y: scale_axis(rect.y, scale),
+        w: scale_axis(rect.w, scale).max(1),
+        h: scale_axis(rect.h, scale).max(1),
+    }
+}
+
+fn scale_point(point: PxPoint, scale: f32) -> PxPoint {
+    if scale <= 1.0 {
+        return point;
+    }
+    PxPoint {
+        x: scale_axis(point.x, scale),
+        y: scale_axis(point.y, scale),
+    }
 }
 
 // ── 1. 暗键候选 ──

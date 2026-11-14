@@ -41,6 +41,8 @@ const LOCATE_FAIL_LIMIT: u32 = 6;
 const MIN_PROGRESS_BOXES: usize = 3;
 /// 定位失败时给用户的下一步动作。
 const POSE_HINT: &str = "（请正对按键面板，让屏幕和 4×4 按键都进入画面）";
+/// 进度框读不到时的收尾说明（这台机器常态：屏幕整体亮度太低）。
+const PROGRESS_NOTE: &str = "；进度格未识别，本条结论依据「亮光熄灭」判据";
 
 pub fn run(
     screen: &mut impl Screen,
@@ -59,6 +61,8 @@ pub fn run(
 
     let poll = az3.poll_interval_ms.max(1);
     let began = clock.now_ms();
+    // 实机分辨率系数（1080p → 1.5）：像素数阈值按它的平方放大。
+    let scale = crate::screen_scale(screen);
     let mut state = State::default();
 
     for _ in 0..az3.frame_budget.max(1) {
@@ -74,7 +78,10 @@ pub fn run(
                 return aborted(pointer.event_count(), format!("黄键台抓帧失败：{error}"))
             }
         };
-        if let Some(outcome) = state.step(&frame, pointer, clock) {
+        // `locate_keys` 内部把帧归一到 720p 判定、坐标再乘回原图，所以这里拿到的是
+        // **原图坐标**，必须配**原帧**统计像素。像素数阈值（40 / 10）是 720p 口径，
+        // 1080p 下同一块区域像素多 2.25 倍 —— 按 `scale²` 放大才对得上。
+        if let Some(outcome) = state.step(&frame, scale, pointer, clock) {
             return outcome;
         }
         clock.sleep_ms(poll);
@@ -109,9 +116,11 @@ impl State {
     fn step(
         &mut self,
         frame: &Frame,
+        scale: f32,
         pointer: &mut impl Pointer,
         clock: &mut impl Clock,
     ) -> Option<Az3Outcome> {
+        let min_glow = crate::scaled_area(MIN_GLOW_PIXELS, scale);
         let located = match locate_keys(frame) {
             Ok(located) => {
                 self.locate_misses = 0;
@@ -120,7 +129,7 @@ impl State {
             Err(error) => return self.on_locate_miss(pointer.event_count(), error),
         };
 
-        let checked = self.checked_in(frame, &located);
+        let checked = self.checked_in(frame, &located, crate::scaled_area(MIN_CHECK_PIXELS, scale));
         self.checked = checked;
         if checked.is_some_and(|checked| checked >= TOTAL_STAGES) {
             let summary = format!("黄键台 {TOTAL_STAGES}/{TOTAL_STAGES} 完成");
@@ -128,11 +137,19 @@ impl State {
         }
 
         // 上一次点击还没有结论 → 本帧先别再点。
-        if self.waiting(checked, clock.now_ms()) {
+        // 第二判据「亮光熄灭」：这台机器的进度框读不出来（屏幕整体 luma 中位数只有 48，
+        // 5 个格子的亮度差仅 5~10，任何绝对阈值都分不开）。而**点对了游戏就会收掉
+        // 那个模块的高亮**——这条通道永远可用，且比进度更直接。
+        let still_lit = self
+            .pending
+            .is_some_and(|index| glow_of(frame, &located.cells, index) >= min_glow / 2);
+        if self.waiting(checked, still_lit, clock.now_ms()) {
             return None;
         }
 
-        let Some((index, at)) = pick_lit_cell(frame, &located.cells, &self.clicked, &self.dead) else {
+        let Some((index, at)) =
+            pick_lit_cell(frame, &located.cells, &self.clicked, &self.dead, min_glow)
+        else {
             return self.on_no_target(checked, pointer.event_count());
         };
 
@@ -151,38 +168,38 @@ impl State {
     }
 
     /// 进度已勾选数；进度框不足 [`MIN_PROGRESS_BOXES`] 个 → `None`（退化，不判进度）。
-    fn checked_in(&self, frame: &Frame, located: &LocatedKeys) -> Option<usize> {
+    fn checked_in(&self, frame: &Frame, located: &LocatedKeys, min_check: u32) -> Option<usize> {
         if located.progress.len() < MIN_PROGRESS_BOXES {
             return None;
         }
-        Some(count_checked(frame, &located.progress))
+        Some(count_checked(frame, &located.progress, min_check))
     }
 
     /// 处理上一次点击的回应；返回 `true` = 本帧还没有结论，先别再点。
-    fn waiting(&mut self, checked: Option<usize>, now: u64) -> bool {
+    fn waiting(&mut self, checked: Option<usize>, still_lit: bool, now: u64) -> bool {
         let Some(index) = self.pending else {
             return false;
         };
         let elapsed = now.saturating_sub(self.click_ms) >= CLICK_ACK_TIMEOUT_MS;
-        match checked {
-            Some(checked) if checked > self.baseline => {
-                self.pending = None;
-                false
-            }
-            Some(_) if elapsed => {
-                self.dead[index] = true;
-                self.pending = None;
-                false
-            }
-            Some(_) => true,
-            // 退化判据：读不到进度就没有「键是否生效」的观测通道 —— 只等游戏吃下这次点击，
-            // 绝不据此判死（否则 16 颗键会在读不到进度时被逐个误杀）。
-            None if elapsed => {
-                self.pending = None;
-                false
-            }
-            None => true,
+        // 判据一（最可靠，能读到进度框时）：进度推进就算这一键吃下了。
+        if checked.is_some_and(|checked| checked > self.baseline) {
+            self.pending = None;
+            return false;
         }
+        // 判据二（永远可用）：**亮光熄灭**。点对了游戏会收掉该模块高亮；
+        // 亮光还在说明这一键没生效（或点错了模块）。
+        if !still_lit {
+            self.pending = None;
+            return false;
+        }
+        if !elapsed {
+            return true;
+        }
+        // 超时仍亮着 → 这一格点错了，判死换下一个。
+        // 只在「真能观测到高亮」时才判死：整屏都没高亮时 `still_lit` 恒假，走不到这里。
+        self.dead[index] = true;
+        self.pending = None;
+        false
     }
 
     /// 没有可点的亮键：要么等下一帧，要么（16 格都点过 / 判死）收尾。
@@ -204,11 +221,22 @@ impl State {
         }
     }
 
-    /// 定位失败：允许抖动几帧，超了才放弃（全程零输入）。
+    /// 定位失败：允许抖动几帧，超了才收尾（全程零输入）。
+    ///
+    /// **面板消失有两种含义**，必须分开：
+    /// - 已经点过键 → 大概率是解完了、面板被游戏收走 ⇒ `Done`（否则每次成功都报失败）；
+    /// - 一次都没点过 → 是「没对准 / 走开了」⇒ `Aborted`，并告诉用户怎么站。
     fn on_locate_miss(&mut self, events: u64, error: LocateError) -> Option<Az3Outcome> {
         self.locate_misses += 1;
         if self.locate_misses < LOCATE_FAIL_LIMIT {
             return None;
+        }
+        if self.clicks > 0 {
+            let summary = format!(
+                "黄键台面板已消失（已点击 {} 次），判定已完成{PROGRESS_NOTE}",
+                self.clicks
+            );
+            return Some(done(events, &summary, self.clicks));
         }
         Some(aborted(events, format!("{error}{POSE_HINT}")))
     }
@@ -228,6 +256,7 @@ fn pick_lit_cell(
     cells: &[PxRect],
     clicked: &[bool; CELLS],
     dead: &[bool; CELLS],
+    min_glow: u32,
 ) -> Option<(usize, PxPoint)> {
     cells
         .iter()
@@ -237,9 +266,17 @@ fn pick_lit_cell(
             let glow = geom::count_in(frame, geom::clip(frame, *cell), geom::is_yellow_or_green_glow);
             (index, *cell, glow)
         })
-        .filter(|(_, _, glow)| *glow >= MIN_GLOW_PIXELS)
+        .filter(|(_, _, glow)| *glow >= min_glow)
         .max_by_key(|(_, _, glow)| *glow)
         .map(|(index, cell, _)| (index, center_of(cell)))
+}
+
+/// 某一格的黄/绿高亮像素数（越界返回 0）。
+fn glow_of(frame: &Frame, cells: &[PxRect], index: usize) -> u32 {
+    let Some(cell) = cells.get(index) else {
+        return 0;
+    };
+    geom::count_in(frame, geom::clip(frame, *cell), geom::is_yellow_or_green_glow)
 }
 
 /// 这一格是否已经点过或判死（越界一律当「已用掉」，宁可不点）。
@@ -256,12 +293,12 @@ fn center_of(rect: PxRect) -> PxPoint {
 }
 
 /// 进度框里已勾选的个数（绿色/黄色像素 ≥ [`MIN_CHECK_PIXELS`]）。
-fn count_checked(frame: &Frame, boxes: &[PxRect]) -> usize {
+fn count_checked(frame: &Frame, boxes: &[PxRect], min_check: u32) -> usize {
     boxes
         .iter()
         .filter(|&&rect| {
             geom::count_in(frame, geom::clip(frame, rect), geom::is_yellow_or_green_glow)
-                >= MIN_CHECK_PIXELS
+                >= min_check
         })
         .count()
 }

@@ -71,13 +71,24 @@ fn cursor_and_target(
     track: &Frame,
     band_x: i32,
     pin_cx: i32,
+    scale: f32,
 ) -> Option<(i32, i32)> {
+    // 阈值是 720p 实测口径：实机 1080p 下游标 27px 高、目标方块 8..24px 宽，
+    // 按原值判会把目标方块全滤掉（上限 16 → 只剩噪声）。按屏幕倍数放大后再比。
+    let half_w = crate::scaled_len(SEARCH_HALF_W, scale);
+    let min_blob = crate::scaled_area(MIN_BLOB_PIXELS, scale);
+    let cursor_min_h = crate::scaled_len(CURSOR_MIN_H as i32, scale).max(1) as u32;
+    let cursor_max_w = crate::scaled_len(CURSOR_MAX_W as i32, scale).max(1) as u32;
+    let target_side = (
+        crate::scaled_len(TARGET_SIDE.0 as i32, scale).max(1) as u32,
+        crate::scaled_len(TARGET_SIDE.1 as i32, scale).max(1) as u32,
+    );
     let window = geom::clip(
         track,
         delta_geom::PxRect {
-            x: pin_cx - band_x - SEARCH_HALF_W,
+            x: pin_cx - band_x - half_w,
             y: 0,
-            w: SEARCH_HALF_W * 2,
+            w: half_w * 2,
             h: track.h as i32,
         },
     );
@@ -85,16 +96,16 @@ fn cursor_and_target(
         return None;
     }
 
-    let whites = geom::blobs(track, window, geom::is_white, MIN_BLOB_PIXELS);
+    let whites = geom::blobs(track, window, geom::is_white, min_blob);
     let cursors: Vec<_> = whites
         .iter()
-        .filter(|blob| blob.clip.h() >= CURSOR_MIN_H && blob.clip.w() <= CURSOR_MAX_W)
+        .filter(|blob| blob.clip.h() >= cursor_min_h && blob.clip.w() <= cursor_max_w)
         .collect();
     let targets: Vec<_> = whites
         .iter()
         .filter(|blob| {
-            (TARGET_SIDE.0..=TARGET_SIDE.1).contains(&blob.clip.w())
-                && (TARGET_SIDE.0..=TARGET_SIDE.1).contains(&blob.clip.h())
+            (target_side.0..=target_side.1).contains(&blob.clip.w())
+                && (target_side.0..=target_side.1).contains(&blob.clip.h())
         })
         .collect();
 
@@ -134,7 +145,9 @@ pub fn run(
 
     let start_ms = clock.now_ms();
     let total_pins = az3.pin_center_x.len();
-    let tol = az3.pin_tolerance_px.max(2);
+    // 实机分辨率系数：下面所有像素阈值乘以它。
+    let scale = crate::screen_scale(screen);
+    let tol = crate::scaled_len(az3.pin_tolerance_px.max(2), scale);
     let mut hits = 0usize;
     let mut locked_count = 0usize;
     let mut target_misses = 0u32;
@@ -185,7 +198,8 @@ pub fn run(
             }
         };
 
-        let pair = cursor_and_target(&track, az3.track_band.x, az3.pin_center_x[active_idx]);
+        let pair =
+            cursor_and_target(&track, az3.track_band.x, az3.pin_center_x[active_idx], scale);
         let Some((cursor_x, target_x)) = pair else {
             target_misses += 1;
             if target_misses >= TARGET_MISS_LIMIT {

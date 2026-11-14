@@ -300,12 +300,6 @@ impl Az3Kind {
 
 // ── AZ3 二级变体判别（有序：先强特征，后弱特征）──
 
-/// 黄键台：整帧黄/绿高亮占比下限。
-///
-/// 这只是**便宜的快速过滤**（整帧一遍谓词），用来跳过明显无关的画面；
-/// 真正的结构判据是 [`locate::locate_keys`]。阈值按整帧口径取 0.001：
-/// 720p 下一颗 40×40 的亮键 ≈ 1600px / 921600 ≈ 0.0017，仍能过关。
-const AZ3_KEYS_FRAME_GLOW_RATIO: f32 = 0.001;
 /// 任务保险：轨道带内竖直白块数量下限（5 槽，容忍 1 根被游标遮住）。
 const AZ3_PINS_MIN_SLOTS: usize = 4;
 /// 任务保险：每个滑槽在配置中心两侧的搜索半宽（与执行层同口径）。
@@ -328,6 +322,11 @@ pub fn az3_variant(frame: &Frame, view: &PxView) -> Az3Kind {
     if frame.w < 32 || frame.h < 32 {
         return Az3Kind::None;
     }
+    // 下面每个判据的像素阈值（白块 18px、游标宽 10px…）都是 **720p 实测口径**，
+    // 1080p 下同一特征大 1.5 倍会全部超限。先归一到 720p 世界再判，
+    // 阈值只维护一套；`locate_*` 内部同样幂等归一化，这里不会重复付出代价。
+    let (small, _) = locate::normalize_frame(frame);
+    let frame = &small;
     let az3 = &view.az3;
     if looks_like_keys(frame) {
         return Az3Kind::ModuleKeys;
@@ -344,25 +343,25 @@ pub fn az3_variant(frame: &Frame, view: &PxView) -> Az3Kind {
     Az3Kind::None
 }
 
-/// 黄键台：**每帧自适应定位**能同时找到 4×4 暗键阵 + 左侧屏幕。
+/// 黄键台：**每帧自适应定位**能同时找到 4×4 暗键阵与左侧屏幕。
 ///
 /// 旧实现拿配置里的 `az3.button_grid_region` 去裁右侧网格 —— 换一版界面布局，
 /// 那个固定矩形就整体偏出去（只盖住键阵右半），于是「黄键台」时而被判成别的场景、
 /// 时而判对了却按错的坐标去点。现在判别与执行共用同一份定位证据（[`locate::locate_keys`]），
 /// 不再有两套坐标。
 ///
-/// 先跑便宜的全帧黄/绿占比过滤，再跑昂贵的连通域定位（先便宜后昂贵）。
+/// **不再用「全帧黄/绿占比」做前置过滤**：实机日志证明它是反指标 ——
+/// 真黄键台刚打开时屏幕写着「自动破译进行中 0%」、一颗键都没亮（实测占比 0.000000），
+/// 被这条过滤挡在门外；反倒是环境里的黄色按钮（场景终端，占比 0.005030）能过关。
+/// 高亮是**执行期**才出现的，只能用来选键，不能用来判别界面。
 fn looks_like_keys(frame: &Frame) -> bool {
-    let whole = delta_geom::PxRect {
-        x: 0,
-        y: 0,
-        w: frame.w as i32,
-        h: frame.h as i32,
-    };
-    if color_ratio(frame, whole, is_yellow_or_green_glow) < AZ3_KEYS_FRAME_GLOW_RATIO {
+    let Ok(keys) = locate::locate_keys(frame) else {
         return false;
-    }
-    locate::locate_keys(frame).is_ok()
+    };
+    // 4×4 键阵本身近似正方形（键是方的、间距均匀）。环境里的墙面暗格阵多为长条形，
+    // 靠这条把「长得像键阵的装饰物」挡掉，避免误判后去点背景。
+    let aspect = keys.grid.w as f32 / keys.grid.h.max(1) as f32;
+    (0.72..=1.40).contains(&aspect)
 }
 
 /// 任务保险：5 个配置槽里至少有 4 个槽内有细长竖直白块（游标）。
@@ -495,6 +494,7 @@ fn is_green_glow([b, g, r]: [u8; 3]) -> bool {
 /// 黄/绿高亮（黄键台的亮键）。与 `flow-az3::geom` 同口径：
 /// `r + g > 3b` 必须在 u16 上算，u8 饱和会让 r+g 恒为 255 → 亮黄键漏检；
 /// `b` 上限 120 是为了容下实测 B≈120 的米黄旋钮（靠暗键阵结构拦截误判）。
+#[cfg(test)]
 fn is_yellow_or_green_glow([b, g, r]: [u8; 3]) -> bool {
     let is_green = is_green_glow([b, g, r]);
     let is_yellow = r > 140

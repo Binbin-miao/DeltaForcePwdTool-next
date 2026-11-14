@@ -64,6 +64,35 @@ pub trait Clock {
     fn sleep_ms(&mut self, ms: u64);
 }
 
+/// 实机屏幕相对 720p 的放大倍数（1080p → 1.5，1440p → 2.0）。
+///
+/// 大保险 / 任务保险只抓**小区域**，区域帧不能按自身高度归一化（那会放大到 720）。
+/// 它们需要的是这个系数：把「720p 实测的像素阈值」乘上去，才对得上实机画面。
+/// 拿不到整帧范围时退化为 1.0（按 720p 处理，绝不会因为测量失败而放大阈值）。
+pub fn screen_scale(screen: &impl Screen) -> f32 {
+    let full = screen.frame_rect();
+    if full.h <= 0 {
+        return 1.0;
+    }
+    (full.h as f32 / delta_scene::locate::REFERENCE_HEIGHT as f32).max(1.0)
+}
+
+/// 长度/坐标按屏幕倍数放大。
+pub fn scaled_len(value: i32, scale: f32) -> i32 {
+    if scale <= 1.0 {
+        return value;
+    }
+    (value as f32 * scale).round() as i32
+}
+
+/// 像素面积按屏幕倍数的**平方**放大（面积是二维量）。
+pub fn scaled_area(value: u32, scale: f32) -> u32 {
+    if scale <= 1.0 {
+        return value;
+    }
+    (value as f32 * scale * scale).round() as u32
+}
+
 /// AZ3 流程统一返回结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Az3Outcome {
@@ -726,6 +755,84 @@ mod tests {
         assert!(
             abort_reason(&outcome).contains("16 键已点完但进度未满"),
             "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn module_keys_acks_on_darkness_so_the_next_key_is_clicked_without_delay() {
+        // 键 0 亮一帧就灭、紧跟着键 1 亮。**亮光熄灭就是最可靠的 ack**：
+        // 实机进度框读不出来（屏幕 luma 中位数 48，5 个格子亮度差仅 5~10，
+        // 任何绝对阈值都分不开），而「点对了游戏就收掉高亮」这条观测永远存在。
+        //
+        // 旧实现只认「进度推进」：熄灭被当成「点了没反应」，必须等满 400ms 才判死放行；
+        // 那 400ms 里键 1 已经亮完又灭了 —— 表现为「明明是亮的，程序却一动不动」。
+        let mut frames = vec![
+            panel_frame(&[0], 0, 16, true),
+            panel_frame(&[], 0, 16, true),
+            panel_frame(&[1], 0, 16, true),
+            panel_frame(&[1], 0, 16, true),
+            panel_frame(&[], 0, 16, true),
+        ];
+        frames.push(panel_frame(&[], 0, 16, true));
+        let mut screen = panel_screen(frames);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
+        assert!(
+            pointer.clicks.len() >= 2,
+            "键 0 熄灭后必须立刻能点键 1：{outcome:?} clicks={:?}",
+            pointer.clicks
+        );
+        let first = panel_key(0);
+        let second = panel_key(1);
+        assert_eq!(
+            (pointer.clicks[0].x, pointer.clicks[0].y),
+            (first.x + first.w / 2, first.y + first.h / 2)
+        );
+        assert_eq!(
+            (pointer.clicks[1].x, pointer.clicks[1].y),
+            (second.x + second.w / 2, second.y + second.h / 2),
+            "第二次必须点在键 1 上，而不是重试键 0"
+        );
+    }
+
+    #[test]
+    fn module_keys_treats_a_vanished_panel_after_clicking_as_done() {
+        // 点过键之后面板消失 = 解完了（游戏会把面板收走）。
+        // 不区分的话，**每次成功都会被报成「找不到 4×4 按键阵」失败**。
+        let mut frames = vec![
+            panel_frame(&[0], 0, 16, true),
+            panel_frame(&[0], 0, 16, true),
+            panel_frame(&[], 0, 16, true),
+        ];
+        // 之后面板整个消失（只剩灰底）。
+        for _ in 0..8 {
+            frames.push(blank_panel_frame());
+        }
+        let mut screen = panel_screen(frames);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
+        assert!(outcome.is_done(), "面板消失应判完成，而不是报定位失败：{outcome:?}");
+        assert!(!pointer.clicks.is_empty());
+    }
+
+    #[test]
+    fn module_keys_moves_on_when_a_key_stays_lit_after_click() {
+        // 点完还是亮的（点错了/键无效）→ 超时判死，换下一颗**亮着**的键继续点。
+        let mut screen = panel_screen(vec![
+            panel_frame(&[0, 5], 0, 16, true),
+            panel_frame(&[0, 5], 0, 16, true),
+            panel_frame(&[0, 5], 0, 16, true),
+            panel_frame(&[0, 5], 0, 16, true),
+            panel_frame(&[0, 5], 0, 16, true),
+        ]);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
+        let mut centres: Vec<(i32, i32)> = pointer.clicks.iter().map(|p| (p.x, p.y)).collect();
+        centres.dedup();
+        assert!(
+            centres.len() >= 2,
+            "第一颗键超时判死后必须换第二颗亮键：{outcome:?} clicks={:?}",
+            pointer.clicks
         );
     }
 

@@ -87,6 +87,8 @@ pub fn run(
             Ok(frame) => frame,
             Err(error) => return aborted(pointer.event_count(), error),
         };
+        // `locate_line` 内部归一到 720p 判定、坐标已乘回原图，所以拖动坐标直接就是
+        // 真实屏幕坐标，无需再换算（相对位移也是原图尺度）。
         if let Some(outcome) = progress.step(&frame, pointer, clock, read_led, cancel) {
             return outcome;
         }
