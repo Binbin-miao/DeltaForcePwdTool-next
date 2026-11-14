@@ -81,9 +81,17 @@ pub(crate) fn is_white([b, g, r]: [u8; 3]) -> bool {
     r > 170 && g > 170 && b > 170
 }
 
+/// 黄/绿高亮（黄键台的亮键、进度勾选）。
+///
+/// `r + g > 3b` 必须在 **u16** 上比较：u8 里 `r+g` 会饱和到 255，只要 `b ≥ 86`
+/// 两边就都是 255，亮黄键（240,200,105）会被判成「不是高亮」→ 亮键漏检。
+/// `b` 的上限取 120 而非 115：米黄/琥珀旋钮实测 B≈120，115 会把它漏掉。
 pub(crate) fn is_yellow_or_green_glow(color: [u8; 3]) -> bool {
     let [b, g, r] = color;
-    let is_yellow = r > 140 && g > 120 && b < 115 && r.saturating_add(g) > b.saturating_mul(3);
+    let is_yellow = r > 140
+        && g > 120
+        && b <= 120
+        && (u16::from(r) + u16::from(g)) > u16::from(b) * 3;
     is_green_glow(color) || is_yellow
 }
 
@@ -277,6 +285,15 @@ mod tests {
         assert_eq!(found[0].center_x(), 24);
         assert_eq!(found[0].clip.w(), 8);
         assert_eq!(found[1].pixels, 16);
+    }
+
+    #[test]
+    fn yellow_glow_survives_large_red_green_sums() {
+        // 谓词入参是 [B, G, R]。
+        // u8 里 r+g 会饱和到 255，亮黄键（240,200,105）以前判不出来。
+        assert!(is_yellow_or_green_glow([105, 200, 240]), "亮黄键必须判成高亮");
+        assert!(is_yellow_or_green_glow([120, 200, 230]), "米黄旋钮也会命中（靠暗键阵拦截）");
+        assert!(!is_yellow_or_green_glow([255, 255, 255]), "纯白不是高亮");
     }
 
     #[test]

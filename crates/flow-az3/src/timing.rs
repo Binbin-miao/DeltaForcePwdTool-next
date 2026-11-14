@@ -157,7 +157,8 @@ pub fn run(
                     events: pointer.event_count(),
                 };
             }
-            last_cell = None;
+            // 刻意保留 `last_cell`：单帧检测抖动不代表游标离开了中间格，
+            // 清掉它就会把「还在中格」当成「重新进入中格」，同一字符按两次 → 整条变红。
             clock.sleep_ms(az3.poll_interval_ms);
             continue;
         };

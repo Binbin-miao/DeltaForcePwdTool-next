@@ -12,7 +12,7 @@ mod features;
 
 use delta_capture::Frame;
 use delta_config::{PxAz3, PxView, MORSE_REGION_COUNT};
-use delta_vision::{BinaryImage, GrayImage};
+use delta_vision::{external_contours, BinaryImage, GrayImage};
 
 pub use features::{
     column_segments, crop, edge_density, equidistant_column_peaks, otsu_foreground_ratio,
@@ -264,6 +264,16 @@ impl Az3Kind {
 const AZ3_KEYS_GLOW_RATIO: f32 = 0.004;
 /// 黄键台：网格能切出的等距竖列下限（4 列按键）。
 const AZ3_KEYS_MIN_COLUMNS: usize = 4;
+/// 黄键台：暗色键块的下限数量（4×4 里允许 6 颗亮着/被遮挡）。
+const AZ3_KEYS_MIN_BLOCKS: usize = 10;
+/// 黄键台：判定「暗键」的灰度上限。
+const AZ3_KEY_DARK_LUMA: u8 = 90;
+/// 黄键台：单颗键的宽高区间（像素）。
+const AZ3_KEY_SIDE: (u32, u32) = (15, 80);
+/// 黄键台：单颗键的宽高比区间（近方形）。
+const AZ3_KEY_ASPECT: (f32, f32) = (0.6, 1.6);
+/// 黄键台：单颗键的最小面积。
+const AZ3_KEY_MIN_AREA: u32 = 120;
 /// 任务保险：轨道带内竖直白块数量下限（5 槽，容忍 1 根被游标遮住）。
 const AZ3_PINS_MIN_SLOTS: usize = 4;
 /// 任务保险：每个滑槽在配置中心两侧的搜索半宽（与执行层同口径）。
@@ -303,13 +313,40 @@ pub fn az3_variant(frame: &Frame, view: &PxView) -> Az3Kind {
     Az3Kind::None
 }
 
-/// 黄键台：右侧网格有明显黄/绿亮键，且网格能切出 4 条等距竖列。
+/// 黄键台：右侧是 **4×4 暗色键阵**（结构证据）+ 有黄/绿亮键 + 4 条等距竖列。
+///
+/// 只靠「亮色占比 + 4 列」会劫持 v5 旧操作台：面板右缘与米黄旋钮正好落在这个区域里，
+/// 旋钮的琥珀色会被当成亮键，随后拿 AZ3 网格坐标去点旧面板。暗键阵是 AZ3 独有的结构。
 fn looks_like_keys(frame: &Frame, gray: &GrayImage, az3: &PxAz3) -> bool {
     let grid = az3.button_grid_region;
     if color_ratio(frame, grid, is_yellow_or_green_glow) < AZ3_KEYS_GLOW_RATIO {
         return false;
     }
-    columns_of(gray, grid, AZ3_KEYS_MIN_COLUMNS)
+    columns_of(gray, grid, AZ3_KEYS_MIN_COLUMNS) && dark_key_blocks(gray, grid) >= AZ3_KEYS_MIN_BLOCKS
+}
+
+/// 数「暗色近方形块」：键阵里每颗未点亮的键都是一块这样的暗块。
+fn dark_key_blocks(gray: &GrayImage, rect: delta_geom::PxRect) -> usize {
+    let Some(cell) = crop(gray, rect) else {
+        return 0;
+    };
+    let Ok(mut dark) = BinaryImage::new(cell.w, cell.h) else {
+        return 0;
+    };
+    for y in 0..cell.h {
+        for x in 0..cell.w {
+            dark.set(x, y, cell.pixel(x, y) < AZ3_KEY_DARK_LUMA);
+        }
+    }
+    external_contours(&dark)
+        .into_iter()
+        .filter(|block| {
+            (AZ3_KEY_SIDE.0..=AZ3_KEY_SIDE.1).contains(&block.region.w)
+                && (AZ3_KEY_SIDE.0..=AZ3_KEY_SIDE.1).contains(&block.region.h)
+                && (AZ3_KEY_ASPECT.0..=AZ3_KEY_ASPECT.1).contains(&block.aspect())
+                && block.area >= AZ3_KEY_MIN_AREA
+        })
+        .count()
 }
 
 /// 任务保险：5 个配置槽里至少有 4 个槽内有细长竖直白块（游标）。
@@ -446,9 +483,15 @@ fn is_green_glow([b, g, r]: [u8; 3]) -> bool {
     g > 120 && g > r.saturating_add(25) && g > b.saturating_add(25)
 }
 
+/// 黄/绿高亮（黄键台的亮键）。与 `flow-az3::geom` 同口径：
+/// `r + g > 3b` 必须在 u16 上算，u8 饱和会让 r+g 恒为 255 → 亮黄键漏检；
+/// `b` 上限 120 是为了容下实测 B≈120 的米黄旋钮（靠暗键阵结构拦截误判）。
 fn is_yellow_or_green_glow([b, g, r]: [u8; 3]) -> bool {
     let is_green = is_green_glow([b, g, r]);
-    let is_yellow = r > 140 && g > 120 && b < 115 && r.saturating_add(g) > b.saturating_mul(3);
+    let is_yellow = r > 140
+        && g > 120
+        && b <= 120
+        && (u16::from(r) + u16::from(g)) > u16::from(b) * 3;
     is_green || is_yellow
 }
 
@@ -723,15 +766,42 @@ mod tests {
         canvas.frame()
     }
 
-    /// 黄键台：右侧 4×4 暗格网格 (640,194)-(909,428) + 1 个亮黄键。
+    /// 黄键台：右侧 4×4 暗格键阵 (640,194)-(909,428) + 1 个亮黄键。
+    ///
+    /// 台面必须比键亮（灰 120 vs 键 40）：暗键阵的判断前提是「键比台面暗」，
+    /// 全黑底会让整块区域连成一片，反而数不出键。
     fn module_keys_frame() -> Frame {
         let mut canvas = Canvas::new(W, H);
+        canvas.paint(rect(640, 194, 269, 234), [120, 120, 120]);
         for row in 0..4 {
             for col in 0..4 {
-                canvas.paint(rect(648 + col * 67, 200 + row * 58, 51, 46), [90, 90, 90]);
+                canvas.paint(rect(648 + col * 67, 200 + row * 58, 51, 46), [40, 40, 40]);
             }
         }
         canvas.paint(rect(648 + 67, 200 + 58, 51, 46), [235, 200, 40]);
+        canvas.frame()
+    }
+
+    /// v5 旧操作台：青绿面板 + 面板 4 列 + 米黄旋钮 + 旧 LED。
+    ///
+    /// 关键点：面板右缘与米黄旋钮正好落在 AZ3 的 `button_grid_region` 里，
+    /// 旋钮的琥珀色也满足「黄绿高亮」——这正是旧操作台曾被误判成黄键台的路径。
+    fn legacy_console_frame() -> Frame {
+        let mut canvas = Canvas::new(W, H);
+        // 青绿面板（H≈90 / S≈120 / V≈110），覆盖 AZ3 网格所在区域。
+        canvas.paint(rect(560, 150, 420, 330), [0, 110, 110]);
+        // 旧操作台面板的 4 条等距竖列。
+        for x in [160, 300, 440, 580] {
+            canvas.paint(rect(x, 200, 8, 300), WHITE);
+        }
+        // 米黄旋钮（被误判成「亮键」的那颗）。
+        canvas.paint(rect(700, 316, 40, 30), [235, 205, 80]);
+        // 旧 LED 序列（在 view.console.led_region 里）。
+        let mut cursor = 870;
+        for _ in 0..8 {
+            canvas.paint(rect(cursor, 92, 12, 40), WHITE);
+            cursor += 26;
+        }
         canvas.frame()
     }
 
@@ -762,9 +832,37 @@ mod tests {
     }
 
     #[test]
+    fn yellow_glow_survives_large_red_green_sums() {
+        // 谓词入参是 [B, G, R]。u8 饱和会让 r+g 恒为 255 → 亮黄键漏检。
+        assert!(is_yellow_or_green_glow([105, 200, 240]), "亮黄键必须判成高亮");
+        assert!(is_yellow_or_green_glow([120, 200, 230]), "米黄旋钮也会命中（靠暗键阵拦截）");
+        assert!(!is_yellow_or_green_glow([255, 255, 255]), "纯白不是高亮");
+    }
+
+    #[test]
+    fn az3_variant_requires_the_4x4_dark_key_grid() {
+        // 「亮色 + 4 条等距竖列」不足以判黄键台：面板右缘 + 琥珀旋钮同样能凑出这两条。
+        // 必须有 4×4 暗键阵的结构证据才算数。
+        let bars_with_amber = {
+            let mut canvas = Canvas::new(W, H);
+            for x in [660, 725, 790, 855] {
+                canvas.paint(rect(x, 210, 8, 200), WHITE);
+            }
+            canvas.paint(rect(700, 316, 40, 30), [235, 205, 80]);
+            canvas.frame()
+        };
+        assert_eq!(az3_variant(&bars_with_amber, &spec_view()), Az3Kind::None);
+    }
+
+    #[test]
     fn az3_variant_does_not_hijack_the_legacy_console() {
-        // v5 旧操作台：LED 只在旧 `view.console.led_region` 里，AZ3 LED 区是空的。
-        // 必须返回 None 让 worker 回落到 run_console，绝不能拿 AZ3 坐标去拖旧面板。
+        // v5 旧操作台：青绿面板 + 米黄旋钮（落在 AZ3 网格区里）+ 旧 LED。
+        // 必须先被认成 Console，但 AZ3 变体必须是 None —— 否则 worker 会拿 AZ3 网格坐标去点旧面板。
+        let legacy = legacy_console_frame();
+        assert_eq!(detect(&legacy, &spec_view()).scene, Scene::Console);
+        assert_eq!(az3_variant(&legacy, &spec_view()), Az3Kind::None);
+
+        // 最简情形：LED 只在旧 `view.console.led_region` 里，AZ3 LED 区是空的。
         let led_only = {
             let mut canvas = Canvas::new(W, H);
             let mut cursor = 870;
@@ -789,3 +887,4 @@ mod tests {
         assert_eq!(az3_variant(&grey, &spec_view()), Az3Kind::None);
     }
 }
+

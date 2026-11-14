@@ -194,7 +194,12 @@ pub fn run(
         };
 
         let Some((index, at)) = pick_lit_cell(&grid_frame, origin, &clicked, &dead) else {
-            if clicked.iter().all(|hit| *hit) {
+            // 没有可点的格子：全部格子都已点过或判死 → 直接放弃，不烧满 15s 超时。
+            let exhausted = clicked
+                .iter()
+                .zip(dead.iter())
+                .all(|(clicked, dead)| *clicked || *dead);
+            if exhausted {
                 return Az3Outcome::Aborted {
                     kind: Az3Kind::ModuleKeys,
                     reason: format!("黄键台：{CELLS} 键已点完但进度未满（{checked}/{TOTAL_STAGES}）"),

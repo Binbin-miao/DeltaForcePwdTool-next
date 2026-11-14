@@ -134,8 +134,12 @@ mod tests {
     const WHITE: [u8; 3] = [240, 240, 240];
     const LIT_YELLOW: [u8; 3] = [235, 200, 40];
     const LOCK_GREEN: [u8; 3] = [40, 210, 60];
+    /// 黄键台台面：比暗键亮，暗键阵才数得出来。
+    const TABLE_GREY: [u8; 3] = [120, 120, 120];
+    /// 未点亮的暗键。
+    const DARK_KEY: [u8; 3] = [40, 40, 40];
 
-    /// 循环脚本：帧用完后从头再放（单帧脚本等价于「画面静止」）。
+    /// 顺序脚本：播完停在最后一帧（等价于「画面静止」），便于断言"之后不再触发"。
     struct ScriptScreen {
         frames: Vec<Frame>,
         cursor: usize,
@@ -152,7 +156,8 @@ mod tests {
             if self.frames.is_empty() {
                 return Err("脚本帧为空".to_owned());
             }
-            let frame = self.frames[self.cursor % self.frames.len()].clone();
+            let last = self.frames.len() - 1;
+            let frame = self.frames[self.cursor.min(last)].clone();
             self.cursor += 1;
             Ok(frame)
         }
@@ -283,15 +288,15 @@ mod tests {
             .collect()
     }
 
-    /// 黄键台网格：仅第 `lit` 格亮黄。
+    /// 黄键台网格：灰台面上第 `lit` / `also` 格亮黄，其余为暗键。
     fn grid_frame(lit: Option<usize>, also: Option<usize>) -> Frame {
-        let mut shapes = Vec::new();
+        let mut shapes = vec![(rect(0, 0, GRID_W as i32, GRID_H as i32), TABLE_GREY)];
         for index in 0..16 {
             if Some(index) == lit || Some(index) == also {
                 continue;
             }
             let (x0, y0) = cell_origin(index);
-            shapes.push((rect(x0 + 6, y0 + 4, 55, 50), [90, 90, 90]));
+            shapes.push((rect(x0 + 6, y0 + 4, 55, 50), DARK_KEY));
         }
         for index in [lit, also].into_iter().flatten() {
             let (x0, y0) = cell_origin(index);
@@ -300,10 +305,19 @@ mod tests {
         paint_frame(GRID_W, GRID_H, &shapes)
     }
 
-    fn cell_origin(index: usize) -> (i32, i32) {
-        let cell_w = (GRID_W / 4) as i32;
+    fn cell_origin(index: usize) -> (i32, i32) {        let cell_w = (GRID_W / 4) as i32;
         let cell_h = (GRID_H / 4) as i32;
         (((index % 4) as i32) * cell_w, ((index / 4) as i32) * cell_h)
+    }
+
+    /// 16 格全亮（模拟「所有键都点过却推不动进度」）。
+    fn grid_all_lit() -> Frame {
+        let mut shapes = vec![(rect(0, 0, GRID_W as i32, GRID_H as i32), TABLE_GREY)];
+        for index in 0..16 {
+            let (x0, y0) = cell_origin(index);
+            shapes.push((rect(x0 + 6, y0 + 4, 55, 50), LIT_YELLOW));
+        }
+        paint_frame(GRID_W, GRID_H, &shapes)
     }
 
     /// 该格的全局点击坐标（与 `keys::cell_clip` 的切分口径逐像素一致）。
@@ -425,6 +439,20 @@ mod tests {
     }
 
     #[test]
+    fn safe_timing_does_not_repeat_press_when_band_flickers() {
+        // 中格 → 单帧找不到带（连通域被字符高光切碎）→ 中格：只允许按 1 次。
+        let mut screen = ScriptScreen::new(vec![
+            timing_frame(2),
+            paint_frame(TARGET_W, TARGET_H, &[]),
+            timing_frame(2),
+        ]);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::SafeTiming, &mut screen, &mut pointer);
+        assert_eq!(pointer.spaces, 1, "{outcome:?}");
+        assert!(!outcome.is_done());
+    }
+
+    #[test]
     fn safe_timing_aborts_when_no_band_is_found() {
         let mut screen = ScriptScreen::new(vec![paint_frame(TARGET_W, TARGET_H, &[])]);
         let mut pointer = MockPointer::default();
@@ -450,12 +478,14 @@ mod tests {
     fn safe_pins_presses_when_cursor_meets_target_and_finishes_all_locked() {
         let centers = pin_local_centers();
         let last = centers[4];
+        // 首帧游标还在容差区外（预武装），第二帧才压到目标上 → 按一次 → 全锁。
         let mut frames = vec![
+            indicator_frame(4),
+            track_frame(Some(last), last + 30),
             indicator_frame(4),
             track_frame(Some(last), last + 6),
             indicator_frame(5),
         ];
-        // 末尾补几帧，防止脚本提前耗尽。
         frames.push(indicator_frame(5));
         let mut screen = ScriptScreen::new(frames);
         let mut pointer = MockPointer::default();
@@ -465,17 +495,54 @@ mod tests {
     }
 
     #[test]
-    fn safe_pins_does_not_repeat_press_for_the_same_target() {
-        // 游标一直压在目标上、槽始终不锁定 → 只允许按一次空格。
+    fn safe_pins_does_not_press_on_the_very_first_frame_already_aligned() {
+        // 首帧就对齐 = 还没「离开过容差区」，不许直接按（否则会按在早一格的时机上）。
         let centers = pin_local_centers();
         let last = centers[4];
-        let track = track_frame(Some(last), last);
-        let mut screen = ScriptScreen::new(vec![indicator_frame(4), track]);
+        let mut screen = ScriptScreen::new(vec![
+            indicator_frame(4),
+            track_frame(Some(last), last),
+        ]);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
+        assert_eq!(pointer.spaces, 0, "{outcome:?}");
+        assert!(!outcome.is_done());
+    }
+
+    #[test]
+    fn safe_pins_finds_target_offset_from_the_slot_center() {
+        // 目标方块偏在槽中心 +45px（实测槽宽约 105px）：搜索半宽必须够大才找得到。
+        let centers = pin_local_centers();
+        let last = centers[4];
+        let offset = last + 45;
+        let mut screen = ScriptScreen::new(vec![
+            indicator_frame(4),
+            track_frame(Some(offset), last + 20),
+            indicator_frame(4),
+            track_frame(Some(offset), offset),
+            indicator_frame(5),
+        ]);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
+        assert!(outcome.is_done(), "{outcome:?}");
+        assert_eq!(pointer.spaces, 1);
+    }
+
+    #[test]
+    fn safe_pins_does_not_repeat_press_for_the_same_target() {
+        // 预武装一次后游标一直压在目标上、槽始终不锁定 → 只允许按一次空格。
+        let centers = pin_local_centers();
+        let last = centers[4];
+        let mut screen = ScriptScreen::new(vec![
+            indicator_frame(4),
+            track_frame(Some(last), last + 30),
+            indicator_frame(4),
+            track_frame(Some(last), last),
+        ]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
         assert_eq!(pointer.spaces, 1, "{outcome:?}");
         assert!(!outcome.is_done());
-        assert!(abort_reason(&outcome).contains("已按 1 次"), "{outcome:?}");
     }
 
     #[test]
@@ -523,6 +590,17 @@ mod tests {
         assert!(!outcome.is_done());
         assert!(abort_reason(&outcome).contains("已点击 0 次"), "{outcome:?}");
         assert!(pointer.clicks.is_empty());
+    }
+
+    #[test]
+    fn module_keys_aborts_once_all_sixteen_keys_are_spent() {
+        // 16 格全点过、进度仍不动 → 必须立即 Abort，而不是烧满 15s 超时。
+        let mut screen = key_screen(grid_all_lit(), vec![progress_frame(0)]);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
+        assert!(!outcome.is_done());
+        assert_eq!(pointer.clicks.len(), 16, "{outcome:?}");
+        assert!(abort_reason(&outcome).contains("16 键已点完但进度未满"), "{outcome:?}");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 > 目标：v5 只认摩斯 / 指纹 / 旧操作台三种；AZ3 场景一律 `Unknown` → 拒绝执行。
 > v6 在**不改动一级三分类**的前提下，给 Console 家族加一层二级变体判别，新增四条流程。
 >
-> 冻结时间：2026-11-14 ｜ 状态：**已实现（356 测试全绿 / clippy 零告警 / exe 5.81MB）**
+> 冻结时间：2026-11-14 ｜ 状态：**已实现（363 测试全绿 / clippy 零告警 / exe 5.82MB）**
 
 ---
 
@@ -121,16 +121,20 @@ detect(frame) -> Morse | Fingerprint | Console | Unknown        （v5 原样，�
 2. **信号线台的列推进假设为「自动跳列」**（录像里玩家全程只转旋钮，没有横拖）。
    若不是，state machine 会走「等自动跳列」分支并最终 Abort，不会乱拖。
 3. **任务保险的目标位**按「小白方块」识别；若实际是第二根游标，同样能配成一对（都是白色块）。
-4. **黄键台高亮色**录像里是绿色，用户口述是黄色 —— 判据同时接受黄与绿。
+4. **黄键台高亮色**录像里是绿色，用户口述是黄色 —— 判据同时接受黄与绿
+   （`r+g > 3b` 必须用 u16 比较：u8 在 `b ≥ 86` 时两边都饱和到 255，亮黄会漏检）。
+5. **黄键台的 `ModuleKeys` 判定还要求网格里 ≥10 个暗色近方形键块**（gray < 90、宽高 15–80px）。
+   这是为了不把旧操作台的米黄旋钮误当亮键。代价：如果实机按键底色偏亮（不是近黑），
+   会识别不出 → 返回 `None`（安全失败，不会乱点），此时需要把 `AZ3_KEY_DARK_LUMA` 调高。
 
 ---
 
 ## 7. 验证
 
 ```bash
-cargo test --workspace --no-fail-fast -- --test-threads=1   # 356 passed / 0 failed
+cargo test --workspace --no-fail-fast -- --test-threads=1   # 363 passed / 0 failed
 cargo clippy --workspace --all-targets -- -D warnings        # 0 error
-cargo build --release                                        # 5.81 MB (6,094,848 B)
+cargo build --release                                        # 5.82 MB (6,100,992 B)
 ```
 
 实机验收（交给用户，不由自动化代跑）：

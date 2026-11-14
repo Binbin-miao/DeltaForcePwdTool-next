@@ -30,8 +30,8 @@ const CURSOR_MAX_W: u32 = 10;
 const TARGET_SIDE: (u32, u32) = (5, 16);
 /// 目标方块 / 游标的最小连通面积（滤噪点）。
 const MIN_BLOB_PIXELS: u32 = 12;
-/// 每个滑槽在配置中心两侧的搜索半宽。
-const SEARCH_HALF_W: i32 = 40;
+/// 每个滑槽在配置中心两侧的搜索半宽（实测相邻槽间距 ≈105px）。
+const SEARCH_HALF_W: i32 = 55;
 /// 连续多少帧找不到目标方块才放弃。
 const TARGET_MISS_LIMIT: u32 = 20;
 
@@ -138,7 +138,8 @@ pub fn run(
     let mut hits = 0usize;
     let mut locked_count = 0usize;
     let mut target_misses = 0u32;
-    let mut armed = true;
+    // 起始未武装：spec 要求「离开过容差区才按」，首帧恰好对齐不该直接按下去。
+    let mut armed = false;
 
     for _ in 0..az3.frame_budget {
         if cancel.load(Ordering::SeqCst) {
