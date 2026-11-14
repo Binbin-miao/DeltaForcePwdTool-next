@@ -236,6 +236,38 @@ fn main_rows(content: Rect) -> MainRows {
     }
 }
 
+/// 标题栏上的「识别总开关」胶囊：开=绿色实心，关=灰色空心。
+///
+/// 关掉后 `run_once` 在入口直接返回，**连截图都不抓**（不只是不注入）。
+/// 放在标题栏而不是设置页，是因为这个开关的用途就是「临时别动」——
+/// 对枪、跑图、看录像时需要一秒关掉，翻设置页太慢。
+fn master_toggle(ui: &egui::Ui, rect: Rect, on: bool, pal: &Palette) -> bool {
+    let (fill, text_color, label) = if on {
+        (pal.ok, pal.bg_panel, "识别中")
+    } else {
+        (pal.bg_panel, pal.text_3, "已暂停")
+    };
+    let painter = ui.painter();
+    let corner = rect.height() / 2.0;
+    painter.rect_filled(rect, corner, fill);
+    if !on {
+        painter.rect_stroke(
+            rect,
+            corner,
+            Stroke::new(1.0, pal.line_strong),
+            egui::StrokeKind::Inside,
+        );
+    }
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        pal.text(pal.font_label),
+        text_color,
+    );
+    clickable(ui, rect, "master-toggle", Sense::click()).clicked()
+}
+
 fn main_layout(ui: &egui::Ui, full: Rect, state: &mut UiState, pal: &Palette) -> Option<Action> {
     let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
     let rows = main_rows(content);
@@ -271,6 +303,23 @@ fn main_layout(ui: &egui::Ui, full: Rect, state: &mut UiState, pal: &Palette) ->
             Vec2::splat(icon),
         )
     };
+    // 识别总开关：放在标题栏、紧贴右侧图标之前 —— 窗口一打开第一眼就能看到，
+    // 不用翻设置页。开着是绿色「识别中」，关掉是灰色「已暂停」。
+    let master_w = 66.0;
+    let master = Rect::from_min_size(
+        Pos2::new(
+            rows.title.right()
+                - icon * 3.0
+                - theme::SPACE_XS * 3.0
+                - theme::SPACE_S
+                - master_w,
+            rows.title.top() + (theme::TITLE_BAR_H - theme::MASTER_TOGGLE_H) / 2.0,
+        ),
+        Vec2::new(master_w, theme::MASTER_TOGGLE_H),
+    );
+    if master_toggle(ui, master, state.master_enabled, pal) {
+        action = Some(Action::ToggleMaster);
+    }
     let (quit, collapse, pin) = (icon_at(1.0), icon_at(2.0), icon_at(3.0));
     if icon_button(ui, pin, "pin", if state.always_on_top { "■" } else { "□" }, pal) {
         action = Some(Action::ToggleAlwaysOnTop);

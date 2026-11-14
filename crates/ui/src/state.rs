@@ -472,6 +472,8 @@ pub enum Action {
     Quit,
     /// 标题条图钉：切换窗口置顶（默认关）。
     ToggleAlwaysOnTop,
+    /// 标题条上的「识别总开关」：关掉后任何热键都不触发识别，连截图都不抓。
+    ToggleMaster,
     OpenCalibration,
     OpenSettings,
     ToggleFlow(SceneKind),

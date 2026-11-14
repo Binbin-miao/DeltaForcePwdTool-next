@@ -555,6 +555,8 @@ pub const SWITCH_H: f32 = 16.0;
 pub const SWITCH_THUMB: f32 = 12.0;
 /// 标题条图标按钮边长。
 pub const ICON_BUTTON: f32 = 16.0;
+/// 标题栏「识别总开关」胶囊的高度（宽度在视图里按文案定）。
+pub const MASTER_TOGGLE_H: f32 = 20.0;
 /// 警示条里「知道了」按钮尺寸。
 pub const NOTICE_BUTTON_W: f32 = 64.0;
 pub const NOTICE_BUTTON_H: f32 = 24.0;

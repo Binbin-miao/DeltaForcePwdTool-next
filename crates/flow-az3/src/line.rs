@@ -15,8 +15,8 @@ use delta_capture::Frame;
 use delta_config::PxAz3;
 use delta_flow_console::{parse_led_sequence, TargetSequence};
 use delta_geom::{PxPoint, PxRect};
-use delta_scene::locate::{locate_line, LocatedLine, LINE_COLUMNS};
-use delta_vision::{detect_yellow_hatch, DiagonalStripeParams};
+use delta_scene::locate::{locate_line, LocatedLine, LINE_COLUMNS, LINE_ROWS};
+use delta_vision::{detect_yellow_hatch, external_contours, BinaryImage, DiagonalStripeParams, GrayImage, Region};
 
 use crate::{Az3Outcome, Clock, Pointer, Screen};
 
@@ -97,11 +97,205 @@ pub fn run(
     aborted(pointer.event_count(), "抓帧配额已用尽".to_owned())
 }
 
-/// 生产用 LED 读数：裁出字条 → 字形识别 → 解析成 4 组 2 位 0/1。
+/// 生产用 LED 读数：裁出字条 → **按拓扑读 0/1** → 拼成 4 组 2 位目标序列。
+///
+/// 不再走字形模板：实机 LED 是点阵风格的 `11-10-00-11`（白字黑底 + 光晕），
+/// 内置模板的 NCC 实测只有 **-0.03**（完全不相关），不是调阈值能救的 —— 字体根本不是同一套。
+///
+/// 而 0 和 1 的区别是**拓扑**：`0` 中间有洞，`1` 是没有洞的细竖条。
+/// 拓扑判据与字体、字号、缩放、光晕全都无关。
+///
+/// `led` 是定位层给的**粗略**框（实测常偏小或偏移几十像素），这里先向外扩一圈，
+/// 再自己在扩后的区域里找「数字所在的那一行带」。
 pub fn read_led_sequence(frame: &Frame, led: PxRect) -> Result<TargetSequence, String> {
-    let strip = delta_scene::crop(&frame.luma(), led).ok_or_else(|| "LED 区域越界".to_owned())?;
-    let text = delta_vision::read_glyph_string(&strip).map_err(|error| error.to_string())?;
+    let region = widen(led, frame);
+    let strip = delta_scene::crop(&frame.luma(), region).ok_or_else(|| "LED 区域越界".to_owned())?;
+    let digits = read_led_digits(&strip)?;
+    if digits.len() != LED_DIGITS {
+        return Err(format!(
+            "LED 读出 {} 个字符（应为 {LED_DIGITS} 个 0/1）：{digits}",
+            digits.len()
+        ));
+    }
+    let text = format!(
+        "{}-{}-{}-{}",
+        &digits[0..2],
+        &digits[2..4],
+        &digits[4..6],
+        &digits[6..8]
+    );
     parse_led_sequence(&text).map_err(|error| error.to_string())
+}
+
+/// LED 的 0/1 位数（4 组 × 2 位）。
+const LED_DIGITS: usize = 8;
+/// LED 数字亮度的下限（压掉数字外面的淡绿光晕）。
+const LED_DIGIT_LUMA: u8 = 178;
+
+/// 把定位层给的框向外扩：左右各 35% 宽、上下各 60% 高（都不超过帧边界）。
+fn widen(led: PxRect, frame: &Frame) -> PxRect {
+    // 只外扩一点点：定位给的框实测已经盖住数字（`1287,110 554x149` vs 数字 1298..1832/115..200）。
+    // 扩太多会把 LED 面板的黑框、旁边的按钮、顶部 HUD 全带进来，`tallest` 一旦被大块污染，
+    // 数字就全被「同高」过滤器扫掉（实测只剩 1 个连通域）。
+    let pad_x = (led.w as f32 * 0.06) as i32;
+    let pad_y = (led.h as f32 * 0.15) as i32;
+    let x = (led.x - pad_x).max(0);
+    let y = (led.y - pad_y).max(0);
+    let right = (led.right() + pad_x).min(frame.w as i32);
+    let bottom = (led.bottom() + pad_y).min(frame.h as i32);
+    PxRect {
+        x,
+        y,
+        w: (right - x).max(1),
+        h: (bottom - y).max(1),
+    }
+}
+
+/// 在灰度条里按拓扑读出 0/1 串（自左向右）。
+fn read_led_digits(strip: &GrayImage) -> Result<String, String> {
+    // **不能用纯 Otsu**：LED 数字外面裹着一圈淡绿光晕（实测 luma 80~140），
+    // Otsu 把光晕也算成前景，8 个数字连同光晕连成一整块 —— 实测只剩 1 个连通域。
+    // 取「Otsu 与固定下限的较大者」：背景干净时听 Otsu，有光晕时被下限托住。
+    // 实测阈值 170~200 都能稳定切出 8 个数字 + 4 个短横。
+    let threshold = strip.otsu().threshold.max(LED_DIGIT_LUMA);
+    let binary = BinaryImage::from_gray_threshold(strip, threshold);
+    // 只在**数字所在的那一行带**里找字符：面板黑框、底板、旁边的按钮先被行带筛掉，
+    // 否则大块轮廓进入 `tallest`，8 个数字会被「同高」过滤器一起扫掉。
+    let band = digit_band(strip)?;
+    let max_w = (strip.w / 4).max(8);
+    let max_h = (band.h * 3 / 2).max(8);
+    let glyphs: Vec<Region> = external_contours(&binary)
+        .into_iter()
+        .map(|contour| contour.region)
+        .filter(|region| region.w >= 3 && region.h >= 6)
+        .filter(|region| region.y >= band.y && region.y + region.h <= band.y + band.h)
+        .filter(|region| region.w <= max_w && region.h <= max_h)
+        .collect();
+    let tallest = glyphs.iter().map(|region| region.h).max().unwrap_or(0);
+    if tallest == 0 {
+        return Err("LED 区域里没有字符".to_owned());
+    }
+    // 只留「跟最高字符差不多高」的：数字高度一致，中间的短横（`-`）只有几分之一高。
+    let digits: Vec<Region> = glyphs
+        .into_iter()
+        .filter(|region| region.h * 3 >= tallest * 2)
+        .collect();
+    if digits.len() < LED_DIGITS {
+        return Err(format!(
+            "LED 只找到 {} 个数字（应为 {LED_DIGITS}）",
+            digits.len()
+        ));
+    }
+    let mut sorted = digits;
+    sorted.sort_by_key(|region| region.x);
+    // 多检出的（光晕碎块）取最左 8 个：LED 条是左对齐排布的。
+    Ok(sorted
+        .iter()
+        .take(LED_DIGITS)
+        .map(|region| if has_hole(&binary, *region) { '0' } else { '1' })
+        .collect())
+}
+
+/// 数字所在的水平带：亮像素最密集的那一段连续行。
+///
+/// LED 条带里除了数字还有面板黑框、底板、旁边的小按钮 —— 它们的亮像素远少于数字行，
+/// 用「行亮像素数」一筛就只剩数字那一带。
+fn digit_band(strip: &GrayImage) -> Result<Region, String> {
+    let mut counts = Vec::with_capacity(strip.h as usize);
+    for y in 0..strip.h {
+        let count = strip
+            .row(y)
+            .iter()
+            .filter(|&&value| value > LED_DIGIT_LUMA)
+            .count();
+        counts.push(count as u32);
+    }
+    let peak = counts.iter().copied().max().unwrap_or(0);
+    if peak == 0 {
+        return Err("LED 区域里没有亮字".to_owned());
+    }
+    // 峰值 30% 以上算「数字行」；取最长的一段连续行。
+    let threshold = (peak * 3 / 10).max(2);
+    let mut best: Option<(u32, u32)> = None;
+    let mut start: Option<u32> = None;
+    for (y, &count) in counts.iter().enumerate() {
+        let live = count >= threshold;
+        match (live, start) {
+            (true, None) => start = Some(y as u32),
+            (false, Some(begin)) => {
+                let span = (y as u32) - begin;
+                if best.is_none_or(|(_, best_span)| span > best_span) {
+                    best = Some((begin, span));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        let span = strip.h - begin;
+        if best.is_none_or(|(_, best_span)| span > best_span) {
+            best = Some((begin, span));
+        }
+    }
+    let (y, h) = best.ok_or_else(|| "LED 区域里没有连续的数字行".to_owned())?;
+    Ok(Region {
+        x: 0,
+        y,
+        w: strip.w,
+        h: h.max(1),
+    })
+}
+
+/// 字符外接框里是否包着一个**不与边界连通**的暗区（数字 `0` 的洞）。
+///
+/// `1` 是一条竖线，暗区全部连着外边界；`0` 中间那圈暗区被亮字围住。
+fn has_hole(binary: &BinaryImage, region: Region) -> bool {
+    let (w, h) = (region.w, region.h);
+    if w < 5 || h < 5 {
+        return false;
+    }
+    let index = |x: u32, y: u32| (y * w + x) as usize;
+    let mut seen = vec![false; (w * h) as usize];
+    let mut stack: Vec<(u32, u32)> = Vec::new();
+    for x in 0..w {
+        stack.push((x, 0));
+        stack.push((x, h - 1));
+    }
+    for y in 0..h {
+        stack.push((0, y));
+        stack.push((w - 1, y));
+    }
+    while let Some((x, y)) = stack.pop() {
+        let slot = index(x, y);
+        if seen[slot] {
+            continue;
+        }
+        seen[slot] = true;
+        if binary.get(region.x + x, region.y + y) {
+            continue;
+        }
+        for (nx, ny) in [
+            (x.wrapping_sub(1), y),
+            (x, y.wrapping_sub(1)),
+            (x + 1, y),
+            (x, y + 1),
+        ] {
+            if nx < w && ny < h {
+                stack.push((nx, ny));
+            }
+        }
+    }
+    let mut enclosed = 0u32;
+    for y in 0..h {
+        for x in 0..w {
+            if !seen[index(x, y)] && !binary.get(region.x + x, region.y + y) {
+                enclosed += 1;
+            }
+        }
+    }
+    // 洞要够大：抗锯齿边缘会留下几个孤立暗点，那不是洞。
+    enclosed >= 10
 }
 
 impl Progress {
@@ -206,6 +400,51 @@ impl Progress {
         (0..LINE_COLUMNS).find(|&column| !self.calibrated[column] && !self.dead[column])
     }
 
+    /// 读不出当前档位时的兜底：**归零再定位**。
+    ///
+    /// 信号线是连续可调的，实机常停在两档之间，`selected` 因此是 `None`。
+    /// 这条路不依赖「当前是第几行」，只用相对位移：
+    /// 1. 向上拖过全部档位（游戏会把线夹在顶行）；
+    /// 2. 从顶行往下数到目标行。
+    fn homing_drag(
+        &mut self,
+        line: &LocatedLine,
+        column: usize,
+        pointer: &mut impl Pointer,
+        clock: &mut impl Clock,
+        cancel: &AtomicBool,
+    ) -> Option<Az3Outcome> {
+        if self.attempts[column] >= MAX_ATTEMPTS {
+            self.dead[column] = true;
+            return self.on_column_dead(pointer.event_count());
+        }
+        let (Some(top), Some(target)) = (
+            line.slot_center(column, 0),
+            line.slot_center(column, self.targets[column]),
+        ) else {
+            return Some(aborted(pointer.event_count(), "档位坐标换算失败".to_owned()));
+        };
+        let gap = (target.y - top.y).abs().max(1);
+        let grab = PxPoint {
+            x: line.columns.get(column).copied().unwrap_or(top.x),
+            y: top.y,
+        };
+        // 第一步：向上拖过全部档位，游戏会把线夹到顶行。
+        let overshoot = -(gap * (LINE_ROWS as i32 + 1));
+        if let Err(error) = drag(pointer, grab, overshoot, cancel) {
+            return Some(aborted(pointer.event_count(), error));
+        }
+        clock.sleep_ms(SETTLE_MS);
+        // 第二步：从顶行往下数到目标行。
+        if let Err(error) = drag(pointer, grab, target.y - top.y, cancel) {
+            return Some(aborted(pointer.event_count(), error));
+        }
+        self.attempts[column] += 1;
+        self.drags += 2;
+        clock.sleep_ms(SETTLE_MS);
+        None
+    }
+
     /// 驱动某一列：看得出档位就纵拖到目标行，看不出就等下一帧（绝不盲拖）。
     fn drive_line(
         &mut self,
@@ -216,13 +455,14 @@ impl Progress {
         cancel: &AtomicBool,
     ) -> Option<Az3Outcome> {
         let Some(row) = line.selected.get(column).copied().flatten() else {
+            // 读不出当前档位 —— 实机很常见：信号线是**连续**可调的，经常停在两档之间
+            // （实测 t112：线在 y=204，距最近档位 104px，而档距只有 109px）。
+            // 这时「按差值拖」无从算起，但「先把线拖到顶、再往下数 N 档」只依赖相对位移，
+            // 永远成立。先给它几次归零的机会，实在不行才判死这一列。
             self.select_misses[column] += 1;
-            if self.select_misses[column] < SELECT_FAIL_LIMIT {
-                return None;
+            if self.select_misses[column] <= SELECT_FAIL_LIMIT {
+                return self.homing_drag(line, column, pointer, clock, cancel);
             }
-            // 实测 t78/t88（未开始的静止画面）整屏都没有琥珀框，t96 才逐列出现；
-            // 已完成的列也可能不再显示框。没有框就没有位置信息 —— 这一列判死、不再碰它，
-            // 但不立刻收工：剩下还有别的列要拖，或者游戏稍后会给出「信息已校准」。
             self.dead[column] = true;
             return self.on_column_dead(pointer.event_count());
         };
@@ -418,6 +658,9 @@ mod tests {
             let slot = rect(COLUMNS[index] - 10, ROWS[*row] - 15, 20, 30);
             ring(&mut canvas, slot, 3, AMBER);
         }
+        // 注：这里**不画信号线**。这些用例验的是「琥珀框 → 拖动闭环」这条老路径，
+        // 每条列都有琥珀框，够用了；信号线通道由 `delta-scene` 的合成帧覆盖
+        // （那里画了中灰阶梯线，专门验「只有受控列有框」时的读值）。
         canvas.paint(LED_PANEL, LED_DARK);
         for index in 0..11 {
             let area = match index % 3 {
@@ -600,22 +843,30 @@ mod tests {
     }
 
     #[test]
-    fn column_without_marker_is_never_dragged() {
-        // 第 2 列没有黄色定位框：这一列绝不拖（没有位置信息）。
-        // 但不能因为一列读不到就整体放弃 —— 其余列该拖还是要拖，
-        // 收尾时说清是哪几列没搞定（实测第 4 列常被屏幕右缘裁掉）。
+    fn column_without_marker_falls_back_to_homing_drag() {
+        // 第 2 列读不出当前档位（信号线停在两档之间，或游戏还没给它画框）。
+        //
+        // **旧行为是直接判死这一列** —— 实机上那等于「明明能修却不动手」，
+        // 用户看到的就是「控制台不动」。现在改成归零兜底：
+        // 先把线拖到顶（游戏会夹住），再往下数到目标行，全程只用相对位移。
         let (outcome, game) = play(Game::new([Some(3), None, Some(2), Some(0)]));
         let game = game.borrow();
-        assert!(!outcome.is_done(), "{outcome:?}");
+        let second: Vec<_> = game
+            .begin_points
+            .iter()
+            .filter(|point| point.x == COLUMNS[1])
+            .collect();
         assert!(
-            game.begin_points.iter().all(|point| point.x != COLUMNS[1]),
-            "看不出档位的那列绝不拖：{:?}",
+            !second.is_empty(),
+            "读不出档位的列必须走归零兜底，而不是放弃：{:?}",
             game.begin_points
         );
         assert!(
-            reason_of(&outcome).contains("第 2 列没能对齐"),
-            "{outcome:?}"
+            game.steps.iter().all(|&(dx, _)| dx == 0),
+            "归零也必须只纵拖：{:?}",
+            game.steps
         );
+        let _ = outcome;
     }
 
     #[test]

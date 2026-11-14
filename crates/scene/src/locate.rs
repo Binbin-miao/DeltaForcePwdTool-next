@@ -542,10 +542,15 @@ fn led_glyphs(frame: &Frame, panel: PxRect) -> Option<PxRect> {
 
 // ── 4/5/6. 列、行、选中档位 ──
 
-/// 档位方块亮面：`V ≥ 150 ∧ S ≤ 60`（白或冷白青）。
+/// 档位方块亮面：`V ≥ 150 ∧ S ≤ 90`（白 / 冷白青 / **米黄**）。
+///
+/// 上限从 60 放到 90 是被实机逼的：**当前受控的那一列档条是米黄色**（实测
+/// R≈220 G≈200 B≈150 ⇒ delta 70），旧判据 `delta ≤ 60` 把它整列排除，于是屏幕里
+/// 只剩 3 列白档条 → `most_even` 凑不出 4 列 → 报「屏幕上数不到 4 列档位」。
+/// 屏幕背景是深蓝（max≈40）够不到 150，行标签是青色（delta≈100）超过 90，放开不误收。
 fn is_slot_bright(color: [u8; 3]) -> bool {
     let (max, delta) = brightness(color);
-    max >= 150 && delta <= 60
+    max >= 150 && delta <= 90
 }
 
 /// 选中档位的琥珀色定位框：与 OpenCV 标度 `H∈[15,40] ∧ S≥70 ∧ V≥110` 等价。
@@ -574,7 +579,7 @@ fn find_grid(frame: &Frame, screen: PxRect) -> Option<Grid> {
     let field = masked(frame, screen, is_slot_bright)?;
     let columns = field_columns(&field)?;
     let rows = field_rows(&field, &columns)?;
-    let selected = field_selected(frame, &columns, &rows);
+    let selected = field_selected(frame, screen, &columns, &rows);
     let targets = slot_rects(&columns, &rows);
     Some(Grid {
         columns,
@@ -623,10 +628,38 @@ fn field_rows(field: &Masked, columns: &[i32]) -> Option<Vec<i32>> {
     most_even(&centers, 8).map(|picked| picked.to_vec())
 }
 
-/// 每列的选中行：档位阵里琥珀框像素最多的一行；不足 `MARKER_MIN_PIXELS` → `None`。
+/// 每列当前档位：读**白色信号线**在该列的穿越高度，映射到最近的行。
 ///
-/// 只扫 16 个小窗（合计约 2 万像素），不为整屏建掩码 —— 1080p 下这一项差一个数量级。
-fn field_selected(frame: &Frame, columns: &[i32], rows: &[i32]) -> Vec<Option<usize>> {
+/// 旧实现找「琥珀色定位框」。实机 4 帧全部 `selected = [None; 4]` —— 因为游戏只在
+/// **当前受控的那一列**画琥珀框，其余三列根本没有框，于是「每列现在是什么值」读不出来。
+///
+/// 而横向那条**白色信号线**贯穿全屏，在每一列都有一个明确高度 —— 那个高度就是这一列的值。
+/// 判据（与字体/缩放无关）：
+/// - 窗口内某一行的白像素要占满窗口宽度的一半以上（信号线是横贯的粗线）；
+/// - 档位方条只有十来像素宽，凑不满这个占比，自然被排除。
+fn field_selected(
+    frame: &Frame,
+    screen: PxRect,
+    columns: &[i32],
+    rows: &[i32],
+) -> Vec<Option<usize>> {
+    // 两条独立通道，取**先有证据的那个**：
+    // 1. **琥珀定位框**（旧通道）：游戏只为「当前受控的那一列」画框，其余列恒空；
+    // 2. **白色/中灰信号线**（新通道）：贯穿全屏，每一列都有高度 —— 能补上 1 的空白。
+    //
+    // 顺序不能反：受控列的琥珀框是「这一列此刻被选中」的直接证据，比线的高度更权威；
+    // 而线在未对齐时可能落在两档之间（读成 None），正好由框兜住。
+    let amber = amber_selected(frame, columns, rows);
+    let wire = wire_selected(frame, screen, columns, rows);
+    amber
+        .into_iter()
+        .zip(wire)
+        .map(|(from_amber, from_wire)| from_amber.or(from_wire))
+        .collect()
+}
+
+/// 通道一：每列被**琥珀定位框**圈住的行（不足 `MARKER_MIN_PIXELS` → `None`）。
+fn amber_selected(frame: &Frame, columns: &[i32], rows: &[i32]) -> Vec<Option<usize>> {
     let gap = row_gap_of(rows);
     let half_x = (gap / 5).max(6);
     let half_y = (gap / 3).max(8);
@@ -649,6 +682,86 @@ fn field_selected(frame: &Frame, columns: &[i32], rows: &[i32]) -> Vec<Option<us
                 .map(|(row, _)| row)
         })
         .collect()
+}
+
+/// 通道二：从**信号线**在各列的穿越高度推出该列档位。
+fn wire_selected(
+    frame: &Frame,
+    screen: PxRect,
+    columns: &[i32],
+    rows: &[i32],
+) -> Vec<Option<usize>> {
+    let (Some(&first), Some(&last)) = (rows.first(), rows.last()) else {
+        return vec![None; columns.len()];
+    };
+    let gap = row_gap_of(rows);
+    // **信号线不是白色**：实测亮度只有 70~100（灰），而档位方条是 220。
+    // 用找档位条的那套 `is_slot_bright`（≥150）会把信号线整条漏掉。
+    let Some(wire) = masked(frame, screen, is_signal_wire) else {
+        return vec![None; columns.len()];
+    };
+    let half = (wire.binary.width() as i32 / 40).max(20);
+    // 只留 4 行各自 ±1/2 行距：再宽一点，屏幕底部那条「自动破译进行中」的亮横线
+    // （实测 y≈688，距最后一行 52px）就会被当成信号线，把整列读成最后一行。
+    let y_min = first - gap / 2 - wire.y0 as i32;
+    let y_max = last + gap / 2 - wire.y0 as i32;
+    columns
+        .iter()
+        .map(|&column| {
+            line_row_at(&wire, column, half, y_min, y_max).and_then(|y| nearest_row(rows, y))
+        })
+        .collect()
+}
+
+/// 信号线的颜色：**中灰**（亮度 62~170、接近无彩）。
+///
+/// 屏幕背景是深蓝（亮度约 40），档位方条是亮白（约 220），只有信号线落在中间这一段。
+fn is_signal_wire(color: [u8; 3]) -> bool {
+    let (max, delta) = brightness(color);
+    (62..=170).contains(&max) && delta <= 48
+}
+
+/// 信号线在 `column ± half` 这个窄窗里的行位置（掩码局部坐标 → 帧坐标）。
+fn line_row_at(field: &Masked, column: i32, half: i32, y_min: i32, y_max: i32) -> Option<i32> {
+    let width = field.binary.width();
+    let height = field.binary.height();
+    let start = (column - field.x0 as i32 - half).max(0) as u32;
+    let end = ((column - field.x0 as i32 + half + 1).max(0) as u32).min(width);
+    if start >= end || height == 0 {
+        return None;
+    }
+    let span = end - start;
+    let from = y_min.max(0) as u32;
+    let to = (y_max.max(0) as u32).min(height);
+    if from >= to {
+        return None;
+    }
+    let mut best: Option<(u32, u32)> = None;
+    for y in from..to {
+        let mut count = 0u32;
+        for x in start..end {
+            if field.binary.get(x, y) {
+                count += 1;
+            }
+        }
+        if best.is_none_or(|(best_count, _)| count > best_count) {
+            best = Some((count, y));
+        }
+    }
+    // 必须占满窗口一半以上：横贯的粗线才满足，档位方条/波形细线不满足。
+    best.filter(|&(count, _)| count * 2 >= span)
+        .map(|(_, y)| field.y0 as i32 + y as i32)
+}
+
+/// 离 `y` 最近的档位行；超过行距的 2/3 就算「对不上任何一行」（不猜）。
+fn nearest_row(rows: &[i32], y: i32) -> Option<usize> {
+    let tolerance = (row_gap_of(rows) * 2 / 3).max(6);
+    rows.iter()
+        .enumerate()
+        .map(|(index, &row)| (index, (row - y).abs()))
+        .min_by_key(|&(_, distance)| distance)
+        .filter(|&(_, distance)| distance <= tolerance)
+        .map(|(index, _)| index)
 }
 
 fn slot_rects(columns: &[i32], rows: &[i32]) -> Vec<PxRect> {
@@ -1365,6 +1478,8 @@ pub(crate) mod fixture {
     pub(crate) const PANEL: [u8; 3] = [10, 55, 60];
     /// 档位方块亮面：冷白青（V≈225、低饱和）。
     pub(crate) const SLOT: [u8; 3] = [190, 225, 225];
+    /// 信号线的中灰：实机实测亮度 70~100，比档位方条（220）暗得多。
+    pub(crate) const WIRE: [u8; 3] = [138, 136, 133];
     /// 选中档位的琥珀定位框。
     pub(crate) const AMBER: [u8; 3] = [250, 210, 60];
     /// LED 面板底色：近黑。
@@ -1507,6 +1622,25 @@ pub(crate) mod fixture {
                     AMBER,
                 );
             }
+        }
+        // 信号线：**中灰**（实机亮度 70~100，远低于档位方条的 220），
+        // 在每列的高度 = 该列当前档位。四列可以不同高，所以按列画成阶梯。
+        // 少了这条线，「每列现在是什么值」就没有观测通道（旧实现靠琥珀框，实机只有
+        // 受控那一列有框，其余恒为 None）。
+        let half = ((COLUMNS[1] - COLUMNS[0]) / 2).max(8);
+        for (index, row) in selected.iter().enumerate() {
+            let Some(row) = row else {
+                continue;
+            };
+            canvas.rect(
+                PxRect {
+                    x: COLUMNS[index] - half,
+                    y: ROWS[*row] - 4,
+                    w: half * 2,
+                    h: 8,
+                },
+                WIRE,
+            );
         }
         canvas.rect(LED_PANEL, LED_DARK);
         for index in 0..11 {

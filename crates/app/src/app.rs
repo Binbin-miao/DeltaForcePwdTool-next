@@ -336,6 +336,7 @@ impl DeltaApp {
             Action::ToggleFKeyHook => self.toggle_f_key_hook(),
             Action::DismissNotice => self.state.dismiss_notice(),
             Action::ToggleAlwaysOnTop => self.toggle_always_on_top(),
+            Action::ToggleMaster => self.toggle_master(),
         }
     }
 
