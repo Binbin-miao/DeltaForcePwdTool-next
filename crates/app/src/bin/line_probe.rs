@@ -9,7 +9,8 @@
 //! ```
 //!
 //! 图例：绿=screen、黄=LED 数字条、红实心圆=knob、青线=4 列 / 4 行、
-//! 灰框=16 个档位格、**橙粗框=每列命中的那一行**（「程序认为横线现在在哪」的唯一证据）。
+//! 灰框=16 个档位格、**橙粗框=每列命中的那一行**（「程序认为横线现在在哪」的唯一证据）、
+//! **蓝框=左侧行标签的读数窗口**（标签值 → 行索引的映射来源）。
 
 use std::fs;
 use std::io::{BufReader, BufWriter};
@@ -19,7 +20,9 @@ use std::time::Instant;
 
 use delta_capture::Frame;
 use delta_geom::PxRect;
-use delta_scene::locate::{locate_line, LocateError, LocatedLine, LINE_ROWS};
+use delta_scene::locate::{
+    diagnose_line_grid, locate_line, LocateError, LocatedLine, LINE_COLUMNS, LINE_ROWS,
+};
 
 /// 用法错误 / 读写失败。
 const EXIT_IO: u8 = 1;
@@ -51,6 +54,10 @@ const AXIS_THICKNESS: i32 = 1;
 const SELECTED_THICKNESS: i32 = 4;
 /// 品红横线线宽。
 const WIRE_THICKNESS: i32 = 2;
+/// 行标签读数窗口：蓝。
+const LABEL_COLOR: [u8; 3] = [45, 120, 255];
+/// 行标签框线宽。
+const LABEL_THICKNESS: i32 = 2;
 /// 旋钮标记半径。
 const KNOB_RADIUS: i32 = 10;
 
@@ -83,6 +90,14 @@ fn main() -> ExitCode {
         Ok(located) => located,
         Err(error) => {
             println!("定位失败: 卡在 {} —— {error}", stage_name(error));
+            // 列/行没定出来时，把「各有多少条候选」也带出来 —— 只说「数不到 4 列」
+            // 等于没说（`drag_row3` 就卡在这句没有信息量的文案上）。
+            if matches!(
+                error,
+                LocateError::Columns | LocateError::GridColumns | LocateError::GridRows
+            ) {
+                report_grid(&frame);
+            }
             return ExitCode::from(EXIT_LOCATE);
         }
     };
@@ -127,7 +142,30 @@ fn stage_name(error: LocateError) -> &'static str {
         LocateError::Screen => "Screen",
         LocateError::Led => "Led",
         LocateError::Columns => "Columns",
+        LocateError::GridColumns => "GridColumns",
+        LocateError::GridRows => "GridRows",
         LocateError::Keys => "Keys",
+    }
+}
+
+/// 网格诊断：列/行各切出几条候选、`most_even` 选了哪 4 条。
+fn report_grid(frame: &Frame) {
+    match diagnose_line_grid(frame) {
+        Ok(diagnosis) => {
+            println!(
+                "  列候选 {} 条: {:?}",
+                diagnosis.column_candidates.len(),
+                diagnosis.column_candidates
+            );
+            println!("  列选定: {:?}", diagnosis.columns);
+            println!(
+                "  行候选 {} 条: {:?}",
+                diagnosis.row_candidates.len(),
+                diagnosis.row_candidates
+            );
+            println!("  行选定: {:?}", diagnosis.rows);
+        }
+        Err(error) => println!("  网格诊断也失败: {} —— {error}", stage_name(error)),
     }
 }
 
@@ -180,20 +218,51 @@ fn report(frame: &Frame, located: &LocatedLine) {
     println!("selected: {:?}", located.selected);
     println!("wire_y:   {:?}", located.wire_y);
     println!(
-        "命中行:   {:?}",
-        row_labels(&located.selected)
+        "row_labels: {:?}  ({:?})",
+        located.row_labels,
+        label_texts(&located.row_labels)
     );
+    println!("命中行:   {:?}", row_labels(&located.selected));
     println!("targets:  {} 个格子", located.targets.len());
     match delta_flow_az3::line::read_led_sequence(frame, located.led) {
-        Ok(sequence) => {
-            let rows = sequence.rows();
-            let labels: Vec<String> = (0..rows.len())
-                .map(|column| format!("{}@行{}", sequence.label_for(column), rows[column]))
-                .collect();
-            println!("目标序列: {}", labels.join(" "));
-        }
+        Ok(sequence) => report_targets(&sequence, &located.row_labels),
         Err(message) => println!("警告: LED 数字条读不出目标序列 —— {message}"),
     }
+}
+
+/// 目标值 → 命中行：**必须走生产同一份映射**（`resolve_target_rows`），不许探针另写一套。
+fn report_targets(sequence: &delta_flow_console::TargetSequence, labels: &[Option<u8>; LINE_ROWS]) {
+    println!(
+        "目标序列: {}",
+        (0..LINE_COLUMNS)
+            .map(|column| sequence.label_for(column).to_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    match delta_flow_az3::line::resolve_target_rows(labels, sequence) {
+        Ok(rows) => println!(
+            "目标值→命中行: {}",
+            (0..LINE_COLUMNS)
+                .map(|column| format!("{}→行{}", sequence.label_for(column), rows[column]))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        Err(error) => println!("警告: 目标值无法映射到档位行 —— {error}（该列不许动手）"),
+    }
+}
+
+/// 标签值 → 两位数文本（`2` → `10`），读不出显示 `--`。
+fn label_texts(labels: &[Option<u8>; LINE_ROWS]) -> Vec<&'static str> {
+    labels
+        .iter()
+        .map(|label| match label {
+            Some(0) => "00",
+            Some(1) => "01",
+            Some(2) => "10",
+            Some(3) => "11",
+            _ => "--",
+        })
+        .collect()
 }
 
 /// 档位行标签（`10/11/01/00`）—— 直接用 flow-console 那一份，不另起一套。
@@ -231,6 +300,9 @@ fn draw_probe(frame: &Frame, located: &LocatedLine) -> Canvas {
     }
     for &row in &located.rows {
         canvas.hline(located.screen.x, located.screen.right(), row, AXIS_COLOR);
+    }
+    for box_ in located.label_boxes.iter().flatten() {
+        canvas.stroke_rect(*box_, LABEL_COLOR, LABEL_THICKNESS);
     }
     canvas.stroke_rect(located.screen, SCREEN_COLOR, BOX_THICKNESS);
     canvas.stroke_rect(located.led, LED_COLOR, BOX_THICKNESS);

@@ -1,13 +1,18 @@
 //! AZ3 信号线台（横线台）：**每帧自适应定位 + 只上下拖动 + 列自动推进**。
 //!
 //! 实机机制（录像实测，见 `.scratch/az3/line-geometry.md`）：
-//! - 屏幕里有 4 列、每列 4 个档位，对应左侧行标签 `10 / 11 / 01 / 00`（自上而下）；
+//! - 屏幕里有 4 列、每列 4 个档位，**左侧有 4 个两位行标签**（`0`/`1` 组成，如 `10 11 01 00`）；
+//!   用户实测：**行标签与右上 LED 的数字每局都会变**，所以「第几行是哪个值」必须每帧读，
+//!   见 [`resolve_target_rows`]；
 //! - 右上 LED 给出 4 组目标序列，如 `10-11-01-10`；
 //! - **操作 = 在屏幕里按住左键上下拖动**（等价于「旋转旋钮」），把**当前列**的档位拖到目标行；
 //! - 一列到位后游戏自动推进到下一列；4 列全对 → 黄黑斜纹「信息已校准」。
 //!
 //! 所以这里只做三件事：定位（[`locate`]）、读 LED、纵拖。**不横拖、不点屏幕以外的地方、
 //! 看不出档位就零输入退出** —— 旧实现拿固定坐标去猜，在摩斯面板上发过 64 个乱拖事件。
+//!
+//! **目标行必须查标签表**：旧实现把 LED 的 4 组值直接当行索引（写死 `10/11/01/00`），
+//! 一局标签顺序变一次就会把线拖到错行。读不出标签 ⇒ 一列也不许动（fail-closed）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -17,6 +22,7 @@ use delta_flow_console::{parse_led_sequence, TargetSequence};
 use delta_geom::{PxPoint, PxRect};
 use delta_scene::locate::{locate_line, LocatedLine, LINE_COLUMNS, LINE_ROWS};
 use delta_vision::{detect_yellow_hatch, external_contours, BinaryImage, DiagonalStripeParams, GrayImage, Region};
+use thiserror::Error;
 
 use crate::{Az3Outcome, Clock, Pointer, Screen};
 
@@ -44,6 +50,81 @@ const MAX_ATTEMPTS: u32 = 3;
 const MAX_CORRECTIONS: u32 = 1;
 /// 定位失败时给用户的下一步动作。
 const POSE_HINT: &str = "（请正对操作台、让屏幕和红旋钮都进入画面）";
+/// 目标行映射不出来（左侧标签读不出 / 目标值不唯一）时，最多容忍几帧再收尾。
+///
+/// 标签是**静态 UI**，一帧读不出多半下一帧也读不出；4 帧（50ms 轮询 ≈0.2s）足够滤掉
+/// 偶发的抖动帧，又不会让人干等。
+const TARGET_FAIL_LIMIT: u32 = 4;
+
+/// 目标行映射失败的原因。文案直接进 Abort 提示，必须说清「为什么一列都没动」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum TargetMapError {
+    #[error("左侧行标签读不出（4 行里有 {missing} 行没读到），无法把 LED 目标值对应到档位行")]
+    LabelsUnreadable { missing: usize },
+    #[error("第 {column} 列的目标标签 {label:?} 不是两位 0/1，无法对应到档位行")]
+    BadLabel { column: usize, label: &'static str },
+    #[error("第 {column} 列的目标标签 {label:?} 在左侧标签里出现 {hits} 次（必须恰好 1 次），无法确定目标行")]
+    Ambiguous {
+        column: usize,
+        label: &'static str,
+        hits: usize,
+    },
+}
+
+/// 行标签 → 值（`10`=2、`11`=3、`01`=1、`00`=0）：两位 0/1 当二进制读。
+///
+/// 编码必须与 [`delta_scene::locate::LocatedLine::row_labels`] 完全一致 ——
+/// 那边按「十位 ×2 + 个位」产出，这里按同一规则解析标签文本。
+fn label_value(label: &str) -> Option<u8> {
+    let mut value = 0u8;
+    let mut digits = 0usize;
+    for character in label.chars() {
+        value = value * 2
+            + match character {
+                '0' => 0,
+                '1' => 1,
+                _ => return None,
+            };
+        digits += 1;
+    }
+    (digits == 2).then_some(value)
+}
+
+/// **把 LED 的目标值查成档位行索引**：`labels` 是左侧 4 行标签（自上而下，`None` = 读不出）。
+///
+/// 这就是本轮的核心：行与值的对应关系每局都会变，所以只能「LED 目标值 → 在标签表里
+/// 找它出现在第几行」。**任何不确定都不许猜**：
+/// - 4 行标签有一行没读出 ⇒ 整块不可信（那个值可能就藏在读不出的那一行）；
+/// - 某目标值在标签里出现 0 次或 2 次以上 ⇒ 这一列的目标行不唯一。
+pub fn resolve_target_rows(
+    labels: &[Option<u8>; LINE_ROWS],
+    sequence: &TargetSequence,
+) -> Result<[usize; LINE_COLUMNS], TargetMapError> {
+    let missing = labels.iter().filter(|label| label.is_none()).count();
+    if missing > 0 {
+        return Err(TargetMapError::LabelsUnreadable { missing });
+    }
+    let mut rows = [0usize; LINE_COLUMNS];
+    for (column, slot) in rows.iter_mut().enumerate() {
+        let label = sequence.label_for(column);
+        let value = label_value(label).ok_or(TargetMapError::BadLabel { column, label })?;
+        let mut hits = 0usize;
+        for (row, candidate) in labels.iter().enumerate() {
+            if *candidate == Some(value) {
+                hits += 1;
+                *slot = row;
+            }
+        }
+        if hits != 1 {
+            return Err(TargetMapError::Ambiguous {
+                column,
+                label,
+                hits,
+            });
+        }
+    }
+    Ok(rows)
+}
 
 /// 一次任务的进度账本：把「数到第几帧 / 哪列死掉」从主循环里挪出来。
 #[derive(Default)]
@@ -61,6 +142,8 @@ struct Progress {
     calibrated: [bool; LINE_COLUMNS],
     aligned_since: [Option<u64>; LINE_COLUMNS],
     targets: [usize; LINE_COLUMNS],
+    /// 目标行映射连续失败的帧数（左侧标签读不出 / 目标值不唯一）。
+    target_misses: u32,
     drags: u32,
 }
 
@@ -334,7 +417,14 @@ impl Progress {
             Err(error) => return self.on_led_miss(pointer.event_count(), &error),
         };
         self.led_misses = 0;
-        self.targets = sequence.rows();
+        // LED 的 4 组值是**标签值**，不是行索引：每局行标签顺序会变，必须现查。
+        match resolve_target_rows(&line.row_labels, &sequence) {
+            Ok(rows) => {
+                self.targets = rows;
+                self.target_misses = 0;
+            }
+            Err(error) => return self.on_target_miss(pointer.event_count(), error),
+        }
 
         if self.track(&line, clock.now_ms()) {
             let summary = format!("信号线台已对齐校准（4 列，共拖 {} 次）", self.drags);
@@ -384,6 +474,21 @@ impl Progress {
         }
         let reason = format!("右上角数字条读不出来（要求 4 组、每组 2 位 0/1）：{error}");
         Some(aborted(events, reason))
+    }
+
+    /// 目标行映射不出来：**这一帧一列也不许动**（`None` = 零输入继续等）。
+    ///
+    /// 这是本轮 fail-closed 的落点：不知道「这个值在第几行」就去拖，等于闭着眼睛把线
+    /// 拖到别的档位 —— 拖错之后游戏不会告诉你，4 列全错才算完。宁可零输入退出。
+    fn on_target_miss(&mut self, events: u64, error: TargetMapError) -> Option<Az3Outcome> {
+        self.target_misses += 1;
+        if self.target_misses < TARGET_FAIL_LIMIT {
+            return None;
+        }
+        Some(aborted(
+            events,
+            format!("{error}（已按零输入退出，避免拖错行）"),
+        ))
     }
 
     /// 更新「哪列已校准」：档位在目标行上连续停满 `STABLE_MS`。返回是否 4 列全部校准。
@@ -641,6 +746,13 @@ mod tests {
     };
     const COLUMNS: [i32; 4] = [100, 180, 260, 340];
     const ROWS: [i32; 4] = [90, 140, 190, 240];
+    /// 行标签底色（浅蓝绿）与数字墨色（深）。
+    const LABEL_BG: [u8; 3] = [180, 220, 215];
+    const LABEL_INK: [u8; 3] = [30, 45, 45];
+    /// 默认行标签（自上而下）—— 每局会变，测试可以换。
+    const DEFAULT_LABELS: [&str; LINE_ROWS] = ["10", "11", "01", "00"];
+    /// 标签块左缘：铺满 `columns[0]` 左侧 0.70~1.75 个行距的读数窗口（本夹具 12..66）。
+    const LABEL_X: i32 = 12;
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> PxRect {
         PxRect { x, y, w, h }
@@ -692,8 +804,29 @@ mod tests {
         }
     }
 
-    /// 机台一帧：`selected` 是每列被琥珀框圈住的档位行。
-    fn machine(selected: [Option<usize>; LINE_COLUMNS], knob: bool) -> Frame {
+    /// 一行标签块：浅蓝绿底 + 两位深色数字（`1` 画 8px 竖条、`0` 画 15px 空心环）。
+    ///
+    /// 与实机同构（`.scratch/line-probe/in/panel_clean.png` 量出来的判据）：读数靠
+    /// 「深色像素列投影恰好 2 段 + 段宽 0/1 二选一」，所以这里只要画出那两种字形。
+    fn draw_label(canvas: &mut Canvas, y: i32, text: &str) {
+        canvas.paint(rect(LABEL_X, y - 20, 54, 41), LABEL_BG);
+        for (index, digit) in text.chars().enumerate() {
+            let left = LABEL_X + 14 + index as i32 * 19;
+            let stem = rect(left, y - 9, 8, 19);
+            if digit == '1' {
+                canvas.paint(stem, LABEL_INK);
+            } else {
+                ring(&mut *canvas, rect(left, y - 9, 15, 19), 3, LABEL_INK);
+            }
+        }
+    }
+
+    /// 机台一帧：`selected` 是每列被琥珀框圈住的档位行，`labels` 是左侧 4 行标签。
+    fn machine_with(
+        selected: [Option<usize>; LINE_COLUMNS],
+        knob: bool,
+        labels: [Option<&'static str>; LINE_ROWS],
+    ) -> Frame {
         let mut canvas = Canvas::new(MACHINE);
         canvas.paint(SCREEN, BEZEL);
         canvas.paint(CONTENT, PANEL);
@@ -710,6 +843,11 @@ mod tests {
         // 注：这里**不画信号线**。这些用例验的是「琥珀框 → 拖动闭环」这条老路径，
         // 每条列都有琥珀框，够用了；信号线通道由 `delta-scene` 的合成帧覆盖
         // （那里画了中灰阶梯线，专门验「只有受控列有框」时的读值）。
+        for (index, label) in labels.iter().enumerate() {
+            if let Some(text) = label {
+                draw_label(&mut canvas, ROWS[index], text);
+            }
+        }
         canvas.paint(LED_PANEL, LED_DARK);
         for index in 0..11 {
             let area = match index % 3 {
@@ -724,6 +862,11 @@ mod tests {
         canvas.frame()
     }
 
+    /// 默认标签的机台（既有用例都用这一版）。
+    fn machine(selected: [Option<usize>; LINE_COLUMNS], knob: bool) -> Frame {
+        machine_with(selected, knob, DEFAULT_LABELS.map(Some))
+    }
+
     /// 固定 LED 读数（测试里不跑字形识别，只验闭环控制）。
     fn fixed_led(_frame: &Frame, _led: PxRect) -> Result<TargetSequence, String> {
         parse_led_sequence("10-11-01-10").map_err(|error| error.to_string())
@@ -734,7 +877,7 @@ mod tests {
     impl Screen for MachineScreen {
         fn grab(&mut self, _rect: PxRect) -> Result<Frame, String> {
             let game = self.0.borrow();
-            Ok(machine(game.selected, game.knob))
+            Ok(machine_with(game.selected, game.knob, game.labels))
         }
 
         fn frame_rect(&self) -> PxRect {
@@ -746,6 +889,8 @@ mod tests {
     struct Game {
         selected: [Option<usize>; LINE_COLUMNS],
         knob: bool,
+        /// 左侧 4 行标签；`None` = 那一行没画（读不出）。
+        labels: [Option<&'static str>; LINE_ROWS],
         dragging: Option<(usize, i32)>,
         begin_points: Vec<PxPoint>,
         steps: Vec<(i32, i32)>,
@@ -762,8 +907,15 @@ mod tests {
             Self {
                 selected,
                 knob: true,
+                labels: DEFAULT_LABELS.map(Some),
                 ..Self::default()
             }
+        }
+
+        /// 换一组行标签（验证「值 → 行」是现查的，不是写死的）。
+        fn with_labels(mut self, labels: [Option<&'static str>; LINE_ROWS]) -> Self {
+            self.labels = labels;
+            self
         }
     }
 
@@ -1113,5 +1265,85 @@ mod tests {
         let outcome = drag(&mut pointer, PxPoint { x: 100, y: 240 }, -150, &cancel);
         assert_eq!(outcome, Err("已取消".to_owned()));
         assert_eq!(shared.borrow().releases, 1, "取消也必须抬手，否则鼠标键会卡死");
+    }
+
+    // ── 行标签 → 目标行（本轮新增）──
+
+    #[test]
+    fn led_values_are_mapped_through_the_row_labels_not_a_fixed_table() {
+        // 每局标签顺序会变：这一局自上而下是 `01/00/11/10`。
+        // 目标序列仍是 `10-11-01-10` ⇒ 值 2/3/1/2 ⇒ 行 3/2/0/3。
+        let expected = [Some(3), Some(2), Some(0), Some(3)];
+        let game = Game::new([Some(0); 4])
+            .with_labels([Some("01"), Some("00"), Some("11"), Some("10")]);
+        let (outcome, game) = play(game);
+        let game = game.borrow();
+        assert!(outcome.is_done(), "{outcome:?}");
+        assert_eq!(
+            game.selected, expected,
+            "必须拖到「标签值对应的那一行」，不是写死的行 0/1/2/0"
+        );
+        assert!(
+            game.steps.iter().all(|&(dx, _)| dx == 0),
+            "只允许纵拖：{:?}",
+            game.steps
+        );
+    }
+
+    #[test]
+    fn a_duplicated_label_value_stops_the_run_with_zero_input() {
+        // 两行都是 `10` ⇒ 目标值 2 出现 2 次 ⇒ 目标行不唯一：一列也不许动。
+        let game = Game::new([Some(3); 4])
+            .with_labels([Some("10"), Some("10"), Some("01"), Some("00")]);
+        let (outcome, game) = play(game);
+        let game = game.borrow();
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert!(game.begin_points.is_empty(), "映射不唯一 ⇒ 零输入：{:?}", game.begin_points);
+        assert_eq!(game.events, 0, "全程零输入");
+        let reason = reason_of(&outcome);
+        assert!(
+            reason.contains("出现 2 次") && reason.contains("无法确定目标行"),
+            "要说清是哪一列、哪个值、出现几次：{reason}"
+        );
+    }
+
+    #[test]
+    fn unreadable_labels_stop_the_run_with_zero_input() {
+        // 第 3 行的标签读不出 ⇒ 那个值可能就藏在它后面，整块不可信。
+        let game = Game::new([Some(3); 4])
+            .with_labels([Some("10"), Some("11"), None, Some("00")]);
+        let (outcome, game) = play(game);
+        let game = game.borrow();
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(game.events, 0, "读不出标签时不许有任何输入");
+        let reason = reason_of(&outcome);
+        assert!(
+            reason.contains("左侧行标签读不出") && reason.contains("1 行没读到"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn label_values_are_parsed_from_their_two_digits() {
+        assert_eq!(label_value("10"), Some(2));
+        assert_eq!(label_value("11"), Some(3));
+        assert_eq!(label_value("01"), Some(1));
+        assert_eq!(label_value("00"), Some(0));
+        assert_eq!(label_value("2"), None, "必须是两位");
+        assert_eq!(label_value("12"), None, "只允许 0/1");
+    }
+
+    #[test]
+    fn resolve_target_rows_reports_a_missing_label_before_anything_else() {
+        let sequence = parse_led_sequence("10-11-01-10").expect("合法序列");
+        assert_eq!(
+            resolve_target_rows(&[Some(2), Some(3), Some(1), None], &sequence),
+            Err(TargetMapError::LabelsUnreadable { missing: 1 })
+        );
+        // 全读出、且值是 10/11/01/00 的一个排列 ⇒ 正常查表。
+        assert_eq!(
+            resolve_target_rows(&[Some(2), Some(3), Some(1), Some(0)], &sequence),
+            Ok([0, 1, 2, 0])
+        );
     }
 }

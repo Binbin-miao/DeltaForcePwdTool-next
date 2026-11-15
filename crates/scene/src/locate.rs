@@ -186,6 +186,167 @@ const SPACING_SPREAD: f32 = 0.25;
 /// 琥珀定位框的像素数下限（720p 实测 106~183）。
 const MARKER_MIN_PIXELS: u32 = 40;
 
+/// 相邻行中心的最小间距（720p 实测档位行距 50~110px，8 只是「别把两条带当一行」）。
+const ROW_MIN_GAP: i32 = 8;
+
+/// 行标签数字的亮度上限：深色数字实测均值 < 100，浅蓝绿底约 205。
+const LABEL_DARK_LUMA: u8 = 100;
+/// 行标签底色的亮度下限（182,220,215 一族均值约 205；深色背景约 30~60）。
+const LABEL_BRIGHT_LUMA: u8 = 150;
+/// 单个字形段的宽度区间（720p 世界）。
+///
+/// 实测：`1` 的笔画 7~8px、`0` 的环宽 13~16px；块边框/装饰线只有 4~5px，
+/// 背景整片又远超上限 —— 下限 6 正好把「字」与「框」分开。
+const LABEL_GLYPH_RUN: (usize, usize) = (6, 25);
+/// 单段宽达到这个值就判 `0`（实测 `0` ≥13、`1` ≤8，两倍以上差距）。
+const LABEL_ZERO_WIDTH: usize = 12;
+/// 深色像素数达到这个值也判 `0`（宽判据的兜底：字形被压扁时宽度会失真）。
+const LABEL_ZERO_PIXELS: u32 = 180;
+/// 字形段必须占满窗口高度的比例（噪点/细线不满足）。
+const LABEL_GLYPH_HEIGHT: f32 = 0.25;
+/// 标签读数窗口的 x 范围（相对 `columns[0]`，单位 = 行距）。
+///
+/// 实机两个口径：左缘 `1.55~1.63` 个行距、右缘 `0.86~1.04` 个行距，取包住两者的区间。
+const LABEL_WINDOW_X: (f32, f32) = (-1.75, -0.70);
+/// 标签读数窗口的 y 半高（单位 = 行距）。
+///
+/// **必须 ≤ 0.25**：再大就会把标签块的上下边框收进窗口，列投影被那两条整宽横线
+/// 连成一段，永远凑不出 2 段（实测 0.30 时四行全是「1 段」）。
+const LABEL_WINDOW_Y: f32 = 0.25;
+/// 字形左右各取多少像素作为「底色邻接」样本。
+const LABEL_EDGE_SAMPLE: i32 = 3;
+/// 邻接样本里浅色像素的最低占比：字形两侧必须是标签底色（框线两侧是深色背景）。
+const LABEL_EDGE_PALE: f32 = 0.5;
+
+/// 一行的标签读数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowLabel {
+    /// 标签值 `0..=3`（`10`=2、`11`=3、`01`=1、`00`=0）；`None` = 读不出。
+    pub value: Option<u8>,
+    /// 读数窗口（720p 世界坐标，供探针画框）；`None` = 连列都没定出来。
+    pub window: Option<PxRect>,
+}
+
+/// 读左侧 4 行标签（`[行] -> 标签值`）。
+///
+/// 用户实测：右上角 LED 的 4 组数字与左侧 4 个行标签**每局都会变**，所以「第几行是哪个值」
+/// 必须每帧从画面读出来，`line.rs` 再拿 LED 的目标值来这张表里查行。
+///
+/// 判据（`.scratch/line-probe/in/panel_clean.png` 等 5 张实测）：
+/// 标签 = 浅蓝绿底 + 深色两位数字，只有 `0`/`1` 两种字形；`0` 的环宽 13~16px、
+/// `1` 的笔画 7~8px，宽度（或深色像素数）单段判形。段数不是恰好 2 段就 `None`（绝不猜）。
+///
+/// `columns` / `rows` 是**720p 世界**的坐标（与本文件其余阈值同一口径）。
+fn read_row_labels(frame: &Frame, columns: &[i32], rows: &[i32]) -> [RowLabel; LINE_ROWS] {
+    let first = columns.first().copied();
+    let gap = row_gap_of(rows);
+    std::array::from_fn(|index| {
+        let window = rows
+            .get(index)
+            .copied()
+            .and_then(|y| label_window(first, y, gap));
+        let value = window.and_then(|window| read_row_label(frame, window, gap));
+        RowLabel { value, window }
+    })
+}
+
+/// 第 `row_y` 行的标签读数窗口（720p 世界）；列没定出来就是 `None`。
+fn label_window(first_column: Option<i32>, row_y: i32, gap: i32) -> Option<PxRect> {
+    let first = first_column?;
+    let gap = gap.max(1);
+    let x0 = first + (gap as f32 * LABEL_WINDOW_X.0) as i32;
+    let x1 = first + (gap as f32 * LABEL_WINDOW_X.1) as i32;
+    let half = (gap as f32 * LABEL_WINDOW_Y) as i32;
+    Some(PxRect {
+        x: x0,
+        y: row_y - half,
+        w: (x1 - x0).max(1),
+        h: (half * 2 + 1).max(1),
+    })
+}
+
+/// 单行标签读数：窗内深色像素的列投影 → 恰好 2 段 → 两位数字 → 值。
+fn read_row_label(frame: &Frame, window: PxRect, gap: i32) -> Option<u8> {
+    let (x0, y0, x1, y1) = clip(frame, window)?;
+    let width = (x1 - x0) as usize;
+    let height = y1 - y0;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let mut profile = vec![0u32; width];
+    for (index, count) in profile.iter_mut().enumerate() {
+        let x = x0 + index as u32;
+        *count = (y0..y1)
+            .filter(|&y| luma_of(frame.pixel(x, y)) < LABEL_DARK_LUMA)
+            .count() as u32;
+    }
+    let max_width = ((gap as f32) * 0.45) as usize;
+    let glyphs: Vec<(usize, usize)> = runs(&profile, 0)
+        .into_iter()
+        .filter(|&(start, end)| within_usize(LABEL_GLYPH_RUN, end - start))
+        .filter(|&(start, end)| end - start <= max_width.max(1))
+        .filter(|&(start, end)| {
+            profile[start..end].iter().copied().max().unwrap_or(0) as f32
+                >= height as f32 * LABEL_GLYPH_HEIGHT
+        })
+        // 字形两侧必须是标签底色：块边框的右邻是深色背景，就在这里被挡掉。
+        .filter(|&(start, end)| {
+            let left = x0 as i32 + start as i32;
+            let right = x0 as i32 + end as i32;
+            pale_ratio(frame, left - LABEL_EDGE_SAMPLE, left, y0, y1) >= LABEL_EDGE_PALE
+                && pale_ratio(frame, right, right + LABEL_EDGE_SAMPLE, y0, y1) >= LABEL_EDGE_PALE
+        })
+        .collect();
+    if glyphs.len() != 2 {
+        return None;
+    }
+    let tens = label_digit(&profile, glyphs[0]);
+    let ones = label_digit(&profile, glyphs[1]);
+    Some(tens * 2 + ones)
+}
+
+/// 单段字形是 `0` 还是 `1`：宽 ≥ [`LABEL_ZERO_WIDTH`] 或深色像素 ≥ [`LABEL_ZERO_PIXELS`] ⇒ `0`。
+fn label_digit(profile: &[u32], glyph: (usize, usize)) -> u8 {
+    let (start, end) = glyph;
+    let pixels: u32 = profile
+        .get(start..end)
+        .map_or(0, |slice| slice.iter().sum());
+    if end - start >= LABEL_ZERO_WIDTH || pixels >= LABEL_ZERO_PIXELS {
+        0
+    } else {
+        1
+    }
+}
+
+/// 窗口内一段竖条里「浅色像素」的占比（越界部分裁掉；裁空 → 0）。
+fn pale_ratio(frame: &Frame, x_from: i32, x_to: i32, y0: u32, y1: u32) -> f32 {
+    let left = x_from.max(0) as u32;
+    let right = x_to.min(frame.w as i32).max(0) as u32;
+    if right <= left {
+        return 0.0;
+    }
+    let mut pale = 0u32;
+    let mut total = 0u32;
+    for x in left..right {
+        for y in y0..y1 {
+            total += 1;
+            if luma_of(frame.pixel(x, y)) >= LABEL_BRIGHT_LUMA {
+                pale += 1;
+            }
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        pale as f32 / total as f32
+    }
+}
+
+/// BGRA 像素的亮度（三通道均值，与横线判据同一口径）。
+fn luma_of([b, g, r]: [u8; 3]) -> u8 {
+    ((u32::from(b) + u32::from(g) + u32::from(r)) / 3) as u8
+}
+
 /// 信号线的亮度下限：RGB 三通道均值 **> 170**。
 ///
 /// 旧判据认中灰（`max 62..170`）是错的：四张拖动图实测横线是纯白 `(255,255,255)`。
@@ -324,6 +485,13 @@ pub struct LocatedLine {
     pub columns: Vec<i32>,
     /// 4 行的 y 中心（自上而下，对应行标签 `10/11/01/00`）。
     pub rows: Vec<i32>,
+    /// **每行左侧两位数字标签的值**（自上而下）：`10`=2、`11`=3、`01`=1、`00`=0。
+    ///
+    /// 用户实测：**右上角的四位数字与左侧四位数字每局都会变**，所以「第几行是哪个值」
+    /// 不能写死成 `10/11/01/00`。`None` = 这一行的标签读不出（绝不猜）。
+    pub row_labels: [Option<u8>; LINE_ROWS],
+    /// 每行标签的读数窗口（原图坐标，供探针画框）。
+    pub label_boxes: [Option<PxRect>; LINE_ROWS],
     /// 16 个候选档位方块的外接框，**列优先、行次之**：`targets[col * 4 + row]`。
     pub targets: Vec<PxRect>,
     /// 每列当前被琥珀框圈住的档位行；`None` = 这一列看不出位置（不猜）。
@@ -368,8 +536,18 @@ pub enum LocateError {
     Screen,
     #[error("没找到右上角的 01-10 数字条")]
     Led,
+    /// **旧版合并变体**：`find_grid` 早先把「列没找到」与「行没找到」拍平成同一个
+    /// `Columns`，`drag_row3` 因此卡在没有信息量的「数不到 4 列档位」上。
+    /// 语义保持不变（留给下游既有匹配），但 [`locate_line`] 已不再产生它 —— 现在走
+    /// [`LocateError::GridColumns`] / [`LocateError::GridRows`]。
     #[error("屏幕上数不到 4 列档位")]
     Columns,
+    /// 列投影凑不出 4 个等距峰（候选条数见 [`diagnose_line_grid`]）。
+    #[error("屏幕上数不到 4 列档位（列候选凑不出等距 4 列）")]
+    GridColumns,
+    /// 列已定、但列窗内的行投影凑不出 4 条等距带。
+    #[error("屏幕上数不到 4 行档位（列已定位到，行候选凑不出等距 4 行）")]
+    GridRows,
     #[error("没找到右侧的 4×4 按键阵（能对上号的暗色键块不足 12 个）")]
     Keys,
 }
@@ -483,13 +661,19 @@ pub fn locate_line(frame: &Frame) -> Result<LocatedLine, LocateError> {
     let knob = find_knob(frame).ok_or(LocateError::Knob)?;
     let screen = find_screen(frame, knob).ok_or(LocateError::Screen)?;
     let led = find_led(frame, knob, screen).ok_or(LocateError::Led)?;
-    let grid = find_grid(frame, screen).ok_or(LocateError::Columns)?;
+    let grid = find_grid(frame, screen)?;
+    // 行标签在这 720p 世界里读，窗口/框随结果一起乘回原图比例（与其他字段同一规则）。
+    let labels = read_row_labels(frame, &grid.columns, &grid.rows);
     Ok(LocatedLine {
         screen: scale_rect(screen, scale),
         led: scale_rect(led, scale),
         knob: scale_point(knob, scale),
         columns: grid.columns.iter().map(|x| scale_axis(*x, scale)).collect(),
         rows: grid.rows.iter().map(|y| scale_axis(*y, scale)).collect(),
+        row_labels: std::array::from_fn(|index| labels[index].value),
+        label_boxes: std::array::from_fn(|index| {
+            labels[index].window.map(|rect| scale_rect(rect, scale))
+        }),
         targets: grid
             .targets
             .iter()
@@ -762,14 +946,31 @@ struct Grid {
     wire_y: [Option<i32>; LINE_COLUMNS],
 }
 
-fn find_grid(frame: &Frame, screen: PxRect) -> Option<Grid> {
-    let field = masked(frame, screen, is_slot_bright)?;
-    let columns = field_columns(&field)?;
-    let rows = field_rows(&field, &columns)?;
+/// 列 / 行的投影候选与 `most_even` 的结果 —— **失败时唯一能说清「卡在哪一项」的东西**。
+///
+/// `drag_row3` 的教训：旧实现把「列没找到」和「行没找到」都塌成 `LocateError::Columns`，
+/// 拿到的信息只有「数不到 4 列档位」，而真实原因可能是行投影凑不出等距 4 行。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GridDiagnosis {
+    /// 列投影切出的全部候选中心（x）。
+    pub column_candidates: Vec<i32>,
+    /// 从候选里选出的 4 列；`None` = 凑不出。
+    pub columns: Option<Vec<i32>>,
+    /// 行投影切出的全部候选中心（y）；列没定出来时为空（行投影要用列窗）。
+    pub row_candidates: Vec<i32>,
+    /// 从候选里选出的 4 行；`None` = 凑不出。
+    pub rows: Option<Vec<i32>>,
+}
+
+fn find_grid(frame: &Frame, screen: PxRect) -> Result<Grid, LocateError> {
+    let field = masked(frame, screen, is_slot_bright).ok_or(LocateError::GridColumns)?;
+    let diagnosis = grid_candidates(&field);
+    let columns = diagnosis.columns.ok_or(LocateError::GridColumns)?;
+    let rows = diagnosis.rows.ok_or(LocateError::GridRows)?;
     let wire_y = wire_lines(frame, screen, &columns, &rows);
     let selected = field_selected(frame, &columns, &rows, &wire_y);
     let targets = slot_rects(&columns, &rows);
-    Some(Grid {
+    Ok(Grid {
         columns,
         rows,
         targets,
@@ -778,24 +979,65 @@ fn find_grid(frame: &Frame, screen: PxRect) -> Option<Grid> {
     })
 }
 
-fn field_columns(field: &Masked) -> Option<Vec<i32>> {
+/// 列 / 行投影的候选与选择结果（`find_grid` 与探针共用同一份判定）。
+fn grid_candidates(field: &Masked) -> GridDiagnosis {
+    let column_candidates = columns_of(field);
+    let columns =
+        most_even(&column_candidates, column_min_gap(field)).map(|picked| picked.to_vec());
+    let row_candidates = match &columns {
+        Some(columns) => rows_of(field, columns),
+        None => Vec::new(),
+    };
+    let rows = most_even(&row_candidates, ROW_MIN_GAP).map(|picked| picked.to_vec());
+    GridDiagnosis {
+        column_candidates,
+        columns,
+        row_candidates,
+        rows,
+    }
+}
+
+/// 诊断入口：跑一遍「旋钮 → 屏幕 → 列/行投影」，把中间候选条数一并带出来。
+///
+/// 与 [`locate_line`] 的差别只有一处：**不因为凑不出 4 列 / 4 行而提前退出**，
+/// 而是把候选原样返回，供探针说清「是列没找到，还是行没找到，各有多少条候选」。
+pub fn diagnose_line_grid(frame: &Frame) -> Result<GridDiagnosis, LocateError> {
+    if frame.w < MIN_FRAME_SIDE || frame.h < MIN_FRAME_SIDE {
+        return Err(LocateError::Frame {
+            w: frame.w,
+            h: frame.h,
+        });
+    }
+    let (small, _) = normalize_frame(frame);
+    let frame = &small;
+    let knob = find_knob(frame).ok_or(LocateError::Knob)?;
+    let screen = find_screen(frame, knob).ok_or(LocateError::Screen)?;
+    let field = masked(frame, screen, is_slot_bright).ok_or(LocateError::GridColumns)?;
+    Ok(grid_candidates(&field))
+}
+
+/// 列投影切出的全部候选中心（只按亮度峰切段，不做等距筛选）。
+fn columns_of(field: &Masked) -> Vec<i32> {
     let profile = field.column_counts();
     let tallest = profile.iter().copied().max().unwrap_or(0);
     if tallest == 0 {
-        return None;
+        return Vec::new();
     }
     let threshold = ((tallest as f32) * 0.25).max(6.0) as u32;
-    let centers: Vec<i32> = runs(&profile, threshold)
+    runs(&profile, threshold)
         .into_iter()
         .map(|(start, end)| field.x0 as i32 + (start + end) as i32 / 2)
-        .collect();
-    let min_gap = (field.binary.width() as i32) / 8;
-    most_even(&centers, min_gap).map(|picked| picked.to_vec())
+        .collect()
+}
+
+/// 相邻列中心的最小间距（掩码宽度的 1/8）。
+fn column_min_gap(field: &Masked) -> i32 {
+    (field.binary.width() as i32) / 8
 }
 
 /// 行带只在 4 个列窗内投影：信号线曲线在每列的穿越高度不同，横向求和会被稀释，
 /// 而档位方块在四列里高度一致 —— 于是 4 条等距带自然浮出来。
-fn field_rows(field: &Masked, columns: &[i32]) -> Option<Vec<i32>> {
+fn rows_of(field: &Masked, columns: &[i32]) -> Vec<i32> {
     let half = (field.binary.width() as i32 / 90).max(7);
     let mut profile = vec![0u32; field.binary.height() as usize];
     for &column in columns {
@@ -809,12 +1051,11 @@ fn field_rows(field: &Masked, columns: &[i32]) -> Option<Vec<i32>> {
             }
         }
     }
-    let centers: Vec<i32> = runs(&profile, 5)
+    runs(&profile, 5)
         .into_iter()
         .filter(|(start, end)| within_usize(ROW_RUN, end - start))
         .map(|(start, end)| field.y0 as i32 + (start + end) as i32 / 2)
-        .collect();
-    most_even(&centers, 8).map(|picked| picked.to_vec())
+        .collect()
 }
 
 /// 每列当前档位：优先读**琥珀定位框**，没有框就看**亮白信号线**在该列的穿越高度。
@@ -2390,7 +2631,28 @@ mod tests {
         let mut canvas = machine([None; 4]);
         // 把档位阵整块涂回面板底色：旋钮、屏幕、LED 都在，只剩 4 列数不出来。
         canvas.rect(inset(SCREEN, 12), PANEL);
-        assert_eq!(locate_line(&canvas.frame()), Err(LocateError::Columns));
+        assert_eq!(locate_line(&canvas.frame()), Err(LocateError::GridColumns));
+    }
+
+    #[test]
+    fn a_screen_with_columns_but_no_rows_reports_rows() {
+        // 列在、行数不出来：擦掉档位阵，只在 4 列各画一条 **8px 高**的亮条 ——
+        // 低于 ROW_RUN 下限（10px），行投影一条带都切不出来。
+        // 必须报 GridRows，而不是笼统的「数不到 4 列」。
+        let mut canvas = machine([None; 4]);
+        canvas.rect(CONTENT, PANEL);
+        for column in COLUMNS {
+            canvas.rect(
+                PxRect {
+                    x: column - 4,
+                    y: ROWS[0] - 4,
+                    w: 8,
+                    h: 8,
+                },
+                SLOT,
+            );
+        }
+        assert_eq!(locate_line(&canvas.frame()), Err(LocateError::GridRows));
     }
 
     #[test]
@@ -2415,6 +2677,169 @@ mod tests {
         );
         assert_eq!(most_even(&[10, 400, 900], 40), None, "不足 4 个就没有 4 列");
         assert_eq!(most_even(&[0, 10, 20, 30], 40), None, "间距小于下限要拒绝");
+    }
+
+    #[test]
+    fn a_split_column_peak_is_what_makes_the_evenness_check_give_up() {
+        // `drag_row3` 实测候选（720p，探针 `diagnose_line_grid` 原样输出）：
+        // 亮线横段压在档位条上，把第 2 根切成 417/426/435；真正的 4 列
+        // （285/426/577/728）因此在候选表里**不连续** —— `most_even` 只看连续窗口，
+        // 只能返回 None。这才是 `LocateError::GridColumns` 的真身，不是「屏幕上没有 4 列」。
+        let candidates = [
+            138, 157, 184, 212, 228, 267, 274, 285, 417, 426, 435, 577, 728, 772, 785,
+        ];
+        assert_eq!(most_even(&candidates, 89), None);
+        // 反证：把碎峰还原成一根（417/426/435 → 426）之后，同一份候选立刻定得出 4 列。
+        let repaired = [138, 157, 184, 212, 228, 267, 274, 285, 426, 577, 728, 772, 785];
+        assert_eq!(most_even(&repaired, 89), Some([285, 426, 577, 728]));
+    }
+
+    // ── 行标签（左侧两位 0/1）──
+
+    /// 标签底色：浅蓝绿（实测 180,220,215 一族，均值 ≈205）。
+    const LABEL_BG: [u8; 3] = [180, 220, 215];
+    /// 标签数字的深色墨（实测均值 <100）。
+    const LABEL_INK: [u8; 3] = [30, 45, 45];
+
+    /// 在 `(x, y-20)` 画一个标签块 + 两位数字（`1` 是 8px 竖条、`0` 是 15px 空心环）。
+    ///
+    /// 块宽 54px 铺满读数窗口（窗口 = `columns[0]` 左侧 0.70~1.75 个行距），
+    /// 这样字形两侧都是标签底色 —— 与实机「数字落在浅色块里」同构。
+    fn draw_label(canvas: &mut Canvas, x: i32, y: i32, text: &str) {
+        canvas.rect(
+            PxRect {
+                x,
+                y: y - 20,
+                w: 54,
+                h: 41,
+            },
+            LABEL_BG,
+        );
+        for (index, digit) in text.chars().enumerate() {
+            let left = x + 14 + index as i32 * 19;
+            let stem = PxRect {
+                x: left,
+                y: y - 9,
+                w: 8,
+                h: 19,
+            };
+            if digit == '1' {
+                canvas.rect(stem, LABEL_INK);
+            } else {
+                canvas.ring(
+                    PxRect {
+                        w: 15,
+                        ..stem
+                    },
+                    3,
+                    LABEL_INK,
+                );
+            }
+        }
+    }
+
+    /// 只在 `labels[index]` 有值的行画标签块（`None` = 那一行没有标签）。
+    fn labelled_machine(labels: [Option<&str>; LINE_ROWS]) -> Canvas {
+        let mut canvas = machine([None; LINE_COLUMNS]);
+        for (index, label) in labels.iter().enumerate() {
+            if let Some(text) = label {
+                draw_label(&mut canvas, 12, ROWS[index], text);
+            }
+        }
+        canvas
+    }
+
+    #[test]
+    fn row_labels_are_read_as_binary_digits_from_the_left_column() {
+        let canvas = labelled_machine([Some("10"), Some("11"), Some("01"), Some("00")]);
+        let labels = read_row_labels(&canvas.frame(), &COLUMNS, &ROWS);
+        assert_eq!(
+            labels.map(|label| label.value),
+            [Some(2), Some(3), Some(1), Some(0)],
+            "10→2、11→3、01→1、00→0（自上而下）"
+        );
+        assert!(
+            labels.iter().all(|label| label.window.is_some()),
+            "读数窗口必须随结果一起带出来（探针要画框）"
+        );
+    }
+
+    #[test]
+    fn a_row_without_a_readable_label_stays_none_instead_of_guessing() {
+        let canvas = labelled_machine([Some("10"), None, Some("01"), None]);
+        let labels = read_row_labels(&canvas.frame(), &COLUMNS, &ROWS);
+        assert_eq!(
+            labels.map(|label| label.value),
+            [Some(2), None, Some(1), None],
+            "读不出的行必须是 None，绝不按 10/11/01/00 兜底"
+        );
+    }
+
+    #[test]
+    fn three_glyph_segments_are_rejected_instead_of_picking_two() {
+        // 一行里画三根等宽竖条：段数不是 2 ⇒ 这一行整体判「读不出」。
+        let mut canvas = machine([None; LINE_COLUMNS]);
+        canvas.rect(
+            PxRect {
+                x: 12,
+                y: ROWS[0] - 20,
+                w: 54,
+                h: 41,
+            },
+            LABEL_BG,
+        );
+        for left in [20, 32, 44] {
+            canvas.rect(
+                PxRect {
+                    x: left,
+                    y: ROWS[0] - 9,
+                    w: 8,
+                    h: 19,
+                },
+                LABEL_INK,
+            );
+        }
+        let labels = read_row_labels(&canvas.frame(), &COLUMNS, &ROWS);
+        assert_eq!(
+            labels.map(|label| label.value),
+            [None; LINE_ROWS],
+            "3 段 ⇒ None（宁可读不出，也不许从 3 段里挑 2 段）"
+        );
+    }
+
+    #[test]
+    fn shuffled_labels_are_mapped_by_position_not_by_a_fixed_table() {
+        // 每局标签顺序都会变：这里 `01/00/11/10` 从上往下。
+        let canvas = labelled_machine([Some("01"), Some("00"), Some("11"), Some("10")]);
+        let labels = read_row_labels(&canvas.frame(), &COLUMNS, &ROWS);
+        assert_eq!(
+            labels.map(|label| label.value),
+            [Some(1), Some(0), Some(3), Some(2)],
+            "值必须跟着画面走，不能写死成 10/11/01/00"
+        );
+    }
+
+    #[test]
+    fn locate_line_carries_the_labels_and_their_boxes() {
+        let canvas = labelled_machine([Some("10"), Some("11"), Some("01"), Some("00")]);
+        let line = locate_line(&canvas.frame()).expect("带标签的机台必须仍能定位");
+        assert_eq!(
+            line.row_labels,
+            [Some(2), Some(3), Some(1), Some(0)],
+            "定位结果要把标签值一起带出来"
+        );
+        assert!(
+            line.label_boxes.iter().all(Option::is_some),
+            "4 个标签框都要有：{:?}",
+            line.label_boxes
+        );
+    }
+
+    #[test]
+    fn a_machine_without_labels_reports_all_none() {
+        // 旧合成机台（与实机一样有屏幕/档位，但左侧没有标签块）⇒ 必须全是 None。
+        let line = locate_line(&machine([None; 4]).frame()).expect("几何仍可定位");
+        assert_eq!(line.row_labels, [None; LINE_ROWS], "没标签就是 None，不许猜");
     }
 }
 
