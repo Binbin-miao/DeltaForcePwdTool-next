@@ -186,6 +186,23 @@ const SPACING_SPREAD: f32 = 0.25;
 /// 琥珀定位框的像素数下限（720p 实测 106~183）。
 const MARKER_MIN_PIXELS: u32 = 40;
 
+/// 信号线的亮度下限：RGB 三通道均值 **> 170**。
+///
+/// 旧判据认中灰（`max 62..170`）是错的：四张拖动图实测横线是纯白 `(255,255,255)`。
+/// 面板底色深蓝（约 40）够不到；档位条米黄均值约 190 会过线，靠下面的宽度判据排掉。
+const WIRE_BRIGHT_MEAN: u32 = 170;
+/// 横线在单列窗内至少要连续这么宽（720p 实测 110~170px）。
+///
+/// 档位条只有 10~12px 宽，无论多亮都凑不满这个长度 —— 这是「不与档位条混淆」的判据本体。
+const WIRE_MIN_RUN: u32 = 40;
+/// 横线的厚度区间（720p 实测 4~6px）。面板标题栏 8~16px 由此排掉。
+const WIRE_THICKNESS: (i32, i32) = (2, 6);
+/// 横线可搜范围 = 首行上方 / 末行下方各 `3/4` 个行距。
+///
+/// 实测三档取值：横线最远只停到末行下方 **0.51** 个行距（默认位置），面板标题栏在首行
+/// 上方 **0.93**、面板底边框在末行下方 **0.90** —— 3/4 正落在两者之间，两头都不误收。
+const WIRE_BAND_RATIO: (i32, i32) = (3, 4);
+
 /// 黄键台 4×4 键阵的边长。
 pub const KEY_GRID_SIDE: usize = 4;
 /// 4×4 组合里至少要命中的格数：允许 4 颗键正在发光/被 HUD 挡住。
@@ -311,6 +328,10 @@ pub struct LocatedLine {
     pub targets: Vec<PxRect>,
     /// 每列当前被琥珀框圈住的档位行；`None` = 这一列看不出位置（不猜）。
     pub selected: Vec<Option<usize>>,
+    /// 每列**亮白信号线**的原始 y（`None` = 这一列没找到可信横线）。
+    ///
+    /// 只供调试可视化：`selected` 已经把它映射成档位行，执行层不需要看这个。
+    pub wire_y: [Option<i32>; LINE_COLUMNS],
     /// 右上 LED 数字条（亮字外接框）。
     pub led: PxRect,
     /// 暗红旋钮中心。
@@ -475,6 +496,9 @@ pub fn locate_line(frame: &Frame) -> Result<LocatedLine, LocateError> {
             .map(|rect| scale_rect(*rect, scale))
             .collect(),
         selected: grid.selected,
+        wire_y: grid
+            .wire_y
+            .map(|y| y.map(|value| scale_axis(value, scale))),
     })
 }
 
@@ -735,19 +759,22 @@ struct Grid {
     rows: Vec<i32>,
     targets: Vec<PxRect>,
     selected: Vec<Option<usize>>,
+    wire_y: [Option<i32>; LINE_COLUMNS],
 }
 
 fn find_grid(frame: &Frame, screen: PxRect) -> Option<Grid> {
     let field = masked(frame, screen, is_slot_bright)?;
     let columns = field_columns(&field)?;
     let rows = field_rows(&field, &columns)?;
-    let selected = field_selected(frame, screen, &columns, &rows);
+    let wire_y = wire_lines(frame, screen, &columns, &rows);
+    let selected = field_selected(frame, &columns, &rows, &wire_y);
     let targets = slot_rects(&columns, &rows);
     Some(Grid {
         columns,
         rows,
         targets,
         selected,
+        wire_y,
     })
 }
 
@@ -790,33 +817,27 @@ fn field_rows(field: &Masked, columns: &[i32]) -> Option<Vec<i32>> {
     most_even(&centers, 8).map(|picked| picked.to_vec())
 }
 
-/// 每列当前档位：读**白色信号线**在该列的穿越高度，映射到最近的行。
+/// 每列当前档位：优先读**琥珀定位框**，没有框就看**亮白信号线**在该列的穿越高度。
 ///
-/// 旧实现找「琥珀色定位框」。实机 4 帧全部 `selected = [None; 4]` —— 因为游戏只在
+/// 旧实现只找琥珀框。实机 4 帧全部 `selected = [None; 4]` —— 因为游戏只在
 /// **当前受控的那一列**画琥珀框，其余三列根本没有框，于是「每列现在是什么值」读不出来。
 ///
-/// 而横向那条**白色信号线**贯穿全屏，在每一列都有一个明确高度 —— 那个高度就是这一列的值。
-/// 判据（与字体/缩放无关）：
-/// - 窗口内某一行的白像素要占满窗口宽度的一半以上（信号线是横贯的粗线）；
-/// - 档位方条只有十来像素宽，凑不满这个占比，自然被排除。
+/// 而那条**亮白折线**逐列分段，第 N 段的 y 就是第 N 列的值 —— 能补上框的空白。
+/// 两条通道的顺序不能反：受控列的琥珀框是「这一列此刻被选中」的直接证据，比线的高度更权威；
+/// 而线在未对齐时可能落在两档之间（读成 `None`），正好由框兜住。
 fn field_selected(
     frame: &Frame,
-    screen: PxRect,
     columns: &[i32],
     rows: &[i32],
+    wire_y: &[Option<i32>],
 ) -> Vec<Option<usize>> {
-    // 两条独立通道，取**先有证据的那个**：
-    // 1. **琥珀定位框**（旧通道）：游戏只为「当前受控的那一列」画框，其余列恒空；
-    // 2. **白色/中灰信号线**（新通道）：贯穿全屏，每一列都有高度 —— 能补上 1 的空白。
-    //
-    // 顺序不能反：受控列的琥珀框是「这一列此刻被选中」的直接证据，比线的高度更权威；
-    // 而线在未对齐时可能落在两档之间（读成 None），正好由框兜住。
     let amber = amber_selected(frame, columns, rows);
-    let wire = wire_selected(frame, screen, columns, rows);
     amber
         .into_iter()
-        .zip(wire)
-        .map(|(from_amber, from_wire)| from_amber.or(from_wire))
+        .zip(wire_y.iter().copied())
+        .map(|(from_amber, from_wire)| {
+            from_amber.or(from_wire.and_then(|y| nearest_row(rows, y)))
+        })
         .collect()
 }
 
@@ -853,78 +874,120 @@ fn amber_selected(frame: &Frame, columns: &[i32], rows: &[i32]) -> Vec<Option<us
         .collect()
 }
 
-/// 通道二：从**信号线**在各列的穿越高度推出该列档位。
-fn wire_selected(
+/// 通道二：每列**亮白信号线**的 y（列窗内水平亮段的中心）。
+///
+/// 折线是**逐列分段**的：第 N 段横在第 N 列窗内，y = 这一列的值。所以按列独立扫，
+/// 不能整屏一条线读下来。
+fn wire_lines(
     frame: &Frame,
     screen: PxRect,
     columns: &[i32],
     rows: &[i32],
-) -> Vec<Option<usize>> {
-    let (Some(&first), Some(&last)) = (rows.first(), rows.last()) else {
-        return vec![None; columns.len()];
+) -> [Option<i32>; LINE_COLUMNS] {
+    let mut wires = [None; LINE_COLUMNS];
+    let (Some(half), Some(band)) = (column_half_pitch(columns), wire_band(rows)) else {
+        return wires;
     };
-    let gap = row_gap_of(rows);
-    // **信号线不是白色**：实测亮度只有 70~100（灰），而档位方条是 220。
-    // 用找档位条的那套 `is_slot_bright`（≥150）会把信号线整条漏掉。
-    let Some(wire) = masked(frame, screen, is_signal_wire) else {
-        return vec![None; columns.len()];
-    };
-    let half = (wire.binary.width() as i32 / 40).max(20);
-    // 只留 4 行各自 ±1/2 行距：再宽一点，屏幕底部那条「自动破译进行中」的亮横线
-    // （实测 y≈688，距最后一行 52px）就会被当成信号线，把整列读成最后一行。
-    let y_min = first - gap / 2 - wire.y0 as i32;
-    let y_max = last + gap / 2 - wire.y0 as i32;
-    columns
-        .iter()
-        .map(|&column| {
-            line_row_at(&wire, column, half, y_min, y_max).and_then(|y| nearest_row(rows, y))
-        })
-        .collect()
+    for (slot, &column) in wires.iter_mut().zip(columns) {
+        *slot = wire_y_at(frame, screen, column, half, band);
+    }
+    wires
 }
 
-/// 信号线的颜色：**中灰**（亮度 62~170、接近无彩）。
+/// 列窗半宽 = 相邻列中心**最小**间距的一半（保证不伸进邻居的档位条）。
+fn column_half_pitch(columns: &[i32]) -> Option<i32> {
+    let pitch = columns.windows(2).map(|pair| pair[1] - pair[0]).min()?;
+    (pitch > 1).then_some(pitch / 2)
+}
+
+/// 横线的可搜区间：首行上方、末行下方各 [`WIRE_BAND_RATIO`] 个行距。
 ///
-/// 屏幕背景是深蓝（亮度约 40），档位方条是亮白（约 220），只有信号线落在中间这一段。
-fn is_signal_wire(color: [u8; 3]) -> bool {
-    let (max, delta) = brightness(color);
-    (62..=170).contains(&max) && delta <= 48
+/// `(上沿, 下沿)` 都是闭区间帧坐标。
+fn wire_band(rows: &[i32]) -> Option<(i32, i32)> {
+    let (first, last) = (*rows.first()?, *rows.last()?);
+    let pad = row_gap_of(rows) * WIRE_BAND_RATIO.0 / WIRE_BAND_RATIO.1;
+    Some((first - pad, last + pad))
 }
 
-/// 信号线在 `column ± half` 这个窄窗里的行位置（掩码局部坐标 → 帧坐标）。
-fn line_row_at(field: &Masked, column: i32, half: i32, y_min: i32, y_max: i32) -> Option<i32> {
-    let width = field.binary.width();
-    let height = field.binary.height();
-    let start = (column - field.x0 as i32 - half).max(0) as u32;
-    let end = ((column - field.x0 as i32 + half + 1).max(0) as u32).min(width);
-    if start >= end || height == 0 {
+/// 单列横线 y：列窗内取「厚度像横线、连续段最长」的那条带，返回带中心。
+fn wire_y_at(
+    frame: &Frame,
+    screen: PxRect,
+    column: i32,
+    half: i32,
+    band: (i32, i32),
+) -> Option<i32> {
+    let left = (column - half).max(screen.x);
+    let right = (column + half).min(screen.right());
+    let top = band.0.max(screen.y);
+    let bottom = band.1.min(screen.bottom());
+    if right <= left || bottom <= top {
         return None;
     }
-    let span = end - start;
-    let from = y_min.max(0) as u32;
-    let to = (y_max.max(0) as u32).min(height);
-    if from >= to {
-        return None;
-    }
-    let mut best: Option<(u32, u32)> = None;
-    for y in from..to {
-        let mut count = 0u32;
-        for x in start..end {
-            if field.binary.get(x, y) {
-                count += 1;
+    bright_bands(frame, left, right, top, bottom)
+        .into_iter()
+        .filter(|&(start, end, _)| is_wire_thickness(end - start + 1))
+        .max_by_key(|&(_, _, run)| run)
+        .map(|(start, end, _)| (start + end + 1) / 2)
+}
+
+/// `[left,right) × [top,bottom)` 里「单行最长连续亮段 ≥ [`WIRE_MIN_RUN`]」的纵向带。
+///
+/// 返回 `(上沿, 下沿, 带内最长连续亮段)`；上/下沿都是闭区间帧坐标。
+fn bright_bands(frame: &Frame, left: i32, right: i32, top: i32, bottom: i32) -> Vec<(i32, i32, u32)> {
+    let mut bands = Vec::new();
+    let mut current: Option<(i32, i32, u32)> = None;
+    for y in top..bottom {
+        let run = longest_bright_run(frame, left, right, y);
+        if run < WIRE_MIN_RUN {
+            if let Some(band) = current.take() {
+                bands.push(band);
             }
+            continue;
         }
-        if best.is_none_or(|(best_count, _)| count > best_count) {
-            best = Some((count, y));
-        }
+        current = Some(match current {
+            Some((start, _, best)) => (start, y, best.max(run)),
+            None => (y, y, run),
+        });
     }
-    // 必须占满窗口一半以上：横贯的粗线才满足，档位方条/波形细线不满足。
-    best.filter(|&(count, _)| count * 2 >= span)
-        .map(|(_, y)| field.y0 as i32 + y as i32)
+    bands.extend(current);
+    bands
 }
 
-/// 离 `y` 最近的档位行；超过行距的 2/3 就算「对不上任何一行」（不猜）。
+/// 该行在 `[left,right)` 内最长的连续亮段长度。
+fn longest_bright_run(frame: &Frame, left: i32, right: i32, y: i32) -> u32 {
+    let (mut best, mut run) = (0, 0);
+    for x in left..right {
+        if is_wire_bright(frame.pixel(x as u32, y as u32)) {
+            run += 1;
+            best = best.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    best
+}
+
+/// 信号线的颜色：**亮白**（三通道均值 > [`WIRE_BRIGHT_MEAN`]）。
+///
+/// 旧判据认的是**中灰**（`max 62..170`），实机横线根本不是灰色 —— 四张拖动图实测
+/// `(255,255,255)` 一族，整条被判据挡在门外，`selected` 于是读的是背景噪声。
+fn is_wire_bright([b, g, r]: [u8; 3]) -> bool {
+    let mean = (u32::from(b) + u32::from(g) + u32::from(r)) / 3;
+    mean > WIRE_BRIGHT_MEAN
+}
+
+/// 厚度是否为横线：实测 4~6px；面板标题栏 8~16px 由此排掉。
+fn is_wire_thickness(thickness: i32) -> bool {
+    (WIRE_THICKNESS.0..=WIRE_THICKNESS.1).contains(&thickness)
+}
+
+/// 离 `y` 最近的档位行；超过行距的 **1/3** 就算「对不上任何一行」（不猜）。
+///
+/// 容差是 1/3 而不是 2/3：横线停在两档之间是「还没到位」的合法状态。
+/// 旧容差 2/3 会把「差 32px、最近档位 487」的静止位置误读成最末一行。
 fn nearest_row(rows: &[i32], y: i32) -> Option<usize> {
-    let tolerance = (row_gap_of(rows) * 2 / 3).max(6);
+    let tolerance = (row_gap_of(rows) / 3).max(4);
     rows.iter()
         .enumerate()
         .map(|(index, &row)| (index, (row - y).abs()))
@@ -1946,8 +2009,8 @@ pub(crate) mod fixture {
     pub(crate) const PANEL: [u8; 3] = [10, 55, 60];
     /// 档位方块亮面：冷白青（V≈225、低饱和）。
     pub(crate) const SLOT: [u8; 3] = [190, 225, 225];
-    /// 信号线的中灰：实机实测亮度 70~100，比档位方条（220）暗得多。
-    pub(crate) const WIRE: [u8; 3] = [138, 136, 133];
+    /// 信号线的**亮白**：实机实测纯白一族（三通道均值 > 170），比档位条更亮而非更暗。
+    pub(crate) const WIRE: [u8; 3] = [236, 238, 240];
     /// 选中档位的琥珀定位框。
     pub(crate) const AMBER: [u8; 3] = [250, 210, 60];
     /// LED 面板底色：近黑。
@@ -2066,6 +2129,21 @@ pub(crate) mod fixture {
         }
     }
 
+    /// 信号线的一段：亮白、4px 厚（实机 4~6px），横贯整列窗。
+    pub(crate) fn wire_rect(column: i32, y: i32) -> PxRect {
+        let half = column_half_pitch_of_fixture();
+        PxRect {
+            x: column - half,
+            y: y - 2,
+            w: half * 2,
+            h: 4,
+        }
+    }
+
+    fn column_half_pitch_of_fixture() -> i32 {
+        ((COLUMNS[1] - COLUMNS[0]) / 2).max(20)
+    }
+
     /// 完整信号线台机台：金属面 + 青色 CRT + 4×4 档位阵 + LED 条 + 暗红旋钮。
     pub(crate) fn machine(selected: [Option<usize>; LINE_COLUMNS]) -> Canvas {
         let mut canvas = Canvas::new(MACHINE);
@@ -2091,24 +2169,14 @@ pub(crate) mod fixture {
                 );
             }
         }
-        // 信号线：**中灰**（实机亮度 70~100，远低于档位方条的 220），
-        // 在每列的高度 = 该列当前档位。四列可以不同高，所以按列画成阶梯。
+        // 信号线：**亮白折线**，在每列的高度 = 该列当前档位。四列可以不同高，所以按列画成阶梯。
         // 少了这条线，「每列现在是什么值」就没有观测通道（旧实现靠琥珀框，实机只有
         // 受控那一列有框，其余恒为 None）。
-        let half = ((COLUMNS[1] - COLUMNS[0]) / 2).max(8);
         for (index, row) in selected.iter().enumerate() {
             let Some(row) = row else {
                 continue;
             };
-            canvas.rect(
-                PxRect {
-                    x: COLUMNS[index] - half,
-                    y: ROWS[*row] - 4,
-                    w: half * 2,
-                    h: 8,
-                },
-                WIRE,
-            );
+            canvas.rect(wire_rect(COLUMNS[index], ROWS[*row]), WIRE);
         }
         canvas.rect(LED_PANEL, LED_DARK);
         for index in 0..11 {
@@ -2137,6 +2205,17 @@ pub(crate) mod fixture {
     /// 一帧完整的信号线台（场景判别与执行层测试共用）。
     pub(crate) fn machine_frame(selected: [Option<usize>; LINE_COLUMNS]) -> Frame {
         machine(selected).frame()
+    }
+
+    /// 横线画在**指定 y**（用于「停在两档之间」「粗亮带冒充横线」这类边界）。
+    pub(crate) fn machine_with_wire_ys(wire_ys: [Option<i32>; LINE_COLUMNS]) -> Canvas {
+        let mut canvas = machine([None; LINE_COLUMNS]);
+        for (index, y) in wire_ys.iter().enumerate() {
+            if let Some(y) = y {
+                canvas.rect(wire_rect(COLUMNS[index], *y), WIRE);
+            }
+        }
+        canvas
     }
 }
 
@@ -2172,6 +2251,88 @@ mod tests {
             "数字条是长条：{:?}",
             line.led
         );
+        assert_eq!(
+            line.wire_y,
+            [Some(ROWS[0]), Some(ROWS[1]), Some(ROWS[2]), Some(ROWS[3])],
+            "每列横线 y = 该列档位行"
+        );
+    }
+
+    #[test]
+    fn wire_height_alone_is_enough_when_no_column_has_an_amber_frame() {
+        let frame =
+            machine_with_wire_ys([Some(ROWS[3]), Some(ROWS[1]), Some(ROWS[0]), Some(ROWS[2])])
+                .frame();
+        let line = locate_line(&frame).expect("没有任何琥珀框时，横线高度就是唯一观测通道");
+
+        assert_eq!(
+            line.wire_y,
+            [Some(ROWS[3]), Some(ROWS[1]), Some(ROWS[0]), Some(ROWS[2])],
+            "亮白横线的 y 必须逐列读出来"
+        );
+        assert_eq!(
+            line.selected,
+            vec![Some(3), Some(1), Some(0), Some(2)],
+            "横线高度映射回档位行"
+        );
+    }
+
+    #[test]
+    fn wire_between_two_rows_reads_as_no_selection_but_keeps_its_height() {
+        // 行距 50 ⇒ 容差 1/3 = 16px；差 20px 属于「还没到位」。
+        let between = ROWS[1] + 20;
+        let frame = machine_with_wire_ys([
+            Some(ROWS[0]),
+            Some(between),
+            Some(ROWS[2]),
+            Some(ROWS[3]),
+        ])
+        .frame();
+        let line = locate_line(&frame).expect("几何仍可定位");
+
+        assert_eq!(line.wire_y[1], Some(between), "横线本身必须看得见");
+        assert_eq!(
+            line.selected[1], None,
+            "差 20px > 容差 16px ⇒ 未到位，绝不许四舍五入猜一行"
+        );
+    }
+
+    #[test]
+    fn thick_bright_band_is_not_mistaken_for_the_wire() {
+        // 面板里的粗亮带：8px（> 横线厚度上限 6）、又矮于 ROW_RUN 下限，两层判据都该挡掉。
+        let mut canvas = machine_with_wire_ys([
+            Some(ROWS[0]),
+            Some(ROWS[1]),
+            Some(ROWS[2]),
+            Some(ROWS[3]),
+        ]);
+        canvas.rect(
+            PxRect {
+                x: CONTENT.x,
+                y: (ROWS[1] + ROWS[2]) / 2 - 4,
+                w: CONTENT.w,
+                h: 8,
+            },
+            WIRE,
+        );
+
+        let line = locate_line(&canvas.frame()).expect("粗亮带不该破坏定位");
+        assert_eq!(
+            line.wire_y,
+            [Some(ROWS[0]), Some(ROWS[1]), Some(ROWS[2]), Some(ROWS[3])],
+            "8px 粗亮带必须被厚度判据挡掉，不许抢走横线的位置"
+        );
+    }
+
+    #[test]
+    fn wire_band_keeps_the_default_position_but_drops_the_panel_border() {
+        // 实测三个比例：横线默认位置在末行下方 0.51 行距、面板底边框在 0.90、标题栏在 -0.93。
+        let rows = [100, 200, 300, 400];
+        let (top, bottom) = wire_band(&rows).expect("4 行必有可搜带");
+
+        assert_eq!((top, bottom), (25, 475), "首行上方与末行下方各 0.75 个行距");
+        assert!(400 + 51 <= bottom, "横线默认位置（0.51 行距）必须收得住");
+        assert!(400 + 90 > bottom, "面板底边框（0.90 行距）必须排得掉");
     }
 
     #[test]
