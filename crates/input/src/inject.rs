@@ -40,17 +40,110 @@ pub enum Injected {
     Key { scancode: u16, up: bool },
 }
 
-/// 进程级输入事件总计数（t8 用它断言「完成/中止后零新增输入」）。
-static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// 已投递（或已记录）的输入事件总数。
-pub fn event_count() -> u64 {
-    EVENT_COUNTER.load(Ordering::SeqCst)
+/// 输入事件计数器实例。
+///
+/// 进程级默认实例是 [`GLOBAL_COUNTER`]：生产路径（`click` / `key_space` / `Drag`）从不绑定，
+/// 一律记到它上面，行为与改造前的裸 `static AtomicU64` 完全一致。
+///
+/// 之所以做成实例：`cargo test` 默认并行，同一测试二进制里有多条用例会真的走 `emit`
+/// （`drag.rs` 的录制用例、`inject.rs` 的录制用例）。它们共享全局计数器时，
+/// 「绝对次数」断言会被邻居用例的并发自增污染（实测抖动到 79 vs 3）。
+#[derive(Debug, Default)]
+pub struct Counter {
+    count: AtomicU64,
 }
 
-/// 把基线归零，便于上层 `let baseline = event_count(); ... assert_eq!(event_count() - baseline, 0)`。
+impl Counter {
+    pub const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+        }
+    }
+
+    /// 本实例累计的事件数。
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    /// 把本实例归零。
+    pub fn reset(&self) {
+        self.count.store(0, Ordering::SeqCst);
+    }
+
+    fn bump(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 让**本线程**后续的 `emit` 全部记到 `self` 上，返回的守卫在 drop 时恢复绑定前的状态。
+    ///
+    /// 只编译进测试：生产路径没有任何调用者，绑定通道也就不进入发布产物。
+    /// 绑定用 [`Arc`] 保活，守卫活着期间实例不会被回收，因此不会留下悬挂指针；
+    /// 守卫本身是 `!Send`（见 [`CounterBinding`]），跨线程 drop 会在编译期被拦下。
+    #[cfg(test)]
+    pub fn bind(self: &Arc<Self>) -> CounterBinding {
+        let previous = BOUND_COUNTER.with(|slot| slot.borrow_mut().replace(Arc::clone(self)));
+        CounterBinding {
+            previous,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+/// [`Counter::bind`] 的 RAII 守卫：drop 时把本线程的绑定回滚到绑定前的状态（可嵌套）。
+///
+/// `_not_send` 让它 `!Send`：绑定是线程局部状态，在别的线程 drop 只会回滚错线程。
+#[cfg(test)]
+#[derive(Debug)]
+pub struct CounterBinding {
+    previous: Option<Arc<Counter>>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(test)]
+impl Drop for CounterBinding {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        BOUND_COUNTER.with(|slot| {
+            *slot.borrow_mut() = previous;
+        });
+    }
+}
+
+/// 进程级输入事件总计数（t8 用它断言「完成/中止后零新增输入」）。
+static GLOBAL_COUNTER: Counter = Counter::new();
+
+#[cfg(test)]
+thread_local! {
+    /// 本线程显式绑定的计数器；`None` 表示回落到 [`GLOBAL_COUNTER`]。
+    static BOUND_COUNTER: std::cell::RefCell<Option<Arc<Counter>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 记一次事件：本线程有绑定就记到绑定实例，否则记到进程级全局实例。
+///
+/// `Sink::emit` 与 `inject()` 两条自增路径**都**必须走这里，否则录制路径与点击路径
+/// 会记到不同地方，私有计数器就漏账了。绑定分支只在测试构建里存在。
+fn charge() {
+    #[cfg(test)]
+    {
+        if let Some(counter) = BOUND_COUNTER.with(|slot| slot.borrow().clone()) {
+            counter.bump();
+            return;
+        }
+    }
+    GLOBAL_COUNTER.bump();
+}
+
+/// 已投递（或已记录）的输入事件总数。
+///
+/// **只读进程级全局实例**，不看线程绑定：生产从 worker 线程读、`emit` 可能在别的线程写，
+/// 一旦跟着线程走就会读到 0。
+pub fn event_count() -> u64 {
+    GLOBAL_COUNTER.count()
+}
+
+/// 把进程级全局基线归零，便于上层 `let baseline = event_count(); ... assert_eq!(event_count() - baseline, 0)`。
 pub fn reset_event_count() {
-    EVENT_COUNTER.store(0, Ordering::SeqCst);
+    GLOBAL_COUNTER.reset();
 }
 
 /// 录制句柄：与 [`crate::Drag`] 共享同一份事件日志，`Drag` 被 `Drop` 之后仍可读取。
@@ -86,7 +179,7 @@ pub(crate) enum Sink {
 
 impl Sink {
     pub(crate) fn emit(&self, event: Injected) -> Result<(), InputError> {
-        EVENT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        charge();
         match self {
             Self::Live => send(&event),
             Self::Record(handle) => {
@@ -171,7 +264,7 @@ pub fn split_steps(dx: i32, dy: i32) -> Vec<(i32, i32)> {
 
 /// 直接投递一个事件并计入计数器（点击与数字键路径用；拖动走 `Sink`）。
 pub(crate) fn inject(event: &Injected) -> Result<(), InputError> {
-    EVENT_COUNTER.fetch_add(1, Ordering::SeqCst);
+    charge();
     send(event)
 }
 

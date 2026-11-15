@@ -67,25 +67,61 @@ pub fn click_all(points: &[PxPoint]) -> Result<(), InputError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inject::{Counter, Sink};
+    use std::sync::Arc;
 
     /// 事件计数是 t8 断言「斜纹命中后零新增输入」的唯一依据（spec §4 操作台门禁）。
     ///
-    /// 全进程共享一个计数器，两个断言必须写在**同一个**用例里：拆成两个并行用例会
-    /// 互相 reset（本用例就踩过一次这个坑）。
+    /// 计数器按实例记账：本用例持一个私有 [`Counter`] 并在本线程绑定它，于是同进程里
+    /// 另外 7 条会 emit 的用例（`drag.rs` / `inject.rs`）即使在 cargo 并行调度下交错，
+    /// 也只记到全局实例，不会污染这里的绝对次数断言。
     #[test]
     fn event_counter_counts_every_emitted_event_and_can_be_reset() {
-        reset_event_count();
+        let counter = Arc::new(Counter::new());
+        let _binding = counter.bind();
+        counter.reset();
         let (mut drag, _log) = Drag::recording();
         drag.begin(PxPoint { x: 10, y: 10 }).expect("begin");
         drag.step(0, 20).expect("step");
         // begin = 定位 1 + 按下 1，step = 1。
-        assert_eq!(event_count(), 3, "每个事件都必须计数一次");
+        assert_eq!(counter.count(), 3, "每个事件都必须计数一次");
 
-        reset_event_count();
-        let baseline = event_count();
+        counter.reset();
+        let baseline = counter.count();
         drag.end().expect("end");
         assert_eq!(baseline, 0, "reset 后基线必须归零");
-        assert_eq!(event_count(), baseline + 1, "end 之后必须还有计数");
+        assert_eq!(counter.count(), baseline + 1, "end 之后必须还有计数");
+    }
+
+    /// 实例化隔离的可执行证据：两个线程各绑各的计数器、各记不同的次数，互不串账。
+    ///
+    /// 把 `charge()` 改回无条件写全局，这条会读到 `[0, 0]` 而不是 `[32, 64]`，必然失败。
+    #[test]
+    fn bound_counters_are_isolated_between_threads() {
+        /// 单线程绑定后记 `rounds` 次事件，返回本实例读到的次数。
+        fn emit_bound(counter: Arc<Counter>, rounds: u64, tag: i32) -> std::thread::JoinHandle<u64> {
+            std::thread::spawn(move || {
+                let _binding = counter.bind();
+                let sink = Sink::Record(RecordHandle::default());
+                for _ in 0..rounds {
+                    sink.emit(Injected::Move { dx: 1, dy: tag })
+                        .expect("记录");
+                }
+                counter.count()
+            })
+        }
+
+        let first = Arc::new(Counter::new());
+        let second = Arc::new(Counter::new());
+        let first_seen = emit_bound(Arc::clone(&first), 32, 0).join().expect("线程一");
+        let second_seen = emit_bound(Arc::clone(&second), 64, 1)
+            .join()
+            .expect("线程二");
+
+        assert_eq!(first_seen, 32, "第一个实例只该记自己线程的 32 次");
+        assert_eq!(second_seen, 64, "第二个实例只该记自己线程的 64 次");
+        assert_eq!(first.count(), 32, "串账：第一个实例被邻居污染");
+        assert_eq!(second.count(), 64, "串账：第二个实例被邻居污染");
     }
 
     #[test]
