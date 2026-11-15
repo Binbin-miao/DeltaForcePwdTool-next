@@ -51,6 +51,19 @@ const CELLS: usize = GRID_SIDE * GRID_SIDE;
 const TOTAL_STAGES: usize = 5;
 /// 单格高亮像素数下限（滤掉反光与描边）。
 const MIN_GLOW_PIXELS: u32 = 40;
+/// 同一帧内相邻两次点击之间的间隔（毫秒）。
+///
+/// 用户原话：「那一下按错爆红是我操作的，因为按错之后会重新显示黄色亮块，我猜测是第一块
+/// 因为操作延迟失误了，**增加个 0.1 秒延迟试试**」。
+///
+/// 逐 0.05s 量出的时间线（用户录屏 `202611160527`）：
+/// - `6.25~6.40s` 4 个勾在 **0.15 秒**内连闪 —— 程序一帧把 4 个 `observed` 全点了；
+/// - `9.60s` 第 5 格变红叉（用户自己按的）→ `10.05s` 清空重来；
+/// - `11.40~11.65s` 5 个勾在 **0.25 秒**内全出（5 个全点，成功）。
+///
+/// 同一帧批量注入 4~5 次点击、间隔 ≈ 0 时，游戏会把「同一瞬间的多击」当成一次或干脆错过
+/// 已改亮的下一块。留 100ms 让游戏先把黄块推上来，再点下一颗。
+const KEY_CLICK_GAP_MS: u64 = 100;
 /// 单格进度勾选的绿色像素数下限（实测 ✓ 约 100~170px，留余量）。
 const MIN_CHECK_PIXELS: u32 = 30;
 /// 单颗键「已变绿勾」的像素数下限（与 `delta_scene::locate` 的 `SLOT_CHECK_PIXELS` 同源同值）。
@@ -378,7 +391,8 @@ impl State {
         // 立刻切回更严的正常档。误判路径通常「什么都读不全」⇒ 落进退化档；
         // 真面板一定读得到进度格 ⇒ 正常档。分层是为了不误杀「真面板但进度格读不清」。
         let cap = event_cap(checked);
-        for (index, at) in targets {
+        let total = targets.len();
+        for (position, (index, at)) in targets.into_iter().enumerate() {
             if let Err(error) = pointer.click(at) {
                 return Some(aborted(
                     pointer.event_count(),
@@ -393,6 +407,10 @@ impl State {
             // 不能等这一帧把剩余黄键全点完。
             if over_input_cap(pointer.event_count(), event_baseline, cap) {
                 return Some(aborted(pointer.event_count(), over_cap_reason(cap)));
+            }
+            // 后面还有待点目标才留出间隔：最后一个点完立刻进下一帧看进度（省 100ms）。
+            if position + 1 < total {
+                clock.sleep_ms(KEY_CLICK_GAP_MS);
             }
         }
         self.baseline = checked.unwrap_or(0);
@@ -1449,6 +1467,80 @@ mod tests {
         fn sleep_ms(&mut self, ms: u64) {
             self.now += ms;
         }
+    }
+
+    /// 把每一次 `sleep_ms` 的时长都记下来的时钟（用来量「一帧内点了几次、隔了多久」）。
+    struct RecordingClock {
+        now: u64,
+        sleeps: Vec<u64>,
+    }
+
+    impl Clock for RecordingClock {
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+
+        fn sleep_ms(&mut self, ms: u64) {
+            self.sleeps.push(ms);
+            self.now += ms;
+        }
+    }
+
+    // ── 同一帧内的点击间隔（用户原话：按错是第一块因为操作延迟失误，加 0.1 秒试试）──
+
+    #[test]
+    fn three_targets_in_one_frame_are_spaced_by_two_click_gaps() {
+        let frame = panel_frame(&[0, 5, 10], true);
+        let mut state = State::default();
+        let mut pointer = CountingPointer {
+            per_click: 1,
+            emitted: 0,
+        };
+        let mut clock = RecordingClock {
+            now: 0,
+            sleeps: Vec::new(),
+        };
+
+        assert!(
+            state
+                .step(&frame, 1.0, &mut pointer, &mut clock, 0)
+                .is_none(),
+            "三颗亮键本帧点完还得等回应，不该收尾"
+        );
+        assert_eq!(state.clicks, 3, "三颗亮键本帧全点");
+        assert_eq!(state.pending, vec![0, 5, 10], "账本与已发点击必须一致");
+        assert_eq!(
+            clock.sleeps,
+            vec![KEY_CLICK_GAP_MS, KEY_CLICK_GAP_MS],
+            "第 1→2、2→3 之间各睡一次；最后一个目标后不睡（早点进下一帧看进度）"
+        );
+    }
+
+    #[test]
+    fn a_single_target_in_one_frame_never_waits() {
+        let frame = panel_frame(&[7], true);
+        let mut state = State::default();
+        let mut pointer = CountingPointer {
+            per_click: 1,
+            emitted: 0,
+        };
+        let mut clock = RecordingClock {
+            now: 0,
+            sleeps: Vec::new(),
+        };
+
+        assert!(
+            state
+                .step(&frame, 1.0, &mut pointer, &mut clock, 0)
+                .is_none(),
+            "单颗亮键本帧点完还得等回应，不该收尾"
+        );
+        assert_eq!(state.clicks, 1);
+        assert!(
+            clock.sleeps.is_empty(),
+            "只有一个目标时不许无谓等待：{:?}",
+            clock.sleeps
+        );
     }
 
     fn play_keys(frame: &Frame, per_click: u64, az3: &delta_config::PxAz3) -> Az3Outcome {

@@ -555,6 +555,11 @@ fn classify_poll_frame(
             // 远严于一级 `detect`（后者会把走廊判成 `Console`），而且分支只可能走到
             // 「模板已判拒绝 **且** 已等满 QUICK_REJECT_MS」之后 —— 任何模板能命中的成功路径
             // 都在上面 `Target` 分支就返回了，兜底不覆盖、不改变它们。
+            // **为什么这里不再补一次 `locate_pins` 预检**：`az3_variant` 判 `SafePins` 的
+            // 唯一依据就是 `looks_like_pins` ⇒ `locate_pins(frame).is_ok_and(|p| pairs >= 2)`
+            // （`scene/src/lib.rs` 的 `looks_like_pins`）。同一帧、同一个纯函数，二次调用
+            // 不可能给出不同的结论 —— 加一道 `Err` 分支只会得到一段永远走不到的死代码。
+            // 轨道真实性（亮度证据）由 `locate_pins` 内部统一负责，改一处两处都生效。
             match delta_scene::az3_variant(frame, view) {
                 delta_scene::Az3Kind::SafePins | delta_scene::Az3Kind::SafeTiming => {
                     PollVerdict::Ready(None)

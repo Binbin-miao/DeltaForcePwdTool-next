@@ -629,6 +629,31 @@ mod tests {
         assert_eq!(pointer.spaces, 0);
     }
 
+    #[test]
+    fn safe_timing_stops_when_three_presses_never_move_the_cursor_off_center() {
+        // 误判界面：带是绿的、但「游标」每次都只在中格和读不到之间闪（游标提取在假带上必然抖）。
+        // 真面板每按一次游标必推进 ⇒ 从没见过「离开中间格」就是假带，连按 3 次后立刻停手。
+        // 反例：不判「离开」⇒ 会按满 5 次（空格 = 跳跃）才 Done ⇒ 红。
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            frames.push(timing_frame(2)); // 中格
+            frames.push(paint_frame(
+                TARGET_W,
+                TARGET_H,
+                &[(rect(0, 20, TARGET_W as i32, 40), BAND_GREEN)], // 只有带、没有游标
+            ));
+        }
+        let mut screen = ScriptScreen::new(frames);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::SafeTiming, &mut screen, &mut pointer);
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(pointer.spaces, 3, "第 3 次按键后必须停手：{outcome:?}");
+        assert!(
+            abort_reason(&outcome).contains("疑似误判"),
+            "文案要点明「疑似误判界面」：{outcome:?}"
+        );
+    }
+
     // ── 任务保险（每帧量几何：轨道 + 目标方块 + 游标）──
 
     #[test]
@@ -691,14 +716,18 @@ mod tests {
 
     #[test]
     fn safe_pins_reports_unpaired_tracks_instead_of_guessing() {
-        // 只有游标、没有目标方块 ⇒ 一对也配不出来 ⇒ 一次都不按，收尾文案要说清「未配对」。
+        // 只有目标白块、游标还没出来 ⇒ 一对也配不出来 ⇒ 一次都不按，收尾文案要说清「未配对」。
         // 反例：配不上就瞎按，或把「没配对」当成「已完成」。
-        let cursors_only: Vec<(PxRect, [u8; 3])> = PIN_TARGET_XS
+        //
+        // 用白块（而不是「只有游标」）造这个局面：轨道必须有亮线证据
+        // （`PIN_TRACK_BRIGHT_MIN`），5 根 5px 宽的细游标只有 3.3% 亮像素，量不出轨道；
+        // 而 5 块 10px 宽的白块有 6.7%，正是实机「板在、游标还没滑过来」的样子。
+        let targets_only: Vec<(PxRect, [u8; 3])> = PIN_TARGET_XS
             .iter()
-            .map(|&cx| (rect(cx - 2, 182, 5, 27), WHITE))
+            .map(|&cx| (rect(cx - 5, 187, 10, 17), WHITE))
             .collect();
         let mut shapes = vec![(PINS_TRACK, TRACK_GREY)];
-        shapes.extend(cursors_only);
+        shapes.extend(targets_only);
         let mut screen = ScriptScreen::new(vec![paint_frame(PINS_W, PINS_H, &shapes)]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
@@ -721,6 +750,53 @@ mod tests {
         assert!(
             abort_reason(&outcome).contains("轨道"),
             "文案要点明「没找到轨道」：{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn safe_pins_stops_after_five_presses_when_no_slot_ever_locks() {
+        // 误判界面：每帧都有 1 对「对齐」，但指示条一格都不亮（真面板每按一次必然锁一格）。
+        // 空格的游戏内语义是跳跃 —— 必须在第 5 次按键后**立刻**停手，而不是按到超时。
+        // 反例：没有护栏一 ⇒ 一直按到 frame_budget（实测同款日志按了 17 / 48 次）⇒ 红。
+        let offsets: [&[i32]; 6] = [
+            &[40, 40, 40, 40, 40], // 全部先离开容差区（预武装）
+            &[0, 40, 40, 40, 40],  // 第 1 次
+            &[40, 0, 40, 40, 40],  // 第 2 次
+            &[40, 40, 0, 40, 40],  // 第 3 次
+            &[40, 40, 40, 0, 40],  // 第 4 次
+            &[40, 40, 40, 40, 0],  // 第 5 次 → 立刻 Abort
+        ];
+        let frames = offsets.iter().map(|offsets| pins_frame(offsets, 0)).collect();
+        let mut screen = ScriptScreen::new(frames);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(pointer.spaces, 5, "必须正好按 5 次就停手：{outcome:?}");
+        assert_eq!(pointer.events, 10, "5 次空格 = 10 个输入事件：{outcome:?}");
+        assert!(
+            abort_reason(&outcome).contains("没有任何槽锁定"),
+            "文案要点明「0 槽锁定」：{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn safe_pins_never_exceeds_double_the_slot_count_even_if_one_slot_reads_locked() {
+        // 护栏二：指示条偶尔读到 1 格绿（护栏一因此不触发），按键次数仍必须被硬上限截断。
+        // 5 根游标每轮全部对齐 ⇒ 一帧按 5 次；第 3 轮的第 1 次（第 11 次）越过上限就 Abort。
+        // 反例：只写护栏一 ⇒ 这里会一直按到 frame_budget ⇒ 红。
+        let mut frames = vec![pins_frame(&[40, 40, 40, 40, 40], 1)];
+        for _ in 0..3 {
+            frames.push(pins_frame(&[0, 0, 0, 0, 0], 1));
+            frames.push(pins_frame(&[40, 40, 40, 40, 40], 1));
+        }
+        let mut screen = ScriptScreen::new(frames);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(pointer.spaces, 11, "越过上限的那一次就停：{outcome:?}");
+        assert!(
+            abort_reason(&outcome).contains("超过上限"),
+            "文案要点明「按键次数超过上限」：{outcome:?}"
         );
     }
 

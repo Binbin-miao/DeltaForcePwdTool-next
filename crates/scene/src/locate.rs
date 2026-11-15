@@ -471,6 +471,19 @@ const PROGRESS_SLOT_W: f32 = 0.0219;
 const PROGRESS_SLOT_H: f32 = 0.0278;
 /// 格距占整帧宽的比例（spec §0②：4.375% = 56px @1280）。
 const PROGRESS_SLOT_PITCH: f32 = 0.04375;
+/// 5 格进度行的**实测并集区域**（`x, y, w, h` 百分比）：**2026-11-16 1080p 实机实测**。
+///
+/// 与 `delta_config::builtin::AZ3_PROGRESS_REGION` **同值**。scene 不依赖 config
+/// （依赖方向是 `config → geom`），这组实测数只能两处各存一份 —— 改一处必须同步改另一处。
+///
+/// 它在这里的职责是**上界**，不是锚点：格子仍按 [`PROGRESS_ROW`] 的锚点切，
+/// 但凡有一角落到区域外的格子一律不产出。旧区域右边界只到 `0.417`（第 3 格），
+/// 这正是「5 格只读出 3~4 格、却报 5/5」的根因。
+const PROGRESS_REGION: (f32, f32, f32, f32) = (0.275, 0.453, 0.219, 0.075);
+/// 进度框宽度相对中位宽的允许偏差：超出就不像同一排格子（覆盖到了别的东西）。
+const PROGRESS_WIDTH_SPREAD: f32 = 0.25;
+/// 同一行允许的纵向偏移（相对中位格高）。
+const PROGRESS_ROW_SLACK: f32 = 0.3;
 /// 一个格子至少要有这么多个绿 ✓ 像素才算「已勾选」。
 const SLOT_CHECK_PIXELS: u32 = 6;
 /// 少于这么多格「可辨」= 读不到进度（退化）。
@@ -2016,16 +2029,55 @@ fn overlaps_vertically(rect: PxRect, grid: PxRect) -> bool {
 /// 返回 `< 3` 个格子 = 读不到进度（调用方据此退化，不猜）。
 /// 颜色判据（绿 ✓）必须用彩色 `frame`：灰度图里 `r == g == b`，判绿恒假。
 /// `scale` 是产生 `frame` 的缩放比，只喂阈值，**不在这里重新算**。
+///
+/// 读到 ≥3 格还要过 [`consistent_progress_row`]：**宁可退化成「读不到」，也不许报假的 5/5**。
 fn readable_progress(frame: &Frame, gray: &GrayImage, screen: PxRect, scale: f32) -> Vec<PxRect> {
     let adaptive = find_progress_boxes(frame, gray, screen, box_luma(scale));
     if adaptive.len() >= PROGRESS_MIN_READABLE {
-        return adaptive;
+        return consistent_progress_row(adaptive);
     }
     let spec = spec_progress_slots(frame, gray, scale);
     if spec.len() >= PROGRESS_MIN_READABLE {
-        return spec;
+        return consistent_progress_row(spec);
     }
+    // 1~2 格：本来就是退化档，没有「一排格子」可比，原样交给调用方去数。
     adaptive
+}
+
+/// 一排进度框的一致性校验：**不像同一排格子就整排作废**（返回空 ⇒ 调用方走退化档）。
+///
+/// 存在理由（实机故障）：同一张截图上 5 格是 `✓ ✓ ✓ ✓ ⬜`（逐格绿像素 174/164/185/239/**0**），
+/// 日志却报「5/5 已勾选」—— 返回的 5 个矩形里有一个框到了别处（右侧绿色按键图标 / 屏幕绿字）。
+/// 数一笔假账的代价是「一局明明没做完就报完成」，比读不到进度严重得多。
+///
+/// 两条判据（`< 3` 格不校验：那本来就不是「一排」）：
+/// 1. 每格宽度与中位宽的偏差 ≤ [`PROGRESS_WIDTH_SPREAD`]；
+/// 2. `max(y) - min(y) <= 中位格高 × [`PROGRESS_ROW_SLACK`]`（同一行）。
+fn consistent_progress_row(rects: Vec<PxRect>) -> Vec<PxRect> {
+    let widths: Vec<i32> = rects.iter().map(|rect| rect.w).collect();
+    let heights: Vec<i32> = rects.iter().map(|rect| rect.h).collect();
+    let width_median = median_of(&widths).max(1) as f32;
+    let height_median = median_of(&heights).max(1) as f32;
+    let widths_agree = rects
+        .iter()
+        .all(|rect| (rect.w as f32 - width_median).abs() <= width_median * PROGRESS_WIDTH_SPREAD);
+    let (top, bottom) = rects
+        .iter()
+        .fold((i32::MAX, i32::MIN), |(top, bottom), rect| {
+            (top.min(rect.y), bottom.max(rect.y))
+        });
+    let one_row = (bottom - top) as f32 <= height_median * PROGRESS_ROW_SLACK;
+    if widths_agree && one_row {
+        return rects;
+    }
+    Vec::new()
+}
+
+/// 中位数（偶数个取偏上的那一个）：只用于「同一排」的容差基准，不需要插值。
+fn median_of(values: &[i32]) -> i32 {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    sorted.get(sorted.len() / 2).copied().unwrap_or(0)
 }
 
 /// 按 spec §0② 的实测百分比切出 5 个进度格；**只有 ≥3 格可辨才算读到**。
@@ -2067,12 +2119,26 @@ fn row_at(frame: &Frame, gray: &GrayImage, dy: i32, scale: f32) -> RowReading {
     for index in 0..KEY_PROGRESS_MAX {
         let mut slot = spec_slot_rect(gray.w, gray.h, index);
         slot.y += dy;
+        // 落在实测并集区域外的格子一律不产出：那是把别处的东西（绿图标/绿字）当成了进度格。
+        if !inside_progress_region(slot, gray.w, gray.h) {
+            continue;
+        }
         if let Some(evidence) = slot_evidence(frame, gray, slot, scale) {
             slots.push(slot);
             margin += evidence;
         }
     }
     RowReading { dy, slots, margin }
+}
+
+/// 格子是否完整落在 [`PROGRESS_REGION`] 里（四条边都要在，不能只判左上角）。
+fn inside_progress_region(slot: PxRect, w: u32, h: u32) -> bool {
+    let (left, top, width, height) = PROGRESS_REGION;
+    let (w, h) = (w as f32, h as f32);
+    (slot.x as f32) >= w * left
+        && (slot.right() as f32) <= w * (left + width)
+        && (slot.y as f32) >= h * top
+        && (slot.bottom() as f32) <= h * (top + height)
 }
 
 /// 从偏移候选里选出该用哪一行。
@@ -2289,6 +2355,18 @@ const PIN_TRACK_MIN_W: f32 = 0.25;
 const PIN_TRACK_LUMA: (u32, u32) = (55, 110);
 /// 「非背景」像素的灰度下限：轨道底色 67 在内，面板深蓝底（约 40 以下）在外。
 const PIN_TRACK_FLOOR: u8 = 40;
+/// 「亮线」像素的灰度下限：真轨道的白色目标块/游标/亮头都在里面（实测明度中位 193）。
+const PIN_TRACK_BRIGHT_LUMA: u8 = 170;
+/// 候选带内亮像素占比下限 —— 轨道必须是**亮线**，不是一条中灰横带。
+///
+/// 实测（1280×720 归一化后，带内 `luma > 170` 的像素占比）：
+/// - 真面板轨道带（`x 300..1050, y 186..204`）：**7.9%**
+/// - 误判：室内黄色金属栏杆横杆：**0.1%**（暗黄，明度中位 75，落在 [`PIN_TRACK_LUMA`] 里）
+/// - 误判：另一帧逐行取最大：**3.0%**
+///
+/// 取 5%：真轨道留 1.6 倍余量，两种误判都拒。只看 [`PIN_TRACK_LUMA`] 的整带行均值
+/// 挡不住黄色栏杆 —— 它是「同一条中灰横带」的形态复制品，只能靠**亮度**分辨。
+const PIN_TRACK_BRIGHT_MIN: f32 = 0.05;
 /// 轨道内白色元素（目标方块 / 游标）的灰度下限（实测纯白一族）。
 const PIN_WHITE_LUMA: u8 = 140;
 /// 目标方块：宽度区间（实测 10~40；轨道整条亮白头、面板亮边框都远超 40，由此排掉）。
@@ -2341,9 +2419,13 @@ const PIN_TOL_RATIO: f32 = 0.006;
 
 /// 一帧定位：轨道 → 带内白块二分类 → 目标/游标配对。全部几何由 `frame` 决定，不读配置。
 ///
-/// 零值边界：**轨道在、但一个目标都没有**（刚开局游标还没出来）⇒ `Ok` 且 `pairs` 为空，
+/// 零值边界：**轨道在、但游标一个都还没出来**（刚开局配不上对）⇒ `Ok` 且 `pairs` 为空，
 /// 调用方按「还没出游标」继续等；**轨道都找不到** ⇒ `Err(LocateError::Track)`，
 /// 因为「没有轨道」= 这不是任务保险界面，继续等只会空转到超时。
+///
+/// 「轨道在」现在含一条亮度证据（[`PIN_TRACK_BRIGHT_MIN`]）：带内连一个亮像素都没有的
+/// **全灰横带**不算轨道 —— 它是黄栏杆 / 地面警示条的形态复制品，而真轨道上永远挂着
+/// 白色目标方块与游标。所以「板上什么白块都没有」会被判 `Err(Track)`，而不是「等着」。
 pub fn locate_pins(frame: &Frame) -> Result<LocatedPins, LocateError> {
     if frame.w < MIN_FRAME_SIDE || frame.h < MIN_FRAME_SIDE {
         return Err(LocateError::Frame {
@@ -2384,11 +2466,13 @@ pub fn locate_pins_state(frame: &Frame) -> Locate<LocatedPins> {
 
 /// 找轨道：逐行统计「非背景像素数 + 其平均亮度」，合格行连成段，取**最宽**的一段。
 ///
-/// 三条硬门槛缺一不可：
+/// 四条硬门槛缺一不可：
 /// 1. 该行非背景像素数 ≥ 帧宽 [`PIN_TRACK_MIN_W`]（否则只是某一小块面板）；
 /// 2. 这些像素的平均亮度在 [`PIN_TRACK_LUMA`]（轨道是中灰，不是纯黑也不是亮白）；
 /// 3. 连续合格行的高度在 [`PIN_TRACK_H`]（面板上边框实测只有 1~3px，靠这条排掉 ——
-///    它的**行均值同样落在 55..110**，只看亮度必然误判）。
+///    它的**行均值同样落在 55..110**，只看亮度必然误判）；
+/// 4. 带内亮像素占比 ≥ [`PIN_TRACK_BRIGHT_MIN`]：轨道上必有白色目标方块与游标，
+///    黄栏杆 / 地面警示条这类「中灰横带」一个亮像素都没有（见该常数的实测表）。
 ///
 /// 取「最宽」而不是「最靠上」：底部指示条的绿条也是中灰、也能连成 8~40px 高的一段，
 /// 但它窄（实测 5 格 + 间隙 < 轨道宽），轨道永远比它宽。
@@ -2404,7 +2488,7 @@ fn find_pin_track(gray: &GrayImage) -> Option<PxRect> {
             None
         };
         let Some((left, width)) = row else {
-            if let Some(rect) = run.take().and_then(band_rect) {
+            if let Some(rect) = run.take().and_then(|run| band_rect(gray, run)) {
                 best = wider(best, rect);
             }
             continue;
@@ -2417,18 +2501,47 @@ fn find_pin_track(gray: &GrayImage) -> Option<PxRect> {
     best
 }
 
-/// 把一段连续合格行变成矩形；高度不在 [`PIN_TRACK_H`] 里就不算轨道。
-fn band_rect((top, bottom, left, width): (u32, u32, u32, u32)) -> Option<PxRect> {
+/// 把一段连续合格行变成矩形；高度不在 [`PIN_TRACK_H`] 里、或带内没有亮线证据，都不算轨道。
+fn band_rect(gray: &GrayImage, (top, bottom, left, width): (u32, u32, u32, u32)) -> Option<PxRect> {
     let height = bottom + 1 - top;
     if !within_i32(PIN_TRACK_H, height as i32) {
         return None;
     }
-    Some(PxRect {
+    let rect = PxRect {
         x: left as i32,
         y: top as i32,
         w: width as i32,
         h: height as i32,
-    })
+    };
+    let bright = bright_ratio(gray, rect);
+    if bright < PIN_TRACK_BRIGHT_MIN {
+        return None;
+    }
+    Some(rect)
+}
+
+/// 矩形内 `luma > [`PIN_TRACK_BRIGHT_LUMA`]` 的像素占比（0..=1，越界自动裁剪）。
+fn bright_ratio(gray: &GrayImage, rect: PxRect) -> f32 {
+    let x0 = rect.x.max(0) as u32;
+    let y0 = rect.y.max(0) as u32;
+    let x1 = (rect.right().max(0) as u32).min(gray.w);
+    let y1 = (rect.bottom().max(0) as u32).min(gray.h);
+    if x1 <= x0 || y1 <= y0 {
+        return 0.0;
+    }
+    let (mut bright, mut total) = (0u32, 0u32);
+    for y in y0..y1 {
+        for &luma in &gray.row(y)[x0 as usize..x1 as usize] {
+            total += 1;
+            if luma > PIN_TRACK_BRIGHT_LUMA {
+                bright += 1;
+            }
+        }
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    bright as f32 / total as f32
 }
 
 /// 两个轨道候选里取更宽的那个（同宽取更高的，保证结果与遍历顺序无关）。
@@ -3261,7 +3374,7 @@ pub(crate) mod keys_fixture {
         }
 
         /// 空心细边框（进度框就是这种）。
-        fn ring(&mut self, rect: PxRect, thickness: i32, rgb: [u8; 3]) -> &mut Self {
+        pub(crate) fn ring(&mut self, rect: PxRect, thickness: i32, rgb: [u8; 3]) -> &mut Self {
             self.rect(PxRect { w: thickness, ..rect }, rgb);
             self.rect(
                 PxRect {
@@ -3713,6 +3826,80 @@ mod keys_tests {
         assert!(first.x < 640 && first.right() < 640);
     }
 
+    #[test]
+    fn the_measured_region_fits_all_five_slots() {
+        // 2026-11-16 1080p 实测：5 格跨 `x 0.275..0.494`、`y 0.453..0.528`。
+        // 旧区域 `x 0.262..0.417` 右边界只到第 3 格 ⇒ 这里最多切出 3 格 ⇒ 这条必须红。
+        for (w, h) in [(W, H), (1280, 720)] {
+            let inside: Vec<PxRect> = (0..KEY_PROGRESS_MAX)
+                .map(|stage| spec_slot_rect(w, h, stage))
+                .filter(|slot| inside_progress_region(*slot, w, h))
+                .collect();
+            assert_eq!(
+                inside.len(),
+                KEY_PROGRESS_MAX,
+                "{w}×{h} 上 5 格必须全落在实测区域内：{inside:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_off_row_or_off_width_box_invalidates_the_whole_row() {
+        // 实机故障：同一张截图上 5 格是 `✓ ✓ ✓ ✓ ⬜`（逐格绿像素 174/164/185/239/0），
+        // 日志却报「5/5 已勾选」⇒ 第 5 个「框」框到了别处。宁可退化成读不到，不许报假的 5/5。
+        let row: Vec<PxRect> = (0..4).map(box_rect).collect();
+        assert_eq!(consistent_progress_row(row.clone()).len(), 4, "正常一排必须原样返回");
+
+        // ① 纵向偏 11px：仍在 `largest_row` 的同一带内（|Δ中心| = 11 ≤ 24/2），
+        //    但超出「同一行」容差（24 × 0.3 = 7.2）⇒ 整排作废。
+        let off_row = PxRect {
+            y: BOX_Y + 11,
+            ..box_rect(4)
+        };
+        let mut mixed = row.clone();
+        mixed.push(off_row);
+        assert!(
+            consistent_progress_row(mixed).is_empty(),
+            "偏到别处的第 5 框必须让整排作废，不许凑成 5/5"
+        );
+
+        // ② 宽度 20px vs 中位 30px：偏差 33% > 25% ⇒ 同样整排作废（框到了窄的绿图标上）。
+        let narrow = PxRect {
+            w: 20,
+            ..box_rect(4)
+        };
+        let mut mixed = row;
+        mixed.push(narrow);
+        assert!(
+            consistent_progress_row(mixed).is_empty(),
+            "窄得不像同一排的框必须让整排作废"
+        );
+    }
+
+    #[test]
+    fn a_fifth_box_covering_something_else_never_reports_five_of_five() {
+        // 端到端：4 个真勾 + 第 5 个框偏到下一行 ⇒ 进度必须退化（报 5/5 就是实机那个假账）。
+        let mut canvas = panel_without_boxes();
+        for stage in 0..4 {
+            canvas.rect(inset(box_rect(stage), 2), CHECK);
+            canvas.ring(box_rect(stage), 2, BORDER);
+        }
+        canvas.ring(
+            PxRect {
+                y: BOX_Y + 11,
+                ..box_rect(4)
+            },
+            2,
+            BORDER,
+        );
+        let keys = locate_keys(&canvas.frame()).expect("几何完整");
+        assert!(
+            keys.progress.len() < KEY_PROGRESS_MAX,
+            "不许报出第 5 格：{:?}",
+            keys.progress
+        );
+    }
+
     // ── t5：缩放感知阈值 ──
 
     #[test]
@@ -4130,10 +4317,56 @@ mod pins_tests {
         assert_eq!(pins.targets.len(), 2, "{:?}", pins.targets);
         assert!(pins.cursors.is_empty(), "{:?}", pins.cursors);
         assert!(pins.pairs.is_empty(), "配不上游标就不许编造配对：{:?}", pins.pairs);
+    }
 
-        // 连目标都没有（空盘面）也必须 Ok：那是「还没出题」，不是「不是这个界面」。
-        let empty = locate_pins(&pins_frame(&[], &[])).expect("空盘面仍算量到了轨道");
-        assert!(empty.targets.is_empty() && empty.pairs.is_empty());
+    #[test]
+    fn an_all_grey_band_carries_no_bright_line_and_is_not_a_track() {
+        // 亮度证据的零值：一条**全灰**的中灰横带（高度、宽度、行均值全都合格）不是轨道。
+        // 反例：去掉 `PIN_TRACK_BRIGHT_MIN` ⇒ 这里返回 Ok（空盘面）⇒ 红。
+        // 现实对应：室内黄色金属栏杆横杆与地面黄黑警示条都是这种「形态复制品」，
+        // 亮像素占比实测 0.1%，而真面板轨道带 7.9%。
+        let empty = locate_pins(&pins_frame(&[], &[]));
+        assert_eq!(empty, Err(LocateError::Track), "全灰横带必须不算轨道");
+    }
+
+    #[test]
+    fn a_dim_band_with_only_a_few_bright_pixels_is_not_a_track() {
+        // 模拟黄栏杆：**暗黄**中灰横带（明度 91，正落在 `PIN_TRACK_LUMA` 55..110 里）
+        // + 带内 1.4% 的亮像素（< `PIN_TRACK_BRIGHT_MIN` 5%）。
+        // 那块亮东西宽 65px：超出目标方块的宽度上限（≤40），也没伸出带外 ⇒ 配不出任何一对。
+        // 反例：不判亮度 ⇒ 返回 Ok（轨道在、零对）⇒ 红。
+        //
+        // 亮块必须是**窄而少**的：带内亮像素会把该行的均值顶过 `PIN_TRACK_LUMA` 上限，
+        // 行判据先一步失配、整段被切碎 —— 那就测不到亮度判据了（这一条正是真面板
+        // 亮轨道行进不了候选段的原因，见 `PIN_TRACK_BRIGHT_MIN` 注释）。
+        let dim_band = PxRect {
+            x: 40,
+            y: 150,
+            w: 600,
+            h: 15,
+        };
+        let mut data = blank();
+        paint(&mut data, dim_band, [120, 90, 20]);
+        paint(
+            &mut data,
+            PxRect {
+                x: 250,
+                y: 156,
+                w: 65,
+                h: 2,
+            },
+            WHITE,
+        );
+        assert_eq!(locate_pins(&frame_of(data)), Err(LocateError::Track));
+    }
+
+    #[test]
+    fn a_bright_track_with_white_pins_clears_the_bright_line_quota() {
+        // 正例守卫（防阈值定得过严）：真面板量级的亮像素占比必须过闸。
+        // 这份合成帧的带内占比 ≈7.5%，与实机真轨道 7.9% 同量级 —— 阈值 5% 留 1.5 倍余量。
+        let pins = locate_pins(&pins_frame(&[200, 400], &[160, 430])).expect("真轨道必须过闸");
+        assert_eq!(pins.track, TRACK, "{:?}", pins.track);
+        assert_eq!(pins.pairs.len(), 2, "{:?}", pins.pairs);
     }
 
     #[test]

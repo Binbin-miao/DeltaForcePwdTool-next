@@ -8,6 +8,8 @@
 //!    用全带质心会被整条绿底拉偏，这是旧实现的根因。
 //! 4. **按空格**：格宽 = 带宽 / 5，`idx == 2` 即中间格；只有「上一帧不在中间格」时才按一次，
 //!    同一格停留绝不重复按。按满 [`TOTAL_CHARS`] 次即完成（大保险固定 5 个字符）。
+//! 5. **按键止损**：真面板每按一次游标必推进。若连按 [`STUCK_LIMIT`] 次都从没观测到
+//!    「游标离开中间格」⇒ Abort（空格在游戏里是移动/跳跃键，误判时乱按会让角色自己动）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -29,6 +31,12 @@ const RED_ABORT_RATIO: f32 = 0.30;
 const TOTAL_CHARS: i32 = 5;
 /// 中间格的格序号（0 起）。
 const CENTER_CELL: i32 = 2;
+/// 连续多少次「按下之后压根没观测到游标离开中间格」才判定这条带是假的。
+///
+/// 真面板每按一次，游标必然跳到下一格或整条推进 —— 「离开过中间格」是必然观测得到的事实。
+/// 若连按 3 次都只有「中格 / 读不到游标」两种状态在闪，那这条带不是大保险的带
+/// （空格在游戏里是**跳跃**，误判时乱按就是在让角色自己跳）。
+const STUCK_LIMIT: u32 = 3;
 
 fn is_highlight(color: [u8; 3]) -> bool {
     geom::is_green_glow(color) || geom::is_red_glow(color)
@@ -123,6 +131,10 @@ pub fn run(
     let mut hits = 0usize;
     let mut band_misses = 0u32;
     let mut last_cell: Option<i32> = None;
+    // 上次按下之后，是否观测到过游标离开中间格。
+    let mut left_center = false;
+    // 连续多少次「按下后从没离开过中间格」。
+    let mut stuck_hits = 0u32;
 
     for _ in 0..az3.frame_budget {
         if cancel.load(Ordering::SeqCst) {
@@ -173,6 +185,9 @@ pub fn run(
         }
 
         let cell = cursor_cell(&frame, actual);
+        if cell.is_some_and(|cell| cell != CENTER_CELL) {
+            left_center = true;
+        }
         if cell == Some(CENTER_CELL) && last_cell != Some(CENTER_CELL) {
             if let Err(error) = pointer.key_space() {
                 return Az3Outcome::Aborted {
@@ -182,6 +197,23 @@ pub fn run(
                 };
             }
             hits += 1;
+            // 护栏：按下去了，但上一次按下之后的全部帧里游标一次都没离开过中间格 ——
+            // 真面板按完必然推进（游标跳到下一格或整条前移）。连着 3 次都是这样 ⇒ 这条带是假的。
+            if left_center {
+                stuck_hits = 0;
+            } else {
+                stuck_hits += 1;
+            }
+            left_center = false;
+            if stuck_hits >= STUCK_LIMIT {
+                return Az3Outcome::Aborted {
+                    kind: Az3Kind::SafeTiming,
+                    reason: format!(
+                        "大保险：连按 {stuck_hits} 次后游标位置都没变，疑似误判界面，已停手"
+                    ),
+                    events: pointer.event_count(),
+                };
+            }
             if hits >= TOTAL_CHARS as usize {
                 return Az3Outcome::Done {
                     kind: Az3Kind::SafeTiming,
