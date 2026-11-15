@@ -74,6 +74,8 @@ pub enum VisionError {
     },
     #[error("内嵌 LED 字形模板不可用（构建期资源损坏）")]
     LedTemplateUnavailable,
+    #[error("PNG 字节不可解码（损坏、或位深/色彩类型不受支持）")]
+    PngDecode,
 }
 
 /// 图像内的整数区域（左上原点，单位像素）。
@@ -157,6 +159,37 @@ impl GrayImage {
             }
         }
         Self::new(w, h, out)
+    }
+
+    /// PNG 字节 → 灰度（Grayscale / 灰+alpha / RGB / RGBA / 索引色一律归一化到 8 位单通道）。
+    ///
+    /// 与 [`Self::from_bgra`] 同一套 BT.601 灰度口径，因此「落盘的灰度 PNG」再解码回来
+    /// 与运行时从 BGRA 算出的灰度逐像素一致 —— 真实画面才能当回归夹具用。
+    /// 16 位与调色板 PNG 由 `png` 的解码期变换统一到 8 位 RGB，调用方不必关心原始格式。
+    pub fn from_png(bytes: &[u8]) -> Result<Self, VisionError> {
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+        let mut reader = decoder.read_info().map_err(|_| VisionError::PngDecode)?;
+        let mut buffer = vec![0u8; reader.output_buffer_size()];
+        let info = reader
+            .next_frame(&mut buffer)
+            .map_err(|_| VisionError::PngDecode)?;
+        let (w, h) = (info.width, info.height);
+        let channels = match info.color_type {
+            png::ColorType::Grayscale => 1,
+            png::ColorType::GrayscaleAlpha => 2,
+            png::ColorType::Rgb => 3,
+            png::ColorType::Rgba => 4,
+            png::ColorType::Indexed => return Err(VisionError::PngDecode),
+        };
+        let pixels: Vec<u8> = buffer[..(w as usize) * (h as usize) * channels]
+            .chunks_exact(channels)
+            .map(|pixel| match channels {
+                1 | 2 => pixel[0],
+                _ => luma_from_bgra(pixel[2], pixel[1], pixel[0]),
+            })
+            .collect();
+        Self::new(w, h, pixels)
     }
 
     /// 只读像素缓冲（行主序）。

@@ -375,7 +375,23 @@ pub const KEY_GRID_SIDE: usize = 4;
 const KEY_MIN_HITS: usize = 11;
 
 /// 「暗键」的灰度上限（键面近黑）。
-const KEY_DARK_LUMA: u8 = 95;
+///
+/// **取 120 而不是 95：游戏加加等滤镜会提亮暗部，把键面从 88~98 抬到 100~112。**
+/// 用户现场：开滤镜后黄键台一颗键都认不出来，关掉就正常。滤镜的实测等效变换是
+/// gamma≈0.85（`v' = 255·(v/255)^0.85`）。
+///
+/// 实测（真面板帧 `task_1794777686_ok.png` 归一化到 1280×720，16 颗键框内 `luma <= 阈值` 的占比）：
+/// - 原图，阈值 95：填充率中位 **0.555**，满足 `fill >= 0.32` 的键 **16/16**
+/// - 滤镜 gamma 0.85，阈值 95：**0.227**，**0/16** ← 用户报的「开滤镜就认不出」
+/// - 滤镜 gamma 0.85，阈值 110：0.556，16/16
+/// - 滤镜 gamma 0.80，阈值 120：0.688，16/16
+/// - 滤镜 gamma 0.80，阈值 130：0.780，16/16
+///
+/// **上限也在这里**：同一张原图在阈值 95 / 110 / 120 下都恰好定出 **16** 颗键，
+/// 阈值 130 时变成 **17**（面板上「亮一档的中灰块」也开始算暗键，开始增生）。
+/// 所以 120 是「吃下滤镜」与「不增生」之间的取值，两侧都只有一档余量 ——
+/// 改这个数必须先跑 `keys_panel_fixture` 的两条用例。
+const KEY_DARK_LUMA: u8 = 120;
 /// 单颗键的边长区间。720p 实机实测 55~57px。
 const KEY_SIDE: (u32, u32) = (18, 70);
 /// 单颗键的宽高比区间（近方形）。
@@ -2347,26 +2363,68 @@ fn gray_mask(gray: &GrayImage, rect: PxRect, keep: impl Fn(u8) -> bool) -> Optio
 //
 // 现在几何全部每帧从画面量（[`locate_pins`]），与判别/执行共用同一份证据。
 
-/// 轨道带的高度区间（720p 实测 15px；面板上边框只有 1~3px，由此排掉）。
+/// 轨道带的高度区间（720p 实测 17px，y187..203；面板上边框只有 1~3px，由此排掉）。
 const PIN_TRACK_H: (i32, i32) = (8, 40);
 /// 轨道至少要占帧宽的这么多：量到的只是某块面板的一段时不认。
 const PIN_TRACK_MIN_W: f32 = 0.25;
+/// 轨道**最多**占帧宽的这么多：真轨道被面板边框夹着，量出来是帧宽的 30%~75%。
+///
+/// 实测（720p 判定世界，帧宽 1280）：
+/// - 真面板 `task_1794772921`：**640px = 50%**（x346..985）；
+/// - 误判② `task_1794781313`（亮室外）：y638..649 那条 1034px 的亮段 **= 81%**，
+///   它左右也各有暗背景（段内均值 92 vs 左 32 / 右 43），只有「宽度」这一条能把它和真轨道分开。
+///
+/// 这条上限是 2026-11-16 把「整行跨度」换成「被暗背景夹住的亮段」之后仍然必需的判据：
+/// 换成段判据只解决了「整帧都算轨道行」，没解决「一条亮段铺满大半幅画面」。
+const PIN_TRACK_MAX_W: f32 = 0.75;
 /// 轨道底色的灰度区间（720p 实测 67；纯黑背景 0、亮面板边框 >140 都落在外面）。
 const PIN_TRACK_LUMA: (u32, u32) = (55, 110);
 /// 「非背景」像素的灰度下限：轨道底色 67 在内，面板深蓝底（约 40 以下）在外。
 const PIN_TRACK_FLOOR: u8 = 40;
+/// 段与段之间的暗缝至少要这么宽才算「断开」（帧宽比例，720p 实测 ≈26px）。
+///
+/// 比它窄的暗像素算**段内空洞**：轨道上白色目标块/游标把底色挖掉的那一两个像素、
+/// 抗锯齿边都长这样，按像素断开会把一条 640px 的轨道切成十几段，段宽全不达标。
+const PIN_TRACK_GAP_MIN: f32 = 0.02;
+/// 判「左右被暗背景夹住」时，段的两侧各取这么宽的邻域（帧宽比例，720p 实测 38px）。
+const PIN_TRACK_CONTEXT: f32 = 0.03;
+/// 两侧邻域的均值必须 **< 段均值 × 此值** 才算「实质暗背景」。
+///
+/// 实测（真面板轨道 y187..203 x346..985，段均值 70）：左 27（比值 0.39）、右 28（0.40）
+/// —— 真轨道留了近一倍余量，取 0.75 不动它。
+///
+/// **这条判据在现有三张真夹具上都不是决定性的一条**（`yellow_railing` /
+/// `bright_outdoor` 是被宽度上限与亮像素占比拒掉的），它拦的是「同一条亮带向外连成亮区」：
+/// 亮段紧邻着亮墙/灯箱、或干脆顶到画面边缘时，两侧邻域没有暗背景 —— 那不是被面板夹住的轨道。
+/// 它有独立的合成帧反例守卫（`pins_tests::a_band_whose_right_neighbour_is_bright_is_not_a_track`），
+/// 谁想删掉这条判据，那条用例会红。
+const PIN_TRACK_CONTRAST: f32 = 0.75;
+/// 「同一段位置」的判据：相邻两行的段 x 中心漂移 ≤ 帧宽的这个比例。
+const PIN_TRACK_DRIFT: f32 = 0.02;
 /// 「亮线」像素的灰度下限：真轨道的白色目标块/游标/亮头都在里面（实测明度中位 193）。
 const PIN_TRACK_BRIGHT_LUMA: u8 = 170;
 /// 候选带内亮像素占比下限 —— 轨道必须是**亮线**，不是一条中灰横带。
 ///
 /// 实测（1280×720 归一化后，带内 `luma > 170` 的像素占比）：
-/// - 真面板轨道带（`x 300..1050, y 186..204`）：**7.9%**
+/// - 真面板轨道带（`x 346..985, y 187..203`）：**9.5%**
 /// - 误判：室内黄色金属栏杆横杆：**0.1%**（暗黄，明度中位 75，落在 [`PIN_TRACK_LUMA`] 里）
 /// - 误判：另一帧逐行取最大：**3.0%**
 ///
-/// 取 5%：真轨道留 1.6 倍余量，两种误判都拒。只看 [`PIN_TRACK_LUMA`] 的整带行均值
+/// 取 5%：真轨道留 1.9 倍余量，两种误判都拒。只看 [`PIN_TRACK_LUMA`] 的整带行均值
 /// 挡不住黄色栏杆 —— 它是「同一条中灰横带」的形态复制品，只能靠**亮度**分辨。
 const PIN_TRACK_BRIGHT_MIN: f32 = 0.05;
+/// 轨道两端必须离画面边缘有空白：真面板的轨道被面板边框夹住，
+/// 而「整幅画面都很亮」的行段（天空+厂房+栏杆连成一片）会从 x=0 铺到 x=帧宽 ——
+/// 那不是轨道，是一片没有边界的亮区。这一条是 2026-11-16 两次实机误判的决定性差异。
+///
+/// 实测（720p 判定世界）：
+/// - 真面板 `task_1794772921`：`x=346, w=640`（帧宽 1280），两端都留出 27% 帧宽；
+/// - 误判① `task_1794781125`（黄栏杆）：`x=0, w=1280`，两端同时贴边；
+/// - 误判② `task_1794781313`（亮室外）：`x=0, w=1280`，两端同时贴边。
+///
+/// 只拦「贴边」，**不是**「必须居中」：轨道在不同机位会左偏/右偏，唯一稳定的共性是
+/// 「两端都有面板边框压着」，所以两侧各留 2% 帧宽即可。
+const PIN_TRACK_EDGE_MARGIN: f32 = 0.02;
 /// 轨道内白色元素（目标方块 / 游标）的灰度下限（实测纯白一族）。
 const PIN_WHITE_LUMA: u8 = 140;
 /// 目标方块：宽度区间（实测 10~40；轨道整条亮白头、面板亮边框都远超 40，由此排掉）。
@@ -2464,60 +2522,145 @@ pub fn locate_pins_state(frame: &Frame) -> Locate<LocatedPins> {
     }
 }
 
-/// 找轨道：逐行统计「非背景像素数 + 其平均亮度」，合格行连成段，取**最宽**的一段。
+/// 找轨道：逐行切出「被暗背景夹住的亮段」，同一位置的段连成纵向 run，取**最宽**的一条。
 ///
-/// 四条硬门槛缺一不可：
-/// 1. 该行非背景像素数 ≥ 帧宽 [`PIN_TRACK_MIN_W`]（否则只是某一小块面板）；
-/// 2. 这些像素的平均亮度在 [`PIN_TRACK_LUMA`]（轨道是中灰，不是纯黑也不是亮白）；
-/// 3. 连续合格行的高度在 [`PIN_TRACK_H`]（面板上边框实测只有 1~3px，靠这条排掉 ——
-///    它的**行均值同样落在 55..110**，只看亮度必然误判）；
-/// 4. 带内亮像素占比 ≥ [`PIN_TRACK_BRIGHT_MIN`]：轨道上必有白色目标方块与游标，
-///    黄栏杆 / 地面警示条这类「中灰横带」一个亮像素都没有（见该常数的实测表）。
+/// 为什么不能按「整行非背景像素数」判：真面板帧（`real_panel`）720 行里有 696 行都满足
+/// 「整行 ≥ 25% 帧宽都是非背景」—— 整帧的金属柜与地面都 ≥ [`PIN_TRACK_FLOOR`]，
+/// 于是真轨道（被面板边框夹住的 640px）被两侧环境稀释成一整帧跨度，从来不是独立候选。
+/// 段判据把「段」和「段之外」分开，真轨道才第一次成为候选。
+///
+/// 每条段要同时满足四件事（缺一不可）：
+/// 1. 段宽 ∈ [`PIN_TRACK_MIN_W`]..=[`PIN_TRACK_MAX_W`] 帧宽（面板上的一小段 / 一整帧亮区都不算）；
+/// 2. 段内均值在 [`PIN_TRACK_LUMA`]（轨道是中灰，不是纯黑也不是亮白）；
+/// 3. 段左右各 [`PIN_TRACK_CONTEXT`] 帧宽的邻域均值都 **< 段均值 × [`PIN_TRACK_CONTRAST`]**
+///    —— 真轨道被面板的深色内壁夹在中间，环境亮区没有这个「夹心」结构；
+/// 4. 段与段之间只要暗缝 ≥ [`PIN_TRACK_GAP_MIN`] 就断开（窄洞算段内空洞，见该常数）。
+///
+/// 连成的 run 还要过三条：高度 ∈ [`PIN_TRACK_H`]、两端不贴画面边缘
+/// （[`PIN_TRACK_EDGE_MARGIN`]）、带内亮像素占比 ≥ [`PIN_TRACK_BRIGHT_MIN`]。
 ///
 /// 取「最宽」而不是「最靠上」：底部指示条的绿条也是中灰、也能连成 8~40px 高的一段，
 /// 但它窄（实测 5 格 + 间隙 < 轨道宽），轨道永远比它宽。
 fn find_pin_track(gray: &GrayImage) -> Option<PxRect> {
-    let min_w = (gray.w as f32 * PIN_TRACK_MIN_W).ceil() as u32;
+    let gate = TrackGate::new(gray.w);
     let mut best: Option<PxRect> = None;
-    let mut run: Option<(u32, u32, u32, u32)> = None; // (top, bottom, left, width)
-    for y in 0..=gray.h {
-        // 末行用 `None` 收尾，省掉循环外的重复 flush。
-        let row = if y < gray.h {
-            track_row(gray, y, min_w)
-        } else {
-            None
-        };
-        let Some((left, width)) = row else {
-            if let Some(rect) = run.take().and_then(|run| band_rect(gray, run)) {
-                best = wider(best, rect);
-            }
-            continue;
-        };
-        run = Some(match run {
-            Some((top, _, run_left, run_w)) => (top, y, run_left.min(left), run_w.max(width)),
-            None => (y, y, left, width),
-        });
+    let mut open: Vec<TrackRun> = Vec::new();
+    for y in 0..gray.h {
+        // 本行剩下来的段：没被任何 run 接走的，都在这一行新起一个 run。
+        let mut segments = track_segments(gray, y, &gate);
+        let mut still_open = Vec::new();
+        for mut run in open {
+            let Some(position) = take_near(&mut segments, run.center, gate.drift) else {
+                if let Some(rect) = band_rect(gray, run.rect(), &gate) {
+                    best = wider(best, rect);
+                }
+                continue;
+            };
+            run.grow(y, position);
+            still_open.push(run);
+        }
+        still_open.extend(segments.into_iter().map(|position| TrackRun::new(y, position)));
+        open = still_open;
+    }
+    for run in open {
+        if let Some(rect) = band_rect(gray, run.rect(), &gate) {
+            best = wider(best, rect);
+        }
     }
     best
 }
 
-/// 把一段连续合格行变成矩形；高度不在 [`PIN_TRACK_H`] 里、或带内没有亮线证据，都不算轨道。
-fn band_rect(gray: &GrayImage, (top, bottom, left, width): (u32, u32, u32, u32)) -> Option<PxRect> {
-    let height = bottom + 1 - top;
-    if !within_i32(PIN_TRACK_H, height as i32) {
+/// 逐行判据的几何门槛：按帧宽折算一次，避免每行重算。
+struct TrackGate {
+    /// 段宽下限 / 上限（像素）。
+    min_w: u32,
+    max_w: u32,
+    /// 段间暗缝下限（像素）：比它窄的暗像素算段内空洞。
+    gap: u32,
+    /// 段左右各取多宽的邻域（像素）。
+    context: u32,
+    /// 「同一段位置」的 x 中心漂移容差（像素）。
+    drift: u32,
+}
+
+impl TrackGate {
+    fn new(frame_w: u32) -> Self {
+        let scaled = |ratio: f32| (frame_w as f32 * ratio).round() as u32;
+        Self {
+            min_w: scaled(PIN_TRACK_MIN_W),
+            max_w: scaled(PIN_TRACK_MAX_W),
+            gap: scaled(PIN_TRACK_GAP_MIN).max(1),
+            context: scaled(PIN_TRACK_CONTEXT).max(1),
+            drift: scaled(PIN_TRACK_DRIFT).max(1),
+        }
+    }
+}
+
+/// 一个纵向 run：连续若干行里 x 中心几乎不动的那一段（并集即候选轨道带）。
+#[derive(Debug, Clone, Copy)]
+struct TrackRun {
+    top: u32,
+    bottom: u32,
+    x0: u32,
+    x1: u32,
+    /// 最后一行的段 x 中心：下一行按它算漂移。
+    center: u32,
+}
+
+impl TrackRun {
+    fn new(y: u32, (x0, x1): (u32, u32)) -> Self {
+        Self {
+            top: y,
+            bottom: y,
+            x0,
+            x1,
+            center: (x0 + x1) / 2,
+        }
+    }
+
+    fn grow(&mut self, y: u32, (x0, x1): (u32, u32)) {
+        self.bottom = y;
+        self.x0 = self.x0.min(x0);
+        self.x1 = self.x1.max(x1);
+        self.center = (x0 + x1) / 2;
+    }
+
+    fn rect(&self) -> PxRect {
+        PxRect {
+            x: self.x0 as i32,
+            y: self.top as i32,
+            w: (self.x1 + 1 - self.x0) as i32,
+            h: (self.bottom + 1 - self.top) as i32,
+        }
+    }
+}
+
+/// 把一段连续合格行变成矩形；高度不在 [`PIN_TRACK_H`] 里、贴到画面边缘、或带内没有亮线证据，
+/// 都不算轨道。
+///
+/// 高度判据同时挡掉「并集被漂移撑大」的情形：单段宽度在 [`segment_is_track`] 已过闸，
+/// 这里再按**并集**宽度判一次，保证返回的矩形宽度永远是 `≤ PIN_TRACK_MAX_W`。
+///
+/// 「贴边」放在**亮线证据之前**：它比逐像素算亮占比便宜。
+fn band_rect(gray: &GrayImage, rect: PxRect, gate: &TrackGate) -> Option<PxRect> {
+    if !within_i32(PIN_TRACK_H, rect.h) || rect.w > gate.max_w as i32 {
         return None;
     }
-    let rect = PxRect {
-        x: left as i32,
-        y: top as i32,
-        w: width as i32,
-        h: height as i32,
-    };
-    let bright = bright_ratio(gray, rect);
-    if bright < PIN_TRACK_BRIGHT_MIN {
+    if touches_frame_edge(gray, rect) {
+        return None;
+    }
+    if bright_ratio(gray, rect) < PIN_TRACK_BRIGHT_MIN {
         return None;
     }
     Some(rect)
+}
+
+/// 轨道两端是否贴到画面边缘（两侧各要求留出 [`PIN_TRACK_EDGE_MARGIN`] 的帧宽）。
+fn touches_frame_edge(gray: &GrayImage, rect: PxRect) -> bool {
+    let frame_w = gray.w as f32;
+    let margin = frame_w * PIN_TRACK_EDGE_MARGIN;
+    let (left, right) = (rect.x as f32, rect.right() as f32);
+    left < margin || right > frame_w - margin
 }
 
 /// 矩形内 `luma > [`PIN_TRACK_BRIGHT_LUMA`]` 的像素占比（0..=1，越界自动裁剪）。
@@ -2552,32 +2695,83 @@ fn wider(current: Option<PxRect>, candidate: PxRect) -> Option<PxRect> {
     }
 }
 
-/// 单行是否够格当轨道带：返回 `(左缘 x, 跨度宽度)`，不够格返回 `None`。
-///
-/// 宽度用**非背景像素数**而不是「首尾跨度」：底部指示条 5 格之间有间隙，
-/// 按跨度算它也能凑够帧宽的 25%，按像素数算它就露馅了。
-fn track_row(gray: &GrayImage, y: u32, min_w: u32) -> Option<(u32, u32)> {
+/// 本行里够格当轨道的亮段（按 x 升序）。
+fn track_segments(gray: &GrayImage, y: u32, gate: &TrackGate) -> Vec<(u32, u32)> {
     let row = gray.row(y);
-    let (mut count, mut sum) = (0u32, 0u32);
-    let (mut left, mut right) = (None, 0u32);
-    for (x, &luma) in row.iter().enumerate() {
-        if luma < PIN_TRACK_FLOOR {
+    raw_segments(row, gate.gap)
+        .into_iter()
+        .filter(|&segment| segment_is_track(row, segment, gate))
+        .collect()
+}
+
+/// 把一行切成若干「连续 `luma >= `[`PIN_TRACK_FLOOR`]」的段；暗缝窄于 `gap` 不算断开。
+fn raw_segments(row: &[u8], gap: u32) -> Vec<(u32, u32)> {
+    let mut segments = Vec::new();
+    let mut start: Option<u32> = None;
+    let mut dark = 0u32;
+    for (index, &luma) in row.iter().enumerate() {
+        let x = index as u32;
+        if luma >= PIN_TRACK_FLOOR {
+            start.get_or_insert(x);
+            dark = 0;
             continue;
         }
-        count += 1;
-        sum += u32::from(luma);
-        left.get_or_insert(x as u32);
-        right = x as u32;
+        let Some(left) = start else { continue };
+        dark += 1;
+        if dark < gap {
+            continue;
+        }
+        segments.push((left, x - dark));
+        start = None;
+        dark = 0;
     }
-    if count < min_w {
-        return None;
+    if let Some(left) = start {
+        segments.push((left, row.len() as u32 - 1));
     }
-    let mean = sum / count.max(1);
+    segments
+}
+
+/// 单段够不够格当轨道：宽度、段内均值、左右被暗背景夹住，三件事缺一不可。
+fn segment_is_track(row: &[u8], (x0, x1): (u32, u32), gate: &TrackGate) -> bool {
+    let (start, end) = (x0 as usize, x1 as usize);
+    let width = end + 1 - start;
+    if width < gate.min_w as usize || width > gate.max_w as usize {
+        return false;
+    }
+    let mean = mean_of(&row[start..=end]);
     if !(PIN_TRACK_LUMA.0..=PIN_TRACK_LUMA.1).contains(&mean) {
-        return None;
+        return false;
     }
-    let left = left?;
-    Some((left, right - left + 1))
+    let limit = mean as f32 * PIN_TRACK_CONTRAST;
+    let left = context_mean(row, start.saturating_sub(gate.context as usize), start);
+    let right = context_mean(row, end + 1, (end + 1 + gate.context as usize).min(row.len()));
+    left < limit && right < limit
+}
+
+/// `row[from..to]` 的均值；空区间（段贴着画面边、没有可量的邻域）返回 255 判不合格。
+fn context_mean(row: &[u8], from: usize, to: usize) -> f32 {
+    if from >= to {
+        return 255.0;
+    }
+    mean_of(&row[from..to]) as f32
+}
+
+fn mean_of(values: &[u8]) -> u32 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.iter().map(|&luma| u32::from(luma)).sum::<u32>() / values.len() as u32
+}
+
+/// 从本行的段里取走「离 `center` 最近、且漂移 ≤ `drift`」的那一段。
+fn take_near(segments: &mut Vec<(u32, u32)>, center: u32, drift: u32) -> Option<(u32, u32)> {
+    let (index, _) = segments
+        .iter()
+        .enumerate()
+        .map(|(index, &(x0, x1))| (index, ((x0 + x1) / 2).abs_diff(center)))
+        .filter(|(_, distance)| *distance <= drift)
+        .min_by_key(|(_, distance)| *distance)?;
+    Some(segments.swap_remove(index))
 }
 
 /// 轨道内的白块二分类：**目标是「带内的宽块」，游标是「伸出带外的窄线」**。
@@ -2661,7 +2855,10 @@ fn cursor_of(binary: &BinaryImage, start: u32, end: u32, window: PxRect) -> Opti
                 continue;
             }
             top.get_or_insert(y);
-            bottom = y;
+            // 外接框的下沿 = 段内**最低**的白像素：必须取 max。写成 `bottom = y` 时，
+            // 后一列只要在上方有白像素就会把下沿压到 `top` 之上（实机亮栏杆帧就是这样），
+            // debug 下 `bottom + 1 - top` 直接 u32 下溢 panic，release 下则静默得到负数高度。
+            bottom = bottom.max(y);
         }
     }
     let top = top?;
@@ -4339,10 +4536,13 @@ mod pins_tests {
         // 亮块必须是**窄而少**的：带内亮像素会把该行的均值顶过 `PIN_TRACK_LUMA` 上限，
         // 行判据先一步失配、整段被切碎 —— 那就测不到亮度判据了（这一条正是真面板
         // 亮轨道行进不了候选段的原因，见 `PIN_TRACK_BRIGHT_MIN` 注释）。
+        //
+        // 带宽与亮块亮度都必须按新判据标定：600px（93% 帧宽）会先被宽度上限拒掉，
+        // 而 255 的亮块会把该行均值顶到 117（>110）⇒ 同样测不到亮度判据。
         let dim_band = PxRect {
-            x: 40,
+            x: 100,
             y: 150,
-            w: 600,
+            w: 400,
             h: 15,
         };
         let mut data = blank();
@@ -4352,10 +4552,10 @@ mod pins_tests {
             PxRect {
                 x: 250,
                 y: 156,
-                w: 65,
+                w: 60,
                 h: 2,
             },
-            WHITE,
+            [200, 200, 200],
         );
         assert_eq!(locate_pins(&frame_of(data)), Err(LocateError::Track));
     }
@@ -4373,17 +4573,355 @@ mod pins_tests {
     fn a_bright_thin_line_is_not_a_track() {
         // 面板上边框：行均值同样落在 55..110、宽度也够，**只有 3px 的高度**把它和轨道分开。
         // 反例：去掉高度门槛 ⇒ 这帧会返回一个 3px 高的「轨道」，后面一切判据全错位。
+        //
+        // 带宽必须落在 30~75% 帧宽内、且带内自带亮线证据：否则它会先被「宽度上限」或
+        // 「亮像素占比」拒掉，那这条用例就证不到高度判据了（当时是 520px 宽、带内全无亮像素）。
+        let mut data = blank();
+        paint(&mut data, THIN_LINE, [90, 90, 90]);
+        paint(
+            &mut data,
+            PxRect {
+                x: 250,
+                y: 150,
+                w: 30,
+                h: 3,
+            },
+            WHITE,
+        );
+        assert_eq!(locate_pins(&frame_of(data)), Err(LocateError::Track));
+    }
+
+    /// 一条 400×3 的中灰细线（= 面板上边框的形态）。带内自带 30×3 白块，
+    /// 于是「亮像素占比 7.5%」过闸，唯一不合格的只剩高度。
+    const THIN_LINE: PxRect = PxRect {
+        x: 100,
+        y: 150,
+        w: 400,
+        h: 3,
+    };
+
+    #[test]
+    fn a_gap_wider_than_the_seam_splits_the_track_into_too_narrow_pieces() {
+        // 段切分必须按**暗缝**断：轨道中央的支架/缺口是真实存在的，断成两截各 120px
+        // ⇒ 都不到帧宽 25% ⇒ 不是轨道。
+        // 反例：段切分忽略暗缝（整行连成一片）⇒ 300px 的段合格 ⇒ 返回 Ok ⇒ 红。
         let mut data = blank();
         paint(
             &mut data,
             PxRect {
-                x: 60,
+                x: 170,
                 y: 150,
-                w: 520,
-                h: 3,
+                w: 300,
+                h: 15,
             },
-            [96, 96, 96],
+            TRACK_GREY,
+        );
+        paint(
+            &mut data,
+            PxRect {
+                x: 290,
+                y: 150,
+                w: 60,
+                h: 15,
+            },
+            [0, 0, 0],
+        );
+        paint(
+            &mut data,
+            PxRect {
+                x: 200,
+                y: 149,
+                w: 10,
+                h: 17,
+            },
+            WHITE,
         );
         assert_eq!(locate_pins(&frame_of(data)), Err(LocateError::Track));
+    }
+
+    #[test]
+    fn a_notch_narrower_than_the_seam_does_not_split_the_track() {
+        // 轨道上的白色目标块会挖出窄暗洞（10px < 帧宽 2% = 13px）——那是物件，不是缝隙。
+        // 反例：把每个暗像素都当断点 ⇒ 轨道被切成两截各 200px ⇒ 量回的宽度对不上 ⇒ 红。
+        let mut data = blank();
+        paint(&mut data, TRACK, TRACK_GREY);
+        paint(
+            &mut data,
+            PxRect {
+                x: 300,
+                y: 150,
+                w: 10,
+                h: 15,
+            },
+            [0, 0, 0],
+        );
+        // 两个白块（带内亮像素 10% ⇒ 过得了 `PIN_TRACK_BRIGHT_MIN`）。
+        for center_x in [200, 400] {
+            paint(
+                &mut data,
+                PxRect {
+                    x: center_x - 10,
+                    y: 149,
+                    w: 20,
+                    h: 17,
+                },
+                WHITE,
+            );
+        }
+        let pins = locate_pins(&frame_of(data)).expect("窄洞不算断");
+        assert_eq!(pins.track, TRACK, "窄洞不许把轨道切碎：{:?}", pins.track);
+    }
+
+    #[test]
+    fn a_band_whose_right_neighbour_is_bright_is_not_a_track() {
+        // 轨道右侧 13px 外就是一块亮板（机箱灯箱/白墙）：这条带的右边**不是暗背景**，
+        // 说明它没有被面板夹住 —— 与「整幅画面都很亮」的行段同类。
+        // 反例：不做左右暗背景判据 ⇒ 这帧返回 Ok（400×15 的带全项合格）⇒ 红。
+        let mut data = blank();
+        paint(&mut data, BAND_WITH_BRIGHT_NEIGHBOUR, TRACK_GREY);
+        paint(
+            &mut data,
+            PxRect {
+                x: 453,
+                y: 150,
+                w: 48,
+                h: 15,
+            },
+            [255, 255, 255],
+        );
+        paint(
+            &mut data,
+            PxRect {
+                x: 200,
+                y: 149,
+                w: 30,
+                h: 17,
+            },
+            WHITE,
+        );
+        assert_eq!(locate_pins(&frame_of(data)), Err(LocateError::Track));
+    }
+
+    /// 上面那条用例的横带：右侧紧跟 13px 暗缝（正好等于帧宽 2% ⇒ 段在此断开），
+    /// 缝后再是亮板 —— 于是「右侧 19px 邻域」里亮像素占了 6px。
+    const BAND_WITH_BRIGHT_NEIGHBOUR: PxRect = PxRect {
+        x: 40,
+        y: 150,
+        w: 400,
+        h: 15,
+    };
+
+    #[test]
+    fn a_band_spanning_most_of_the_frame_is_not_a_track() {
+        // 「一整帧都亮」的环境（地面+墙面连成一片）也能凑出 8~40px 高的亮段，
+        // 但真轨道被面板夹在中间，量出来只有帧宽的 30~75%。
+        // 反例：不设宽度上限 ⇒ 这帧返回 Ok（590px = 92% 帧宽）⇒ 红。
+        let mut data = blank();
+        paint(
+            &mut data,
+            PxRect {
+                x: 20,
+                y: 150,
+                w: 590,
+                h: 15,
+            },
+            TRACK_GREY,
+        );
+        paint(
+            &mut data,
+            PxRect {
+                x: 300,
+                y: 149,
+                w: 40,
+                h: 17,
+            },
+            WHITE,
+        );
+        assert_eq!(locate_pins(&frame_of(data)), Err(LocateError::Track));
+    }
+}
+
+/// 真实帧回归：把用户实机截图的判定结论钉死（防止每隔几天又靠猜阈值调一轮）。
+///
+/// 夹具全部是 720p 判定世界的灰度 PNG（来源与处理口径见 `tests/fixtures/pins/README.md`），
+/// 因此 `locate_pins` 读它们时不会再缩放一次 —— 测的就是实机看到的那张图。
+#[cfg(test)]
+mod pins_fixtures {
+    use super::*;
+    use std::time::Instant;
+
+    /// 夹具登记表（名字 → 内嵌 PNG 字节）。新增真实帧只在这里加一行。
+    const FIXTURES: [(&str, &[u8]); 3] = [
+        (
+            "real_panel",
+            include_bytes!("../tests/fixtures/pins/real_panel.png"),
+        ),
+        (
+            "yellow_railing",
+            include_bytes!("../tests/fixtures/pins/yellow_railing.png"),
+        ),
+        (
+            "bright_outdoor",
+            include_bytes!("../tests/fixtures/pins/bright_outdoor.png"),
+        ),
+    ];
+
+    /// 夹具 → 帧：灰度 PNG 解成灰度后按 BGRA 三通道同值铺开，
+    /// 于是 `Frame::luma()` 逐像素还原成 PNG 里的灰度（不引入任何色彩转换偏差）。
+    fn fixture_frame(name: &str) -> Frame {
+        let png = FIXTURES
+            .iter()
+            .find(|(fixture, _)| *fixture == name)
+            .map(|(_, bytes)| *bytes)
+            .expect("夹具名字必须在 FIXTURES 里登记");
+        let gray = GrayImage::from_png(png).expect("夹具 PNG 必须可解码");
+        let data = gray
+            .as_slice()
+            .iter()
+            .flat_map(|&value| [value, value, value, 255])
+            .collect();
+        Frame::new(gray.w, gray.h, data, Instant::now()).expect("夹具帧长度正确")
+    }
+
+    /// 生产判据的复刻：`looks_like_pins` 就是「定位成功 **且** 至少 2 对」。
+    fn looks_like_pins(frame: &Frame) -> bool {
+        locate_pins(frame).is_ok_and(|pins| pins.pairs.len() >= 2)
+    }
+
+    #[test]
+    fn real_panel_is_located_as_a_pin_track() {
+        // 正例守卫：收紧判据不许把真面板挡掉（这是本轮所有改动的红线）。
+        //
+        // 旧判据（v6.12~v6.14）按「**整行**非背景像素数 ≥ 25% 帧宽」找轨道行：这张真面板帧
+        // 720 行里有 696 行都满足（整帧深色金属柜/地面都 ≥ `PIN_TRACK_FLOOR`、行均值落在
+        // `PIN_TRACK_LUMA` 内、跨度铺满整幅画面），连续段高达 284 / 316 行，全部被
+        // `PIN_TRACK_H(8..=40)` 毙掉 ⇒ `locate_pins` 恒 `Err(Track)`。真轨道（被面板边框
+        // 夹住的那 640px）在整行统计里被两侧环境稀释成整帧跨度，从来不是独立候选段。
+        // 现在改成「逐行找被暗背景夹住的亮段」，这条用例才第一次真正跑绿。
+        let frame = fixture_frame("real_panel");
+        let width = frame.w as i32;
+        let pins = locate_pins(&frame).expect("真面板必须定位出轨道");
+        assert!(
+            pins.track.x > 0 && pins.track.right() < width,
+            "真面板的轨道必须被面板边框夹住、不贴画面边缘：{:?}（帧宽 {width}）",
+            pins.track
+        );
+        assert!(
+            (0.30..=0.75).contains(&(pins.track.w as f32 / width as f32)),
+            "轨道宽度必须落在帧宽 30%~75%：{:?}（帧宽 {width}）",
+            pins.track
+        );
+        // 断言用**生产判据**（`pairs >= 2`，见 `scene/src/lib.rs::looks_like_pins`），
+        // 不是「至少 1 对」：只剩 1 对时用户侧照样判不成任务保险，而夹具却是绿的。
+        assert!(
+            looks_like_pins(&frame),
+            "真面板必须过生产判据（轨道 + ≥2 对）：{pins:?}"
+        );
+    }
+
+    #[test]
+    fn yellow_railing_is_not_a_pin_track() {
+        // 误判①：黄色金属天桥/楼梯的亮黄栏杆在行统计里长得像一条中灰长轨道。
+        let frame = fixture_frame("yellow_railing");
+        assert_eq!(
+            locate_pins(&frame),
+            Err(LocateError::Track),
+            "黄栏杆必须连轨道都找不到（不是靠配对数凑不够）"
+        );
+    }
+
+    #[test]
+    fn bright_outdoor_is_not_a_pin_track() {
+        // 误判②：室外亮场景（天空 + 厂房 + 栏杆）从左缘铺到右缘，行段没有边界。
+        let frame = fixture_frame("bright_outdoor");
+        assert_eq!(
+            locate_pins(&frame),
+            Err(LocateError::Track),
+            "亮室外场景必须连轨道都找不到（不是靠配对数凑不够）"
+        );
+        assert!(
+            !looks_like_pins(&fixture_frame("bright_outdoor")),
+            "更不许判成任务保险"
+        );
+    }
+}
+
+/// 滤镜适配（游戏加加提亮暗部）与「阈值放宽后不许增生」的真实帧回归。
+///
+/// 夹具 `keys_panel.png`（640×360、8 位灰度、100% 合成、不含任何本机信息）复刻真面板
+/// （`task_1794777686_ok.png` 归一化到 1280×720 后）的相对结构：
+/// - 台面 151 / 屏幕内腔 31 / 进度框细边 200 —— 与 `keys_fixture` 同量级；
+/// - 16 颗键面 **92**（真机键面是 88..98 的渐变，所以阈值 95 下实测填充率 0.555；
+///   这里取均匀值让判据行为可复现），中央 30×26 的亮图标 242
+///   ⇒ 填充率 (44×40 − 30×26) / (44×40) = **0.557**，与实测同量级；
+/// - 键阵右上角一块 **125** 的方形机件 —— 真面板把阈值放到 130 时多出来的那第 17 颗键
+///   就是这种「亮一档的中灰块」。
+///
+/// 同一张图的实测（`uniform_blocks` 之后的键块数 / 全部暗块数）：
+/// - 阈值 95 → **16 / 21**（21 = 16 颗键 + 5 个进度框内腔，后者被尺寸一致性滤掉）；
+/// - gamma 0.85 后阈值 95 → **5 / 5**：16 颗键一颗不剩，只剩 5 个进度框内腔 ⇒ 凑不出 4×4
+///   ⇒ `locate_keys` 报 `Err(Keys)`（= 用户报的「开滤镜就认不出黄键台」）；
+/// - gamma 0.85 后阈值 120 → **16 / 21**（修好）；
+/// - 阈值 130 → **17 / 22**：那块 125 的方形机件也开始算暗键 = 增生。
+#[cfg(test)]
+mod keys_panel_fixture {
+    use super::*;
+    use std::time::Instant;
+
+    const KEYS_PANEL_PNG: &[u8] = include_bytes!("../tests/fixtures/keys/keys_panel.png");
+
+    fn gray_png() -> GrayImage {
+        GrayImage::from_png(KEYS_PANEL_PNG).expect("夹具 PNG 必须可解码")
+    }
+
+    /// 灰度图 → 帧：三通道同值铺开，于是 `Frame::luma()` 逐像素还原成 PNG 里的灰度。
+    fn frame_of(gray: &GrayImage) -> Frame {
+        let data = gray
+            .as_slice()
+            .iter()
+            .flat_map(|&value| [value, value, value, 255])
+            .collect();
+        Frame::new(gray.w, gray.h, data, Instant::now()).expect("夹具帧长度正确")
+    }
+
+    /// 复刻滤镜的提亮效果：`v' = 255·(v/255)^γ`（γ < 1 ⇒ 暗部被提亮）。
+    fn gamma(gray: &GrayImage, value: f32) -> GrayImage {
+        let data = gray
+            .as_slice()
+            .iter()
+            .map(|&luma| (255.0 * (f32::from(luma) / 255.0).powf(value)).round() as u8)
+            .collect();
+        GrayImage::new(gray.w, gray.h, data).expect("gamma 图尺寸不变")
+    }
+
+    #[test]
+    fn the_key_panel_still_counts_sixteen_keys() {
+        // H7：阈值放宽后不许增生。反例：`KEY_DARK_LUMA` 改到 130 ⇒ 那块 125 的方形机件
+        // 也算暗键 ⇒ 17 块 ⇒ 红。
+        let frame = frame_of(&gray_png());
+        let keys_only = uniform_blocks(&dark_blocks(&frame.luma()));
+        assert_eq!(
+            keys_only.len(),
+            KEY_GRID_SIDE * KEY_GRID_SIDE,
+            "原图必须恰好定出 16 颗键（多一颗 = 阈值放宽过头，少一颗 = 键面判据太严）：{keys_only:?}"
+        );
+        let keys = locate_keys(&frame).expect("原图必须定位成功");
+        assert_eq!(keys.cells.len(), KEY_GRID_SIDE * KEY_GRID_SIDE);
+    }
+
+    #[test]
+    fn a_gamma_brightened_key_panel_is_still_located() {
+        // H6：游戏加加滤镜把暗部提亮一档（gamma 0.85）后键面 92 → 107。
+        // 阈值停在 95 时 107 不算暗键 ⇒ 一颗键都定不出来 ⇒ `locate_keys` 报 `Err(Keys)`，
+        // 这正是用户「开滤镜就认不出黄键台、关了就好」的现场。
+        // 反例：`KEY_DARK_LUMA` 保持 95 ⇒ 这里 0 颗键 ⇒ 红。
+        let frame = frame_of(&gamma(&gray_png(), 0.85));
+        let keys_only = uniform_blocks(&dark_blocks(&frame.luma()));
+        assert!(
+            keys_only.len() >= KEY_MIN_HITS,
+            "滤镜后至少要定出 {KEY_MIN_HITS} 颗键（阈值 95 时 16 颗键全丢、只剩 5 个进度框内腔）：{keys_only:?}"
+        );
+        let keys = locate_keys(&frame).expect("滤镜后仍必须定位出键阵");
+        assert_eq!(keys.cells.len(), KEY_GRID_SIDE * KEY_GRID_SIDE);
     }
 }

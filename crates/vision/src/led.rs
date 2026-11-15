@@ -307,35 +307,11 @@ fn templates() -> Result<&'static [Glyph], VisionError> {
         .ok_or(VisionError::LedTemplateUnavailable)
 }
 
-/// 解码内嵌 PNG 为 32×32 灰度。
+/// 解码内嵌 PNG 为灰度（失败一律归因为模板资源不可用）。
+///
+/// 解码细节只有一份：[`GrayImage::from_png`]。这里只做错误归因转换。
 fn decode_png_gray(bytes: &[u8]) -> Result<GrayImage, VisionError> {
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    let mut reader = decoder
-        .read_info()
-        .map_err(|_| VisionError::LedTemplateUnavailable)?;
-    let mut buffer = vec![0u8; reader.output_buffer_size()];
-    let info = reader
-        .next_frame(&mut buffer)
-        .map_err(|_| VisionError::LedTemplateUnavailable)?;
-    let (w, h) = (info.width, info.height);
-    let channels = match info.color_type {
-        png::ColorType::Grayscale => 1,
-        png::ColorType::GrayscaleAlpha => 2,
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
-        png::ColorType::Indexed => return Err(VisionError::LedTemplateUnavailable),
-    };
-    let mut pixels = Vec::with_capacity((w as usize) * (h as usize));
-    for pixel in buffer[..(w as usize) * (h as usize) * channels].chunks_exact(channels) {
-        let value = if channels >= 3 {
-            ((77 * u16::from(pixel[0]) + 150 * u16::from(pixel[1]) + 29 * u16::from(pixel[2]))
-                >> 8) as u8
-        } else {
-            pixel[0]
-        };
-        pixels.push(value);
-    }
-    GrayImage::new(w, h, pixels)
+    GrayImage::from_png(bytes).map_err(|_| VisionError::LedTemplateUnavailable)
 }
 
 /// 字形归一化：裁墨迹包围盒 → 等比缩放到塞进 32×32 → 居中（与内嵌模板同口径）。

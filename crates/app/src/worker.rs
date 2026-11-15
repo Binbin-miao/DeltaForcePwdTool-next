@@ -512,6 +512,40 @@ enum PollVerdict {
     Reject(&'static str),
 }
 
+/// `SafePins` 兜底要连续成立多少帧才放行（其余判据仍是单帧放行）。
+///
+/// 实测依据：跑图时「像任务保险」的帧是**零星闪过**的（2026-11-16 两次误判相隔约 3 秒、
+/// 中间夹着 outright `Reject`），而真面板打开后会**稳定存在**。80ms 一帧 ⇒ 3 帧 ≈ 240ms，
+/// 只让稳定存在的东西通过。这是「按了 5 次空格才发现判错」的第二道止血闸。
+const PINS_STREAK_FRAMES: u32 = 3;
+
+/// `SafePins` 的连续命中计数：**只活在一次轮询循环里**（[`poll_scene_ready`] 持有）。
+///
+/// 绝不放进 `ui_guard`：那是跨任务复用的对象，上一次跑图残留的计数会直接带进下一次，
+/// 让「零星闪过的误判帧」白捡一次连击 —— 这正是「多次误判」的成因之一。
+#[derive(Debug, Default)]
+struct PinsStreak {
+    consecutive: u32,
+}
+
+impl PinsStreak {
+    /// 记一帧 `SafePins`，返回当前连击数（含本帧）。
+    fn hit(&mut self) -> u32 {
+        self.consecutive += 1;
+        self.consecutive
+    }
+
+    /// 记一帧「不是 `SafePins`」：连击清零。
+    fn miss(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// 连击是否已够放行。
+    fn satisfied(&self) -> bool {
+        self.consecutive >= PINS_STREAK_FRAMES
+    }
+}
+
 /// 单帧综合探测：**模板优先，结构判别只在模板库为空时兜底**。
 ///
 /// 顺序不可交换（实测依据：全片 1125 采样点里面板在时 NCC 0.894~0.955，
@@ -532,6 +566,7 @@ fn classify_poll_frame(
     frame: &Frame,
     view: &PxView,
     elapsed_ms: u64,
+    pins: &mut PinsStreak,
 ) -> PollVerdict {
     // 1. 没有可用模板：结构判别是唯一判据（命中即动手）。
     if guard.is_empty() {
@@ -559,12 +594,24 @@ fn classify_poll_frame(
             // 唯一依据就是 `looks_like_pins` ⇒ `locate_pins(frame).is_ok_and(|p| pairs >= 2)`
             // （`scene/src/lib.rs` 的 `looks_like_pins`）。同一帧、同一个纯函数，二次调用
             // 不可能给出不同的结论 —— 加一道 `Err` 分支只会得到一段永远走不到的死代码。
-            // 轨道真实性（亮度证据）由 `locate_pins` 内部统一负责，改一处两处都生效。
+            // 轨道真实性（亮度证据 + 两端不贴边）由 `locate_pins` 内部统一负责，改一处两处都生效。
+            //
+            // **时间闸**（2026-11-16 实机误判后加）：`SafePins` 必须**连续 [`PINS_STREAK_FRAMES`]
+            // 帧**都成立才放行。零星闪过的「像轨道」帧（跑图时的黄栏杆天桥）过不去，
+            // 稳定存在的真面板照旧放行。`SafeTiming` 没有误判记录，仍单帧放行、不参与计数。
             match delta_scene::az3_variant(frame, view) {
-                delta_scene::Az3Kind::SafePins | delta_scene::Az3Kind::SafeTiming => {
-                    PollVerdict::Ready(None)
+                delta_scene::Az3Kind::SafePins => {
+                    pins.hit();
+                    match pins.satisfied() {
+                        true => PollVerdict::Ready(None),
+                        false => PollVerdict::NotYet,
+                    }
                 }
-                _ => PollVerdict::Reject(reason),
+                delta_scene::Az3Kind::SafeTiming => PollVerdict::Ready(None),
+                _ => {
+                    pins.miss();
+                    PollVerdict::Reject(reason)
+                }
             }
         }
         ui_guard::UiVerdict::Reject(_) | ui_guard::UiVerdict::Gray => PollVerdict::NotYet,
@@ -626,6 +673,7 @@ fn poll_scene_ready(
 ) -> Result<ReadyOutcome, String> {
     let began = clock.now_ms();
     let mut probes = 0u32;
+    let mut pins = PinsStreak::default();
     loop {
         // 每轮读一次取消位：关掉总开关后不许还干等。
         if cancel.load(Ordering::SeqCst) {
@@ -634,7 +682,7 @@ fn poll_scene_ready(
         probes += 1;
         let frame = probe()?;
         let elapsed = clock.now_ms().saturating_sub(began);
-        match classify_poll_frame(guard, &frame, view, elapsed) {
+        match classify_poll_frame(guard, &frame, view, elapsed, &mut pins) {
             PollVerdict::Ready(hint) => return Ok(ReadyOutcome::Ready { frame, hint }),
             PollVerdict::Reject(reason) => return Ok(ReadyOutcome::Rejected(reason)),
             PollVerdict::NotYet => {}
@@ -2164,9 +2212,10 @@ mod tests {
         let frames = [panel, corridor];
         let mut decided = PollVerdict::NotYet;
         let mut stopped_at = 0usize;
+        let mut pins = PinsStreak::default();
         for (index, frame) in frames.iter().enumerate() {
             stopped_at = index;
-            decided = classify_poll_frame(&guard, frame, &led_view(), index as u64 * 40);
+            decided = classify_poll_frame(&guard, frame, &led_view(), index as u64 * 40, &mut pins);
             if decided != PollVerdict::NotYet {
                 break;
             }
@@ -2192,7 +2241,13 @@ mod tests {
             ui_guard::UiVerdict::Reject(ui_guard::NOT_UNLOCK_SCREEN),
             "前提：这一帧在模板口径下就是「一张都不像」"
         );
-        let verdict = classify_poll_frame(&guard, &flat_frame(), &led_view(), 300);
+        let verdict = classify_poll_frame(
+            &guard,
+            &flat_frame(),
+            &led_view(),
+            300,
+            &mut PinsStreak::default(),
+        );
         assert_eq!(
             verdict,
             PollVerdict::NotYet,
@@ -2210,6 +2265,7 @@ mod tests {
             &flat_frame(),
             &led_view(),
             QUICK_REJECT_MS,
+            &mut PinsStreak::default(),
         );
         assert_eq!(
             verdict,
@@ -2254,16 +2310,124 @@ mod tests {
         );
 
         // 未到时限：继续等（兜底不许把「拒绝时限」这道闸拆掉）。
+        let mut pins = PinsStreak::default();
         assert_eq!(
-            classify_poll_frame(&guard, &frame, &led_view(), QUICK_REJECT_MS - 1),
+            classify_poll_frame(
+                &guard,
+                &frame,
+                &led_view(),
+                QUICK_REJECT_MS - 1,
+                &mut pins
+            ),
             PollVerdict::NotYet,
             "拒绝时限之内一律不许下结论"
         );
-        // 到时限：模板说「不像」，但结构确认是保险柜 ⇒ 放行；hint=None（不冒充任何模板场景）。
-        assert_eq!(
-            classify_poll_frame(&guard, &frame, &led_view(), QUICK_REJECT_MS),
+        // 到时限之后：**连续 3 帧**都确认是保险柜才放行（时间闸，见 `PINS_STREAK_FRAMES`）；
+        // hint=None（不冒充任何模板场景）。
+        for expected in [
+            PollVerdict::NotYet,
+            PollVerdict::NotYet,
             PollVerdict::Ready(None),
-            "保险柜不许被模板闸拒死"
+        ] {
+            assert_eq!(
+                classify_poll_frame(&guard, &frame, &led_view(), QUICK_REJECT_MS, &mut pins),
+                expected,
+                "保险柜要连续 {PINS_STREAK_FRAMES} 帧稳定存在才许放行"
+            );
+        }
+    }
+
+    /// 脚本化抓帧：第 `i` 次抓帧返回 `frames[i]`（脚本用完后重复最后一帧），
+    /// 并记住一共抓了几帧 —— `probe` 闭包自己回读不了计数。
+    struct ScriptedFrames {
+        frames: Vec<Frame>,
+        served: usize,
+    }
+
+    impl ScriptedFrames {
+        fn new(frames: Vec<Frame>) -> Self {
+            Self { frames, served: 0 }
+        }
+
+        fn probe(&mut self) -> Result<Frame, String> {
+            let index = self.served.min(self.frames.len() - 1);
+            self.served += 1;
+            Ok(self.frames[index].clone())
+        }
+    }
+
+    /// `QUICK_REJECT_MS` 之前的帧数（这段窗里一律 `NotYet`，不会计入连击）。
+    fn frames_before_deadline() -> usize {
+        (QUICK_REJECT_MS / READY_POLL_MS) as usize + 1
+    }
+
+    #[test]
+    fn a_pins_frame_needs_three_consecutive_frames_inside_the_poll_loop() {
+        // Z4：时间闸必须长在轮询循环里（状态跨帧），且**第 3 帧**才放行。
+        // 反例：单帧就放行 ⇒ 第 1 个保险柜帧就 Ready（`served` 会停在 deadline 那一帧）。
+        //
+        // 断言里的 `3` 是**用户拍板的策略值**（80ms 一帧 ⇒ 3 帧 ≈ 240ms），故意不引用
+        // `PINS_STREAK_FRAMES`：引用它会让「把常数改成 1」这种退化测试自己跟着放宽。
+        const SPEC_FRAMES: usize = 3;
+        let guard = ui_guard::UiGuard::load(&ui_templates_dir());
+        let mut frames = vec![flat_frame(); frames_before_deadline()];
+        for _ in 0..SPEC_FRAMES {
+            frames.push(pins_screen_frame());
+        }
+        let mut script = ScriptedFrames::new(frames);
+        let cancel = AtomicBool::new(false);
+        let mut clock = MockClock { now: 0 };
+
+        let outcome = poll_scene_ready(
+            &mut clock,
+            &cancel,
+            &guard,
+            &led_view(),
+            READY_BUDGET_MS,
+            || script.probe(),
+        )
+        .expect("抓帧不失败");
+
+        assert!(
+            matches!(outcome, ReadyOutcome::Ready { hint: None, .. }),
+            "连续 {SPEC_FRAMES} 帧保险柜必须放行：{outcome:?}"
+        );
+        assert_eq!(
+            script.served,
+            frames_before_deadline() + SPEC_FRAMES,
+            "必须等到第 {SPEC_FRAMES} 帧才动手（提前放行 = 零星误判帧过关）"
+        );
+    }
+
+    #[test]
+    fn a_non_pins_frame_clears_the_pins_streak() {
+        // Z5：连击中间夹一帧「不是保险柜」⇒ 计数清零，下一次要从 1 重新数。
+        // 反例：不清零 ⇒ 后面第 2 帧（总共第 5 帧）就 Ready ⇒ 红。
+        let guard = ui_guard::UiGuard::load(&ui_templates_dir());
+        let pins_frame = pins_screen_frame();
+        let corridor = flat_frame();
+        let mut streak = PinsStreak::default();
+        let classify = |frame: &Frame, streak: &mut PinsStreak| {
+            classify_poll_frame(&guard, frame, &led_view(), QUICK_REJECT_MS, streak)
+        };
+
+        assert_eq!(classify(&pins_frame, &mut streak), PollVerdict::NotYet);
+        assert_eq!(classify(&pins_frame, &mut streak), PollVerdict::NotYet);
+        assert_eq!(
+            classify(&corridor, &mut streak),
+            PollVerdict::Reject(ui_guard::NOT_UNLOCK_SCREEN),
+            "前提：夹在中间的这一帧是「这不是解锁界面」"
+        );
+        assert_eq!(
+            classify(&pins_frame, &mut streak),
+            PollVerdict::NotYet,
+            "清零后只数到 1 帧，不许放行"
+        );
+        assert_eq!(classify(&pins_frame, &mut streak), PollVerdict::NotYet);
+        assert_eq!(
+            classify(&pins_frame, &mut streak),
+            PollVerdict::Ready(None),
+            "重新数满 {PINS_STREAK_FRAMES} 帧后必须放行"
         );
     }
 
@@ -2278,7 +2442,13 @@ mod tests {
             "前提：走廊帧上没有任何 AZ3 结构"
         );
         assert_eq!(
-            classify_poll_frame(&guard, &frame, &led_view(), QUICK_REJECT_MS),
+            classify_poll_frame(
+                &guard,
+                &frame,
+                &led_view(),
+                QUICK_REJECT_MS,
+                &mut PinsStreak::default()
+            ),
             PollVerdict::Reject(ui_guard::NOT_UNLOCK_SCREEN),
             "兜底只认保险柜，不许放宽成「什么都放行」"
         );
@@ -2296,7 +2466,13 @@ mod tests {
             "前提：这一帧在模板口径下就是莫斯面板"
         );
         assert_eq!(
-            classify_poll_frame(&guard, &frame, &led_view(), QUICK_REJECT_MS),
+            classify_poll_frame(
+                &guard,
+                &frame,
+                &led_view(),
+                QUICK_REJECT_MS,
+                &mut PinsStreak::default()
+            ),
             PollVerdict::Ready(Some(delta_scene::Scene::Morse)),
             "模板结论必须原样透传"
         );
@@ -2311,6 +2487,7 @@ mod tests {
             &flat_frame(),
             &led_view(),
             QUICK_REJECT_MS * 3,
+            &mut PinsStreak::default(),
         );
         assert_eq!(verdict, PollVerdict::NotYet, "没有模板就不许拒绝");
     }
@@ -2472,7 +2649,13 @@ mod tests {
         );
 
         for elapsed in (0..=QUICK_REJECT_MS + 500).step_by(250) {
-            let verdict = classify_poll_frame(&guard, &frame, &view, elapsed);
+            let verdict = classify_poll_frame(
+                &guard,
+                &frame,
+                &view,
+                elapsed,
+                &mut PinsStreak::default(),
+            );
             assert!(
                 !matches!(verdict, PollVerdict::Ready(_)),
                 "模板分极低时任何时刻都不许 Ready（elapsed={elapsed}ms）：{verdict:?}"
@@ -2493,7 +2676,13 @@ mod tests {
         }
         // 对照：没有素材可判时才允许退回结构判别（fail-open，不许把工具变成永久失效）。
         assert_eq!(
-            classify_poll_frame(&ui_guard::UiGuard::default(), &frame, &view, 0),
+            classify_poll_frame(
+                &ui_guard::UiGuard::default(),
+                &frame,
+                &view,
+                0,
+                &mut PinsStreak::default()
+            ),
             PollVerdict::Ready(None),
             "模板库为空时必须退化到结构判别"
         );
