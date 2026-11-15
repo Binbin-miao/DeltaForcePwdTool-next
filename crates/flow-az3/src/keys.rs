@@ -5,9 +5,12 @@
 //!
 //! 闭环（全部判据都来自实测录像，见 `.scratch/az3-fix-batch/spec.md`）：
 //! 1. 每帧整帧抓**一次**，`locate_keys` 量出 16 颗键的**实测矩形**与屏幕里的进度格；
-//! 2. **同一帧亮着黄光的模块按钮全都要点**（用户拍板：不要求顺序、点过的记 `clicked`）；
+//! 2. **亮过黄光的模块按钮全都要点**（用户原话：「黄键亮了之后应该先记住位置，然后点击那些位置，
+//!    而不是黄键消失后就停下」）—— 黄光会被游戏自己收掉，所以「该点哪些」查**观察记忆**
+//!    （[`State::observed`]），不看这一帧还亮不亮；不要求顺序，点过的记 `clicked`；
 //!    黄（待点）与绿（已激活）必须是两个谓词：点完变绿就该立刻收手，不许重复点；
-//! 3. 点完等 [`CLICK_ACK_TIMEOUT_MS`]：进度推进 / 黄光熄灭（变暗或变绿）视为吃下，连续 2 轮无效判 `dead`；
+//! 3. 点完等 [`CLICK_ACK_TIMEOUT_MS`]：**只有进度推进或变绿勾才算吃下**
+//!    （黄光熄灭 ≠ 完成：熄灭也可能只是游戏自己收了高亮），连续 2 轮无效判 `dead`；
 //! 4. 进度**回退**（`checked < peak_checked`）= 游戏换了新一局 / 点了无效键把状态清掉 ⇒ 清账本重来；
 //! 5. 左侧进度格读到 **5 个 ✓** → Done。
 //!
@@ -39,8 +42,16 @@ const TOTAL_STAGES: usize = 5;
 const MIN_GLOW_PIXELS: u32 = 40;
 /// 单格进度勾选的绿色像素数下限（实测 ✓ 约 100~170px，留余量）。
 const MIN_CHECK_PIXELS: u32 = 30;
-/// 点击后等待游戏吃下的上限；超时判定这一轮无效。
-const CLICK_ACK_TIMEOUT_MS: u64 = 400;
+/// 单颗键「已变绿勾」的像素数下限（与 `delta_scene::locate` 的 `SLOT_CHECK_PIXELS` 同源同值）。
+///
+/// 那个常量在 scene 侧是私有的，跨 crate 取不到；两处必须同步 —— 否则「同一颗键算不算变绿」
+/// 在定位层与流程层会给出两个答案。键面比进度格小得多，所以下限取像素而不是占比。
+const GREEN_CHECK_PIXELS: u32 = 6;
+/// 点击后等待游戏确认（变绿勾 / 进度推进）的上限；超时判定这一轮无效。
+///
+/// 1080p 实测「点击 → 动画 → 变绿」明显超过 400ms，400ms 会在动画中途判超时、白记 strike。
+/// **只此一处放宽**：`DEAD_STRIKES` / `LOCATE_FAIL_LIMIT` 等其它常量一律不动。
+const CLICK_ACK_TIMEOUT_MS: u64 = 700;
 /// 同一颗键连续这么多轮「点了还亮且进度没动」才判死（spec B6）。
 const DEAD_STRIKES: u8 = 2;
 /// 连续多少帧定位失败才放弃（50ms 轮询下 ≈0.3s 容错）。
@@ -52,7 +63,7 @@ const MAX_DEGENERATE_RESETS: u8 = 3;
 /// 定位失败时给用户的下一步动作。
 const POSE_HINT: &str = "（请正对按键面板，让屏幕和 4×4 按键都进入画面）";
 /// 进度格读不到时的收尾说明（这台机器可能真的读不出来）。
-const PROGRESS_NOTE: &str = "；退化判据：进度格未识别，本条结论依据「黄光熄灭」";
+const PROGRESS_NOTE: &str = "；退化判据：进度格未识别，本条结论依据「绿勾确认 / 在册待点键点完」";
 
 /// 靶点分类：**只有 [`KeyTarget::ModuleButton`] 允许发点击**，[`KeyTarget::ProgressBox`] 只读。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +88,22 @@ pub fn run(
     az3: &PxAz3,
     cancel: &AtomicBool,
 ) -> Az3Outcome {
+    run_with_seed(screen, pointer, clock, az3, cancel, None)
+}
+
+/// 带「开跑前那一帧」的入口：那一帧里已经亮着的键也要进观察记忆。
+///
+/// `seed` = 就绪等待确认的那一帧。存在的理由：按 F 的瞬间黄键正好亮着，
+/// 而这一帧通常在新建任务会话之前就抓完了 —— 丢了它，那颗键要等它下次亮才被记住。
+/// 定位失败就跳过（绝不 panic，也绝不因此放弃任务）。
+pub fn run_with_seed(
+    screen: &mut impl Screen,
+    pointer: &mut impl Pointer,
+    clock: &mut impl Clock,
+    az3: &PxAz3,
+    cancel: &AtomicBool,
+    seed: Option<&Frame>,
+) -> Az3Outcome {
     let rect = screen.frame_rect();
     if rect.w <= 0 || rect.h <= 0 {
         return aborted(
@@ -92,6 +119,9 @@ pub fn run(
     // 全局事件计数是**进程级累计量**，必须减基线才是「本任务发了多少」。
     let event_baseline = pointer.event_count();
     let mut state = State::default();
+    if let Some(frame) = seed {
+        state.observe_seed(frame, scale);
+    }
 
     for _ in 0..az3.frame_budget.max(1) {
         if cancel.load(Ordering::SeqCst) {
@@ -130,6 +160,12 @@ pub fn run(
 struct State {
     clicked: [bool; CELLS],
     dead: [bool; CELLS],
+    /// 本次任务里**曾经见到它发黄光**的键。只增不减（`reset_board_marks` / 盘面重扫时整体清零）。
+    ///
+    /// 存在的理由：黄光会被游戏自己收掉，但该键仍然需要被点（用户明确要求）。
+    /// 与 `clicked` 的分工：`clicked` = 点过，`observed` = 见过 —— 「本帧亮不亮」与「该不该点」
+    /// 是两个不同的问题，混成一个就是「黄键消失后就停下」的根因。
+    observed: [bool; CELLS],
     /// 同一颗键「点了还亮着且进度不动」的轮数（到 [`DEAD_STRIKES`] 判死）。
     strikes: [u8; CELLS],
     /// 本轮已点、还没得到游戏回应的键。
@@ -183,14 +219,26 @@ impl State {
             }
         }
 
-        // 上一轮点击还没有结论 → 本帧先别再点（只认「还在发黄光」的键，已变绿算吃下）。
+        // 上一轮点击还没有结论 → 本帧只点**新观察到的**键（`pending` 里的已被 `clicked` 挡住），
+        // 但「先记住位置」这件事与等待无关：顺序必须是先并入记忆、再选目标，
+        // 否则本帧刚亮的键这一帧就选不到。
         let yellow_lit = yellow_lit_cells(frame, &located.cells, min_glow);
-        if self.waiting(checked, &yellow_lit, clock.now_ms()) {
-            return None;
-        }
+        self.absorb_yellow(&yellow_lit);
 
-        let targets = pick_yellow_targets(frame, &located, &self.clicked, &self.dead, min_glow);
+        // 没有待确认的键就不扫绿勾：16 格像素扫描是热路径上实打实的开销。
+        let acked_green = if self.pending.is_empty() {
+            Vec::new()
+        } else {
+            green_cells(frame, &located.cells, crate::scaled_area(GREEN_CHECK_PIXELS, scale))
+        };
+        let waiting = self.waiting(checked, &acked_green, clock.now_ms());
+
+        let targets = pick_yellow_targets(&located, &self.observed, &self.clicked, &self.dead);
         if targets.is_empty() {
+            // 还在等回应时不得判穷尽：那会把「点了不生效」误判成「这一局点完了」。
+            if waiting {
+                return None;
+            }
             let reset_candidate = has_unspent_yellow(&yellow_lit, &located, &self.dead);
             return self.on_no_target(checked, reset_candidate, pointer.event_count());
         }
@@ -220,6 +268,24 @@ impl State {
         None
     }
 
+    /// 把「本帧发黄光」的格并入观察记忆（`step` 与 [`run_with_seed`] 共用同一段逻辑）。
+    fn absorb_yellow(&mut self, yellow_lit: &[usize]) {
+        for index in yellow_lit {
+            if let Some(slot) = self.observed.get_mut(*index) {
+                *slot = true;
+            }
+        }
+    }
+
+    /// 并入「开跑前那一帧」的观察结果；面板定位不出来就跳过（不 panic、不放弃任务）。
+    fn observe_seed(&mut self, frame: &Frame, scale: f32) {
+        let Ok(located) = locate_keys(frame) else {
+            return;
+        };
+        let min_glow = crate::scaled_area(MIN_GLOW_PIXELS, scale);
+        self.absorb_yellow(&yellow_lit_cells(frame, &located.cells, min_glow));
+    }
+
     /// 清掉「本局盘面」的标记，重开一局。
     ///
     /// **不清** `clicks` 与 `locate_misses`：那是给用户看的报告口径（一共点过几次、
@@ -228,6 +294,8 @@ impl State {
         self.clicked = [false; CELLS];
         self.dead = [false; CELLS];
         self.strikes = [0; CELLS];
+        // 观察记忆记录的是**这块盘面**的证据：新盘面一到，旧证据必须一起作废（spec B7）。
+        self.observed = [false; CELLS];
         self.pending.clear();
         self.baseline = current_progress;
         self.peak_checked = Some(current_progress);
@@ -241,28 +309,29 @@ impl State {
         Some(count_checked(frame, &located.progress, min_check))
     }
 
-    /// 处理上一轮点击的回应；返回 `true` = 本帧还没有结论，先别再点。
-    fn waiting(&mut self, checked: Option<usize>, yellow_lit: &[usize], now: u64) -> bool {
+    /// 处理上一轮点击的回应；返回 `true` = 本帧还没有结论，先别再点**同一批**键。
+    ///
+    /// **黄光熄灭 ≠ 完成**：熄灭有两种互斥含义 —— ① 我点掉了（那会变绿勾）/ ② 游戏自己收了高亮。
+    /// 旧实现把「看不到黄光了」当成「吃下了」，于是没生效的点击也被记成成功（`clicked`
+    /// 保持 `true`），那颗键**再也不会被点**。现在只认两种证据：进度推进、变绿勾。
+    fn waiting(&mut self, checked: Option<usize>, acked_green: &[usize], now: u64) -> bool {
         if self.pending.is_empty() {
             return false;
         }
-        let elapsed = now.saturating_sub(self.click_ms) >= CLICK_ACK_TIMEOUT_MS;
         // 判据一（最可靠，能读到进度格时）：进度推进就算这一轮吃下了。
         if checked.is_some_and(|checked| checked > self.baseline) {
             self.pending.clear();
             return false;
         }
-        // 判据二（永远可用）：**黄光熄灭** —— 变暗或转绿都算。
-        // 只认黄光才成立：绿勾是「已完成」的标志，把绿也算成「还亮着」会让 ack 永远等不到。
-        let still_lit = self.pending.iter().any(|index| yellow_lit.contains(index));
-        if !still_lit {
+        // 判据二：pending 里有格**变绿勾** ⇒ 游戏确认了这一下（不记 strike、不判死）。
+        if self.pending.iter().any(|index| acked_green.contains(index)) {
             self.pending.clear();
             return false;
         }
-        if !elapsed {
+        if now.saturating_sub(self.click_ms) < CLICK_ACK_TIMEOUT_MS {
             return true;
         }
-        // 超时仍亮着：累计无效轮数，到上限判死；没到上限的放回可点池重试（spec B5/B6）。
+        // 超时仍未变绿：累计无效轮数，到上限判死；没到上限的放回可点池重试（spec B3）。
         for index in std::mem::take(&mut self.pending) {
             self.strikes[index] = self.strikes[index].saturating_add(1);
             if self.strikes[index] >= DEAD_STRIKES {
@@ -272,6 +341,11 @@ impl State {
             }
         }
         false
+    }
+
+    /// 这局盘面里**曾经发过黄光**的格数（文案口径：只数在册的键，不是 16 格）。
+    fn lit_once_count(&self) -> usize {
+        self.observed.iter().filter(|lit| **lit).count()
     }
 
     /// 没有可点的黄键：要么等下一帧，要么（不能再期待任何黄键）收尾。
@@ -285,7 +359,22 @@ impl State {
         reset_candidate: bool,
         events: u64,
     ) -> Option<Az3Outcome> {
-        let exhausted = (0..CELLS).all(|index| self.clicked[index] || self.dead[index]);
+        // 该点的集合是 `observed`：从没亮过的暗格不需要点，不该拦住收尾（spec A6/B6）。
+        // 旧判据要求 16 格全 `clicked`，14 个从未亮过的暗格会永远挡住收尾 ⇒ 一路空转到
+        // `frame_budget`(300)，用户看到「超时」，而实际早就点完了。
+        //
+        // 但「什么都没见过」≠「都点完了」：`observed` 全空说明这一局还没开始亮（首帧、或退化
+        // 重扫刚清空账本），此时收尾会把「还没看到」误判成「已经点完」。所以先要求至少见过一颗。
+        //
+        // 已知边界：本判据隐含「一局内该亮的键在短时内全部出现」（spec L13 实测同盘同亮 5 个）。
+        // 若将来出现「分批点亮」的机关，应加「连续 N 帧无新键亮起」的静默判据，**不是**回退本条。
+        let lit_once = self.lit_once_count();
+        if lit_once == 0 {
+            return None;
+        }
+        let exhausted = (0..CELLS).all(|index| {
+            !self.observed[index] || self.clicked[index] || self.dead[index]
+        });
         if !exhausted {
             return None;
         }
@@ -293,6 +382,8 @@ impl State {
             None if reset_candidate && self.degenerate_resets < MAX_DEGENERATE_RESETS => {
                 self.degenerate_resets += 1;
                 self.clicked = [false; CELLS];
+                // 盘面被重置过 ⇒ 旧盘面的黄光证据一起作废，否则会拿旧证据去点新盘面（spec B7）。
+                self.observed = [false; CELLS];
                 None
             }
             None if reset_candidate => Some(aborted(
@@ -303,13 +394,14 @@ impl State {
                 ),
             )),
             None => {
-                // 退化判据：进度读不到，以「16 格点完」收尾，且必须写明用的是哪条判据。
-                let summary = format!("黄键台 {CELLS} 键已全部点过{PROGRESS_NOTE}");
+                // 退化判据：进度读不到，以「在册待点键全点完」收尾，且必须写明用的是哪条判据。
+                let summary = format!("黄键台 {lit_once} 个亮过的键已全部点过{PROGRESS_NOTE}");
                 Some(done(events, &summary, self.clicks))
             }
             Some(checked) => Some(aborted(
                 events,
-                format!("黄键台：{CELLS} 键已点完但进度未满（{checked}/{TOTAL_STAGES}）"),
+                // 数字同样取**实际在册数**（不是 `CELLS`）：没亮过的键不该被算进「点完」。
+                format!("黄键台：{lit_once} 键已点完但进度未满（{checked}/{TOTAL_STAGES}）"),
             )),
         }
     }
@@ -380,10 +472,27 @@ fn intersects(left: PxRect, right: PxRect) -> bool {
 }
 
 /// 本帧**仍在发黄光**的格序号（已经变绿的完成态不在其中）。
+///
+/// 它回答的是「本帧谁亮着」——并入观察记忆与盘面重置检测用；**不是选靶依据**。
 fn yellow_lit_cells(frame: &Frame, cells: &[PxRect], min_glow: u32) -> Vec<usize> {
     (0..cells.len())
         .filter(|&index| yellow_of(frame, cells, index) >= min_glow)
         .collect()
+}
+
+/// 本帧**已经变绿勾**的格序号（与 [`yellow_lit_cells`] 成对：一个答「还亮着」，一个答「已激活」）。
+fn green_cells(frame: &Frame, cells: &[PxRect], min_green: u32) -> Vec<usize> {
+    (0..cells.len())
+        .filter(|&index| is_check_green_cell(frame, cells, index, min_green))
+        .collect()
+}
+
+/// 这一格是否已经变绿勾（越界返回 `false`：宁可继续等，也不把不存在的格当成已完成）。
+fn is_check_green_cell(frame: &Frame, cells: &[PxRect], index: usize, min_green: u32) -> bool {
+    let Some(cell) = cells.get(index) else {
+        return false;
+    };
+    geom::count_in(frame, geom::clip(frame, *cell), geom::is_check_green) >= min_green
 }
 
 /// 盘面上是否还有「亮着、没判死、且属于可点击靶点」的键。
@@ -399,16 +508,17 @@ fn has_unspent_yellow(yellow_lit: &[usize], located: &LocatedKeys, dead: &[bool;
     })
 }
 
-/// 本帧要点的**全部**待点黄键：发黄光、没点过、没判死、且属于可点击靶点。
+/// 本帧要点的**全部在册待点**键：曾见过发黄光、没点过、没判死，且属于可点击靶点。
 ///
-/// 用户拍板：同一帧亮着的模块按钮**全都要点，不要求顺序**（实测同亮 5 个）；
-/// 只挑「最亮的一个」会让 5 个亮键互相等待，最后卡在 4/5。
+/// 只查账本（`observed` / `clicked` / `dead`），**不看这一帧的亮光** —— 黄光会被游戏自己收掉，
+/// 用「本帧还亮着」当条件会让熄灭的键永久退出目标池（用户原话：「黄键消失后就停下」）。
+/// 用户拍板：这些键**全都要点，不要求顺序**（实测同亮 5 个）；只挑「最亮的一个」会让
+/// 5 个亮键互相等待，最后卡在 4/5。
 fn pick_yellow_targets(
-    frame: &Frame,
     located: &LocatedKeys,
+    observed: &[bool; CELLS],
     clicked: &[bool; CELLS],
     dead: &[bool; CELLS],
-    min_glow: u32,
 ) -> Vec<(usize, PxPoint)> {
     located
         .cells
@@ -416,13 +526,14 @@ fn pick_yellow_targets(
         .enumerate()
         .filter(|(index, _)| !is_spent(*index, clicked, dead))
         .filter(|(_, cell)| classify(**cell, &located.progress).clickable())
-        .filter(|(index, _)| yellow_of(frame, &located.cells, *index) >= min_glow)
+        .filter(|(index, _)| observed.get(*index).copied().unwrap_or(false))
         .map(|(index, cell)| (index, center_of(*cell)))
         .collect()
 }
 
 /// 某一格的**纯黄**高亮像素数（越界或已变绿返回 0）。
 ///
+/// 只回答「这一帧亮不亮」，**不代表这一格该被点**（该不该点由观察记忆决定）。
 /// 必须只认黄：绿勾判据（[`geom::is_check_green`]）是「这一格已经完成」，
 /// 把它算成「还亮着」会让 ack 永远等不到，同一颗键被反复点。
 fn yellow_of(frame: &Frame, cells: &[PxRect], index: usize) -> u32 {
@@ -530,6 +641,105 @@ mod tests {
     }
 
     #[test]
+    fn green_cells_sees_only_the_activated_key() {
+        // 反例必须能失败（LESSON-005）：纯黄键不算绿勾，只有变绿的键才算。
+        let cell = PxRect {
+            x: 10,
+            y: 10,
+            w: 20,
+            h: 20,
+        };
+        let yellow = frame_with_rect(60, 60, cell, LIT_YELLOW);
+        let green = frame_with_rect(60, 60, cell, CHECK_GREEN);
+
+        assert!(
+            green_cells(&yellow, &[cell], GREEN_CHECK_PIXELS).is_empty(),
+            "纯黄键不许算成已激活"
+        );
+        assert_eq!(
+            green_cells(&green, &[cell], GREEN_CHECK_PIXELS),
+            vec![0],
+            "变绿键必须算已激活"
+        );
+    }
+
+    #[test]
+    fn a_dark_but_not_green_key_is_not_acknowledged() {
+        // B3：黄光熄灭 + 未变绿 + 进度不动 ⇒ 不许当成吃下（这正是把未点到的键误判成完成的元凶）。
+        let mut state = State::default();
+        state.clicked[2] = true;
+        state.pending.push(2);
+        state.click_ms = 100;
+
+        assert!(state.waiting(Some(0), &[], 200), "熄灭但没变绿 ⇒ 必须继续等");
+        assert_eq!(state.pending, vec![2], "还没结论，待确认不许清空");
+        assert!(state.clicked[2], "还没结论，不许放回可点池重试");
+        assert_eq!(state.strikes[2], 0, "等待期内不记 strike");
+
+        // 700ms 后仍没变绿 ⇒ 记一轮无效，未判死则放回可点池重试。
+        assert!(!state.waiting(Some(0), &[], 100 + CLICK_ACK_TIMEOUT_MS));
+        assert_eq!(state.strikes[2], 1);
+        assert!(!state.clicked[2], "未判死必须允许重试");
+        assert!(!state.dead[2]);
+    }
+
+    #[test]
+    fn a_key_that_was_lit_once_is_still_picked_after_the_glow_goes_out() {
+        // B1（用户原话）：亮过一帧就记住位置，黄光熄灭那一帧仍然要把它选进目标池。
+        let lit = panel_frame(&[7], true);
+        let dark = panel_frame(&[], true);
+        let lit_cells = locate_keys(&lit).expect("合成面板必须定位成功").cells;
+        let located = locate_keys(&dark).expect("合成面板必须定位成功");
+        assert!(
+            yellow_lit_cells(&dark, &located.cells, MIN_GLOW_PIXELS).is_empty(),
+            "前提：这一帧一颗键都不亮"
+        );
+
+        let mut state = State::default();
+        state.absorb_yellow(&yellow_lit_cells(&lit, &lit_cells, MIN_GLOW_PIXELS));
+        assert!(state.observed[7], "亮过就必须记住");
+
+        let targets = pick_yellow_targets(
+            &located,
+            &state.observed,
+            &[false; CELLS],
+            &[false; CELLS],
+        );
+        assert_eq!(targets.len(), 1, "只该有那一颗被记住的键：{targets:?}");
+        assert_eq!(targets[0].0, 7, "熄灭的键仍必须被点：{targets:?}");
+    }
+
+    #[test]
+    fn a_key_that_never_lit_is_never_picked() {
+        // B2：从没亮过的暗键永远不许点（防止对暗键乱按）。
+        let frame = panel_frame(&[0, 1, 2, 3, 4], true);
+        let located = locate_keys(&frame).expect("合成面板必须定位成功");
+        let blank = State::default();
+
+        let targets = pick_yellow_targets(
+            &located,
+            &blank.observed,
+            &[false; CELLS],
+            &[false; CELLS],
+        );
+        assert!(targets.is_empty(), "记忆全空时一个都不许点：{targets:?}");
+
+        // 对照：把本帧亮光并入记忆后，正好这 5 颗可点。
+        let mut state = State::default();
+        state.absorb_yellow(&yellow_lit_cells(&frame, &located.cells, MIN_GLOW_PIXELS));
+        let picked: Vec<usize> = pick_yellow_targets(
+            &located,
+            &state.observed,
+            &[false; CELLS],
+            &[false; CELLS],
+        )
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect();
+        assert_eq!(picked, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
     fn waiting_clears_pending_immediately_when_the_button_turns_green() {
         // B3：点后变绿 ⇒ 下一帧就能继续点别的键，不记 strike、不判死。
         let mut state = State::default();
@@ -537,7 +747,7 @@ mod tests {
         state.pending.push(2);
         state.click_ms = 100;
 
-        assert!(!state.waiting(Some(0), &[], 110), "黄光已熄灭（转绿）⇒ 立刻放行");
+        assert!(!state.waiting(Some(0), &[2], 110), "黄光已熄灭（转绿）⇒ 立刻放行");
         assert!(state.pending.is_empty());
         assert_eq!(state.strikes[2], 0, "正常变绿不该记入超时失误");
         assert!(!state.dead[2], "正常变绿不许判死");
@@ -570,6 +780,7 @@ mod tests {
     fn degenerate_resets_stop_at_the_limit_and_abort() {
         // B5：读不到进度时每次「重置」都是盲重扫，必须有上限 —— 不许死循环。
         let mut state = State {
+            observed: [true; CELLS],
             clicked: [true; CELLS],
             ..State::default()
         };
@@ -579,6 +790,8 @@ mod tests {
                 "上限之内允许清零重扫"
             );
             assert!(state.clicked.iter().all(|flag| !flag));
+            // 重扫把账本全清了；模拟「又把这局该点的键都见过并点完」，才能走到上限。
+            state.observed = [true; CELLS];
             state.clicked = [true; CELLS];
         }
 
@@ -592,8 +805,9 @@ mod tests {
 
     #[test]
     fn a_spent_board_without_a_lit_button_finishes_on_the_degraded_criterion() {
-        // 退化模式正常收尾：16 格都点过、且没有黄键还亮着 ⇒ Done，并写明用的是哪条判据。
+        // 退化模式正常收尾：16 格都见过并点过、且没有黄键还亮着 ⇒ Done，并写明用的是哪条判据。
         let mut state = State {
+            observed: [true; CELLS],
             clicked: [true; CELLS],
             ..State::default()
         };
@@ -603,6 +817,59 @@ mod tests {
             matches!(&outcome, Az3Outcome::Done { summary, .. } if summary.contains("退化判据")),
             "{outcome:?}"
         );
+    }
+
+    #[test]
+    fn a_board_with_only_two_lit_keys_finishes_instead_of_spinning_to_the_budget() {
+        // A6/B6：退化路径（读不到进度）下只有 2 格亮过并点完 ⇒ 立刻收尾，不许空转到 frame_budget。
+        // 旧判据要求 16 格全 `clicked`，14 个从未亮过的暗格会永远挡住收尾 ⇒ 「点完了却报超时」。
+        let mut state = State::default();
+        for index in [0, 1] {
+            state.observed[index] = true;
+            state.clicked[index] = true;
+            state.clicks += 1;
+        }
+
+        let outcome = state.on_no_target(None, false, 0).expect("在册待点键点完必须立刻收尾");
+        match outcome {
+            Az3Outcome::Done { steps, summary, .. } => {
+                assert_eq!(steps, 2, "报告口径必须是实际点击数");
+                assert!(
+                    summary.contains("2 个亮过的键"),
+                    "文案必须给实际在册数，不许再写 16 键：{summary}"
+                );
+            }
+            other => panic!("退化路径点完必须 Done，实际：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_observation_is_not_mistaken_for_a_finished_board() {
+        // 反例守卫：什么都没见过 ≠ 都点完了。首帧还没亮键、或退化重扫刚清空账本时收尾，
+        // 会把「还没看到」误判成「已经点完」（退化档报完成、正常档报「0 键点完但进度未满」）。
+        let mut state = State::default();
+        assert!(
+            state.on_no_target(None, false, 0).is_none(),
+            "一次都没见过亮键时不许收尾"
+        );
+    }
+
+    #[test]
+    fn the_frame_at_the_moment_of_pressing_f_seeds_the_observed_memory() {
+        // A12/B11：按 F 那一刻正好亮着的键，必须在开跑前就进记忆（不等下一帧）。
+        let frame = panel_frame(&[7], true);
+        let located = locate_keys(&frame).expect("合成面板必须定位成功");
+
+        let mut state = State::default();
+        state.observe_seed(&frame, 1.0);
+        assert!(state.observed[7], "种子帧里亮着的键必须被记住");
+
+        let picked: Vec<usize> =
+            pick_yellow_targets(&located, &state.observed, &state.clicked, &state.dead)
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect();
+        assert_eq!(picked, vec![7], "种子里的键必须能被选中：{picked:?}");
     }
 
     #[test]

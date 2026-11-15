@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use delta_capture::{CaptureBackend, CaptureSession, Frame, FRAME_BUDGET};
+use delta_capture::{CaptureBackend, CaptureSession, Frame};
 use delta_config::{Config, PxView, Timings};
 use delta_flow_az3::Clock;
 use delta_geom::{MonitorInfo, PxPoint, PxRect};
@@ -379,9 +379,10 @@ pub fn grab_full(monitor: MonitorInfo, backend: CaptureBackend) -> Result<Frame,
 
 /// 建一次识别任务的采集会话（spec D3：任务开始建、结束 `Drop`）。
 ///
-/// 失败即报错，**不回退到 BitBlt**（spec D5 显式边界：自动降级会掩盖问题）。
+/// 配额取 [`READY_FRAME_BUDGET`]：就绪等待两阶段最多烧 150 帧，默认的 20 张连 2 秒都撑不住
+/// （见该常量的注释）。失败即报错，**不回退到 BitBlt**（spec D5 显式边界：自动降级会掩盖问题）。
 fn open_session(config: &Config, tx: &mpsc::Sender<UiEvent>) -> Option<CaptureSession> {
-    match CaptureSession::new(config.capture_backend) {
+    match CaptureSession::with_budget(config.capture_backend, READY_FRAME_BUDGET) {
         Ok(session) => Some(session),
         Err(error) => {
             let _ = tx.send(UiEvent::Failed(error.to_string()));
@@ -390,33 +391,59 @@ fn open_session(config: &Config, tx: &mpsc::Sender<UiEvent>) -> Option<CaptureSe
     }
 }
 
+/// 抓帧失败的原因文案：**配额用尽必须单独点明**。
+///
+/// 配额耗尽与「画面抓不到」是两件完全不同的事，混成「未检测到游戏界面」会把下一轮排查
+/// 直接带偏（会去怀疑模板/分辨率，而真正的原因是帧数早用完了）。
+fn grab_note(error: delta_capture::CaptureError) -> String {
+    match error {
+        delta_capture::CaptureError::BudgetExceeded { limit } => {
+            format!("抓帧配额用尽（上限 {limit} 张）：本次任务抓帧次数已用完，请重试")
+        }
+        other => other.to_string(),
+    }
+}
+
 // ── 就绪等待（Q1/Q3：面板 0.4s 才淡入、首颗亮键 1.8s 才出现）──
 
 /// 就绪轮询的**总预算**：既是 [`wait_keys_ready`] 等面板的余额，也是场景等待的上界。
 ///
-/// 必须 > [`QUICK_REJECT_MS`]，否则拒绝分支等不满、退化成 `Exhausted`。
-/// 3500 = 3000 拒绝时限 + 500 抓帧/编码余量（40ms 一帧 ⇒ 12 帧余量）。
+/// 必须 > [`QUICK_REJECT_MS`]（现 5000），否则拒绝分支等不满、退化成 `Exhausted`。
+/// 6000 = 5000 拒绝时限 + 1000 抓帧/编码余量（[`READY_POLL_MS`] 一帧 ⇒ 12 帧余量）。
+/// 为什么是 6000 而不是 3500：黄键台首次打开有「拧按钮」的开场动画，动画期间模板分低、
+/// 面板结构也量不全（`keys_panel_ready` 不给 `Found`），3500 会在动画结束前就放弃，
+/// 正好错过动画结束后那第一次亮黄键 —— 用户看到的就是「拧完亮黄键，程序完全没反应」。
 /// 历史上这里是 2100（「面板出现到第一颗亮键 1.4s × 1.5」），就绪闸不再看亮键后
 /// 这个依据已失效，改为服从上面的不等式。
-pub const READY_BUDGET_MS: u64 = 3500;
-/// 等待期间的抓帧间隔（40ms ≈ 25fps；3.5s 约 88 帧，任务会话 300 帧装得下）。
-const READY_POLL_MS: u64 = 40;
+pub const READY_BUDGET_MS: u64 = 6000;
+/// 等待期间的抓帧间隔（80ms ≈ 12.5fps；6s 约 75 帧/阶段，两阶段仍在本阶段配额之内）。
+///
+/// 间隔必须与 [`READY_FRAME_BUDGET`] 一起看：配额是**帧数**，预算与间隔决定**帧数**。
+const READY_POLL_MS: u64 = 80;
+/// 就绪等待（模板闸 + 面板就绪两阶段）**共用的抓帧配额**。
+///
+/// 旧实现用默认 [`FRAME_BUDGET`]（20 张）：40ms 一帧 ⇒ 800ms 就把 20 张耗尽，之后
+/// `grab` 直接 `BudgetExceeded`，画面再好也判不出来 —— 这是「程序完全没反应」的第二个来源。
+/// 现在按最坏情况算：`READY_BUDGET_MS / READY_POLL_MS` = 75 帧/阶段，两阶段 ≤150，
+/// 配额 200 留出余量（单元测试 [`ready_frame_budget_covers_both_stages`] 钉住这个不等式）。
+const READY_FRAME_BUDGET: u32 = 200;
 /// 场景判别的容忍线：连续这么多帧 `Unknown` 才允许判「预算耗尽」（spec P6）。
 const SCENE_UNKNOWN_FRAMES: u32 = 3;
-/// 快速拒绝的时间线：**3 秒**（用户拍板：「模板没命中时先等 3 秒再拒绝」）。
+/// 快速拒绝的时间线：**5 秒**（用户拍板：「模板没命中时先等 3 秒再拒绝」，后按实测放宽到 5s）。
 ///
 /// 0~`QUICK_REJECT_MS` 之间「一帧都不像任何解锁界面」是**正常现象**，一律不得拒绝。
-/// 这个窗必须容得下两件事，缺一条就会误拒真面板：
+/// 这个窗必须容得下三件事，缺一条就会误拒真面板：
 /// 1. 面板淡入实测 0.400~1.400s（`.scratch/az3-fix-batch/spec.md` §0⑤ 锚点表）；
-/// 2. 玩家镜头在**靠近过程中会移动**，同一块面板在画面里会漂、会虚 —— 实测录屏 92.00~92.75s
+/// 2. 黄键台首次打开还有一段「拧按钮」开场动画，动画期间模板分同样上不去；
+/// 3. 玩家镜头在**靠近过程中会移动**，同一块面板在画面里会漂、会虚 —— 实测录屏 92.00~92.75s
 ///    整段模板分掉到 <0.60（其余时段 0.894~0.955），随后又恢复。
 ///
 /// 旧的 400ms 太短：40ms 一帧、400ms 只有 10 帧，镜头一动就整段落在「一帧都不像」，
 /// 于是一个**已确认存在**的面板被当场拒掉 —— 这就是「按一次 F 没用」的直接原因。
 ///
-/// **必须 < [`READY_BUDGET_MS`]**：轮询预算是拒绝时限的上界，预算短于时限时
+/// **必须 < [`READY_BUDGET_MS`]**（现 6000）：轮询预算是拒绝时限的上界，预算短于时限时
 /// 这条拒绝永远等不满，所有非解锁界面都会退化成「预算耗尽」的错归因。
-const QUICK_REJECT_MS: u64 = 3000;
+const QUICK_REJECT_MS: u64 = 5000;
 
 /// 通用就绪等待：每轮取一次 `probe`，`Found` 立刻返回；预算用尽返回最后一次的三态。
 ///
@@ -530,7 +557,7 @@ fn wait_scene_ready(
 ) -> ReadyOutcome {
     let mut clock = delta_flow_az3::SystemClock::new();
     match poll_scene_ready(&mut clock, cancel, guard, view, READY_BUDGET_MS, || {
-        session.grab(full).map_err(|error| error.to_string())
+        session.grab(full).map_err(grab_note)
     }) {
         Ok(outcome) => outcome,
         Err(reason) => {
@@ -601,7 +628,7 @@ fn wait_keys_ready(
     wait_ready(&mut clock, cancel, READY_BUDGET_MS, 1, || match session.grab(full) {
         Ok(frame) => keys_ready_probe(frame),
         Err(error) => {
-            let _ = tx.send(UiEvent::Failed(error.to_string()));
+            let _ = tx.send(UiEvent::Failed(grab_note(error)));
             Locate::Absent
         }
     })
@@ -711,7 +738,7 @@ fn grab_now(
     match session.grab(full) {
         Ok(frame) => Some(frame),
         Err(error) => {
-            let _ = tx.send(UiEvent::Failed(error.to_string()));
+            let _ = tx.send(UiEvent::Failed(grab_note(error)));
             None
         }
     }
@@ -963,8 +990,9 @@ fn run_once(
         SceneKind::Console => {
             if az3_kind.is_known() {
                 // AZ3 实时抓帧上限 300 帧 / 15s（仅任务期存在，结束即 Drop；空闲期零抓帧）。
+                // `frame` 就是就绪等待确认的那一帧 —— 黄键台要把它已看到的黄键带进流程。
                 drop(session);
-                run_az3(&snapshot, &view, az3_kind, monitor, cancel, tx);
+                run_az3(&snapshot, &view, az3_kind, monitor, cancel, tx, Some(&frame));
             } else {
                 // 旧操作台复用当前会话（配额与留证逻辑都在 `run_console` 内），
                 // 会话随本函数出口 Drop。
@@ -1183,6 +1211,9 @@ fn run_fingerprint(
 }
 
 /// AZ3 统一闭环入口（使用 `CaptureSession::with_budget` 300 帧 / 15s 预算）。
+///
+/// `seed` = 就绪等待确认的那一帧：黄键台要把它**已经看到的黄键位置**带进流程
+/// （按 F 的瞬间黄键正好亮着时，这一帧不能丢）。只有黄键台用得上，其余玩法忽略它。
 fn run_az3(
     config: &Config,
     view: &PxView,
@@ -1190,6 +1221,7 @@ fn run_az3(
     monitor: MonitorInfo,
     cancel: &AtomicBool,
     tx: &mpsc::Sender<UiEvent>,
+    seed: Option<&Frame>,
 ) {
     let budget = view.az3.frame_budget.max(delta_flow_az3::AZ3_FRAME_BUDGET);
     let mut session = match CaptureSession::with_budget(config.capture_backend, budget) {
@@ -1203,7 +1235,7 @@ fn run_az3(
     let mut clock = delta_flow_az3::SystemClock::new();
     let mut screen = delta_flow_az3::SystemScreen::new(&mut session);
     // 信号线台现在是「每帧自适应定位 + 只上下拖」的闭环，入口在 `line::run`；
-    // 其余三类仍走统调度。
+    // 黄键台要带首帧观察种子（t7）；其余两类仍走统调度。
     let outcome = if kind == delta_scene::Az3Kind::SignalLine {
         delta_flow_az3::line::run(
             &mut screen,
@@ -1213,15 +1245,18 @@ fn run_az3(
             &view.az3,
             cancel,
         )
+    } else if kind == delta_scene::Az3Kind::ModuleKeys {
+        delta_flow_az3::keys::run_with_seed(
+            &mut screen,
+            &mut pointer,
+            &mut clock,
+            &view.az3,
+            cancel,
+            seed,
+        )
     } else {
         delta_flow_az3::run(kind, &mut screen, &mut pointer, &mut clock, &view.az3, cancel)
     };
-    if session.frames_taken() >= session.budget() {
-        let detail = format!("已抓帧数: {}（上限 {}）", session.frames_taken(), session.budget());
-        save_failure_evidence("AZ3 截图次数超限", monitor, config.capture_backend, &detail);
-        let _ = tx.send(UiEvent::Failed("截图次数超限".to_owned()));
-        return;
-    }
     match outcome {
         delta_flow_az3::Az3Outcome::Done { kind, steps, summary, .. } => {
             save_evidence(
@@ -1240,6 +1275,15 @@ fn run_az3(
             let _ = tx.send(UiEvent::Succeeded(format!("{} · 已完成", kind.label())));
         }
         delta_flow_az3::Az3Outcome::Aborted { kind, reason, events } => {
+            // 配额耗尽时 reason 必须是配额口径，不能被 flow 层「画面抓不到」之类的通用文案盖掉
+            // （spec B10）。只在这里改判文案：`Done` 分支一行不动，否则「5/5 点完却报失败」。
+            let used = session.frames_taken();
+            let limit = session.budget();
+            let reason = if budget_exhausted(used, limit) {
+                budget_reason(used, limit)
+            } else {
+                reason
+            };
             save_failure_evidence(
                 &reason,
                 monitor,
@@ -1308,8 +1352,20 @@ fn run_console(
 }
 
 /// 配额是否已用尽（纯判定，便于单测）。
-fn budget_exhausted(used: u32) -> bool {
-    used >= FRAME_BUDGET
+///
+/// **尺子由调用方传**：会话配额分两层（就绪会话 [`READY_FRAME_BUDGET`] = 200、
+/// 其余会话默认 `FRAME_BUDGET` = 20），判定若硬编码默认值，改成 200 之后
+/// 「已抓 20 帧」会被当成超限，三条单测也会静默失效（永远为假 ⇒ 超限检测形同不存在）。
+fn budget_exhausted(used: u32, limit: u32) -> bool {
+    used >= limit
+}
+
+/// 配额耗尽的**唯一**文案来源（`over_budget` 与 AZ3 收尾共用，防两处口径漂移）。
+///
+/// 必须含「抓帧配额用尽」与 `used/limit`（spec B10）：配额耗尽与「画面抓不到」
+/// 是两件完全不同的事，退化成「未检测到界面」会把下一轮排查直接带偏。
+fn budget_reason(used: u32, limit: u32) -> String {
+    format!("抓帧配额用尽（已抓 {used}/{limit} 帧）")
 }
 
 /// 配额用尽（spec D4）：转成固定文案 + 留证，且**只报一次**。
@@ -1321,15 +1377,15 @@ fn over_budget(
     monitor: MonitorInfo,
     backend: CaptureBackend,
 ) -> bool {
-    if !budget_exhausted(session.frames_taken()) {
+    let used = session.frames_taken();
+    let limit = session.budget();
+    if !budget_exhausted(used, limit) {
         return false;
     }
-    let detail = format!(
-        "已抓帧数: {}（上限 {FRAME_BUDGET}）",
-        session.frames_taken()
-    );
-    save_failure_evidence("截图次数超限", monitor, backend, &detail);
-    let _ = tx.send(UiEvent::Failed("截图次数超限".to_owned()));
+    let reason = budget_reason(used, limit);
+    let detail = format!("已抓帧数: {used}（上限 {limit}）");
+    save_failure_evidence(&reason, monitor, backend, &detail);
+    let _ = tx.send(UiEvent::Failed(reason));
     true
 }
 
@@ -1475,6 +1531,7 @@ pub fn rect_center(rect: PxRect) -> PxPoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use delta_capture::FRAME_BUDGET;
     use delta_config::Config;
 
     #[test]
@@ -1631,10 +1688,54 @@ mod tests {
 
     #[test]
     fn budget_is_exhausted_only_at_the_limit() {
-        assert!(!budget_exhausted(0), "没抓过帧不算超限");
-        assert!(!budget_exhausted(FRAME_BUDGET - 1), "少一张还能抓");
-        assert!(budget_exhausted(FRAME_BUDGET), "正好用满即超限");
-        assert!(budget_exhausted(FRAME_BUDGET + 1), "越界也算超限");
+        // 测的是**函数语义**（`used >= limit`），不是任何常量的取值：显式传尺子。
+        assert!(!budget_exhausted(0, FRAME_BUDGET), "没抓过帧不算超限");
+        assert!(!budget_exhausted(FRAME_BUDGET - 1, FRAME_BUDGET), "少一张还能抓");
+        assert!(budget_exhausted(FRAME_BUDGET, FRAME_BUDGET), "正好用满即超限");
+        assert!(budget_exhausted(FRAME_BUDGET + 1, FRAME_BUDGET), "越界也算超限");
+    }
+
+    /// 尺子必须来自会话本身：就绪会话配额 200，抓到 20 张远未用尽。
+    ///
+    /// 这条守的正是 t6 的回归：`budget_exhausted` 一旦退回硬编码 `FRAME_BUDGET`（20），
+    /// 就绪阶段会在配额只用掉 10% 时被误杀成「抓帧配额用尽」——首开动画期间尤其致命。
+    #[test]
+    fn used_frames_below_the_ready_budget_are_not_exhausted() {
+        assert!(
+            !budget_exhausted(FRAME_BUDGET, READY_FRAME_BUDGET),
+            "默认 20 张不是就绪会话的尺子：已抓 {} 帧 / 上限 {} 帧，远未用尽",
+            FRAME_BUDGET,
+            READY_FRAME_BUDGET
+        );
+    }
+
+    /// 配额耗尽的文案必须点明「抓帧配额用尽」并带上 `used/limit`（spec A9/B10）。
+    ///
+    /// 退化成「未检测到界面 / 不识别」会把下一轮排查带去怀疑模板与分辨率。
+    #[test]
+    fn budget_reason_names_the_quota_and_the_numbers() {
+        let reason = budget_reason(READY_FRAME_BUDGET, READY_FRAME_BUDGET);
+        assert!(
+            reason.contains("抓帧配额用尽"),
+            "文案必须点明配额用尽，实际：{reason}"
+        );
+        assert!(
+            reason.contains("200/200"),
+            "文案必须给出 used/limit，实际：{reason}"
+        );
+    }
+
+    /// 就绪两阶段（场景 + 面板）各自跑满预算，也不得把配额耗光（spec A8/B9）。
+    #[test]
+    fn ready_frame_budget_covers_both_stages() {
+        let frames_per_stage = READY_BUDGET_MS / READY_POLL_MS;
+        let required = 2 * frames_per_stage;
+        assert!(
+            u64::from(READY_FRAME_BUDGET) >= required,
+            "就绪配额不够两阶段用：READY_FRAME_BUDGET = {READY_FRAME_BUDGET} 帧 < \
+             2 × (READY_BUDGET_MS / READY_POLL_MS) = 2 × ({READY_BUDGET_MS} / {READY_POLL_MS}) \
+             = {required} 帧"
+        );
     }
 
     #[test]
