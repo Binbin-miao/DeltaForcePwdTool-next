@@ -355,9 +355,22 @@ mod tests {
     }
 
     fn real_templates() -> Vec<(String, GrayImage)> {
-        let guard = UiGuard::load(&templates_dir());
-        assert_eq!(guard.entries.len(), 3, "images/ui 里应有三张正样本模板");
-        guard.entries
+        let entries = UiGuard::load(&templates_dir()).entries;
+        // **点名断言**，不数张数：加一张模板不该让这里红，缺一张必须一眼看出缺的是谁。
+        for name in ["morse", "keys", "line", "fingerprint"] {
+            assert!(
+                entries.iter().any(|(entry, _)| entry == name),
+                "images/ui 缺少 {name}.png 正样本，现有：{:?}",
+                entries.iter().map(|(entry, _)| entry.as_str()).collect::<Vec<_>>()
+            );
+        }
+        // 下限兜底（防目录被清空/污染），但不封顶：以后再加模板不必回来改这里。
+        assert!(
+            entries.len() >= 4,
+            "images/ui 至少要装下 morse/keys/line/fingerprint 四张正样本，实际 {} 张",
+            entries.len()
+        );
+        entries
     }
 
     fn template_of(name: &str) -> GrayImage {
@@ -448,6 +461,18 @@ mod tests {
         assert_eq!(
             guard.verdict(&frame_showing(&template_of("line"))),
             UiVerdict::Target(Scene::Console)
+        );
+    }
+
+    #[test]
+    fn a_fingerprint_screen_routes_to_its_own_scene() {
+        // 指纹台有了自己的模板之后，必须路由到**它自己的** Scene：只断言 `is_target`
+        // 证明不了这件事（被 keys 抢走也会是 target）。这才是「路由正确」的证明。
+        let guard = UiGuard::load(&templates_dir());
+        assert_eq!(
+            guard.verdict(&frame_showing(&template_of("fingerprint"))),
+            UiVerdict::Target(Scene::Fingerprint),
+            "指纹台画面必须命中 Fingerprint；若命中 Console，说明被别的模板抢走了"
         );
     }
 
