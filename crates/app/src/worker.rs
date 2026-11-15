@@ -46,6 +46,11 @@ pub enum UiEvent {
     Result(delta_ui::ResultContent),
     Succeeded(String),
     Failed(String),
+    /// 跑完了但结论**没有被证据确认**（黄键台退化档：进度格读不出）。
+    ///
+    /// 单独立一条，不复用 `Failed`：`Failed` 在界面上是「未识别」（压根没认出场子），
+    /// 与「点过了但没法核实」是两回事；也不能走 `Succeeded` —— 那就是用户实测的假成功。
+    Unverified(String),
     /// spec D6：未识别必须拒绝执行，零输入。
     Rejected(String),
     TimedOut(String),
@@ -1275,6 +1280,9 @@ fn run_az3(
     let mut pointer = delta_flow_az3::SystemPointer::new();
     let mut clock = delta_flow_az3::SystemClock::new();
     let mut screen = delta_flow_az3::SystemScreen::new(&mut session);
+    // 过程日志正文（多行）：黄键台的账本自己写，收尾时写满（`Done` / `Aborted` 都有）。
+    // 其余玩法还没接，留空 —— 留证正文会退回「只有类型 + 事件数」的老格式。
+    let mut trace = String::new();
     // 信号线台现在是「每帧自适应定位 + 只上下拖」的闭环，入口在 `line::run`；
     // 黄键台要带首帧观察种子（t7）；其余两类仍走统调度。
     let outcome = if kind == delta_scene::Az3Kind::SignalLine {
@@ -1294,18 +1302,34 @@ fn run_az3(
             &view.az3,
             cancel,
             seed,
+            &mut trace,
         )
     } else {
         delta_flow_az3::run(kind, &mut screen, &mut pointer, &mut clock, &view.az3, cancel)
     };
     match outcome {
-        delta_flow_az3::Az3Outcome::Done { kind, steps, summary, .. } => {
+        delta_flow_az3::Az3Outcome::Done {
+            kind,
+            steps,
+            summary,
+            confirmed,
+            events,
+        } => {
+            // 完成分两档：`confirmed = true` 是「判据读到了目标状态」（黄键台 5/5 全勾）；
+            // `false` 是退化档收尾（进度格读不出，只能按「在册待点键点完」推断）。
+            // 后者**不许**报「已完成」：实测只见过 2 颗亮键时，点完 2 颗就报成功，
+            // 而板子上还剩 3 颗（用户实机反馈）。
+            let verdict = if confirmed {
+                format!("{} 已完成", kind.label())
+            } else {
+                format!("{} 未确认完成（进度格读不出，请人工核对）", kind.label())
+            };
             save_evidence(
-                "ok",
-                &format!("{} 已完成", kind.label()),
+                if confirmed { "ok" } else { "unverified" },
+                &verdict,
                 monitor,
                 config.capture_backend,
-                &format!("AZ3类型: {}", kind.label()),
+                &az3_evidence_detail(kind.label(), events, &trace),
             );
             let _ = tx.send(UiEvent::Progress {
                 done: steps,
@@ -1313,7 +1337,15 @@ fn run_az3(
                 note: summary.clone(),
             });
             let _ = tx.send(UiEvent::Result(delta_ui::az3_result(kind.label(), &summary)));
-            let _ = tx.send(UiEvent::Succeeded(format!("{} · 已完成", kind.label())));
+            if confirmed {
+                let _ = tx.send(UiEvent::Succeeded(format!("{} · 已完成", kind.label())));
+            } else {
+                // 独立事件：界面显示「未确认完成」（黄色），不是「未识别」也不是「已完成」。
+                let _ = tx.send(UiEvent::Unverified(format!(
+                    "{} · 未确认完成（进度格读不出，请人工核对）",
+                    kind.label()
+                )));
+            }
         }
         delta_flow_az3::Az3Outcome::Aborted { kind, reason, events } => {
             // 配额耗尽时 reason 必须是配额口径，不能被 flow 层「画面抓不到」之类的通用文案盖掉
@@ -1329,10 +1361,23 @@ fn run_az3(
                 &reason,
                 monitor,
                 config.capture_backend,
-                &format!("AZ3类型: {}, 已发输入事件: {events}", kind.label()),
+                &az3_evidence_detail(kind.label(), events, &trace),
             );
             let _ = tx.send(UiEvent::Failed(reason));
         }
+    }
+}
+
+/// AZ3 留证正文：表头（类型 + 已发事件数）+ 流程给的过程日志。
+///
+/// 过程日志为空（还没接的诊断流程）时退回老格式，保证每次留证至少有类型与事件数 ——
+/// 用户实测的抱怨正是「日志只有四行，看不出为什么漏点」，正文绝不能是空的。
+fn az3_evidence_detail(label: &str, events: u64, trace: &str) -> String {
+    let header = format!("AZ3类型: {label}, 已发输入事件: {events}");
+    if trace.trim().is_empty() {
+        header
+    } else {
+        format!("{header}\n{trace}")
     }
 }
 
@@ -2277,6 +2322,30 @@ mod tests {
             classify_poll_frame(&ui_guard::UiGuard::default(), &frame, &view, 0),
             PollVerdict::Ready(None),
             "模板库为空时必须退化到结构判别"
+        );
+    }
+
+    #[test]
+    fn az3_evidence_detail_keeps_the_trace_verbatim_behind_the_header() {
+        // 留证正文 = 表头（类型 + 事件数）+ 流程写的过程日志，**逐行原样保留**：
+        // 用户实测抱怨「日志只有四行看不出为什么漏点」，正文不许再被裁剪成一句话。
+        let trace = "判据档: 退化档（进度格未识别）\n进度格: 未识别（本次只定位到 2 格 / 共 5 格）\n点击数: 4（本任务共发出 8 个输入事件）\n点击格位: 第1行第1列、第2行第2列\n见过哪些格: 第1行第1列、第2行第2列（共 2 格）\n判死格位: 无\n耗时: 4 帧 / 150ms（首帧→收尾）";
+        let body = az3_evidence_detail("黄键台", 8, trace);
+
+        assert!(
+            body.starts_with("AZ3类型: 黄键台, 已发输入事件: 8\n"),
+            "表头必须带类型与事件数：{body}"
+        );
+        for field in ["判据档", "进度格", "点击数", "点击格位", "见过哪些格", "判死格位", "耗时"] {
+            assert!(body.contains(field), "正文缺字段「{field}」：{body}");
+        }
+        assert!(body.ends_with(trace), "过程日志必须逐字保留：{body}");
+        assert_eq!(body.lines().count(), 1 + trace.lines().count());
+
+        // 还没接过程日志的流程：正文退回老格式，但绝不能是空正文。
+        assert_eq!(
+            az3_evidence_detail("大保险", 6, "   "),
+            "AZ3类型: 大保险, 已发输入事件: 6"
         );
     }
 }

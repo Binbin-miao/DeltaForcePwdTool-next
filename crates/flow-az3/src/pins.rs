@@ -184,6 +184,7 @@ pub fn run(
                 steps: total_pins,
                 events: pointer.event_count(),
                 summary: format!("任务保险 {total_pins}/{total_pins} 槽已锁定"),
+                confirmed: true,
             };
         };
 

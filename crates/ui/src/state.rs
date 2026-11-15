@@ -35,12 +35,17 @@ impl SceneKind {
     }
 }
 
-/// 五态。
+/// 六态。
+///
+/// [`Phase::Unverified`] = 「跑完了但结论没被证据确认」（黄键台退化档：进度格读不出，
+/// 只能按「在册待点键点完」推断）。它**不是**「未识别」（那是压根没认出场子），
+/// 也不该报成「已完成」—— 用户实测就是被「假成功」坑过，标签必须自己说出来。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Idle,
     Running,
     Success,
+    Unverified,
     Unrecognized,
     TimedOut,
 }
@@ -52,6 +57,7 @@ impl Phase {
             Self::Idle => "待机",
             Self::Running => "识别中",
             Self::Success => "已完成",
+            Self::Unverified => "未确认完成",
             Self::Unrecognized => "未识别",
             Self::TimedOut => "识别超时",
         }
@@ -63,6 +69,8 @@ impl Phase {
             Self::Idle => pal.text_3,
             Self::Running => pal.accent,
             Self::Success => pal.ok,
+            // 与「未识别」同色（warn）：都需要人工看一眼，区别只在文案与描边节奏。
+            Self::Unverified => pal.warn,
             Self::Unrecognized => pal.warn,
             Self::TimedOut => pal.err,
         }
@@ -74,6 +82,8 @@ impl Phase {
             Self::Idle => ResultState::Idle,
             Self::Running => ResultState::Loading,
             Self::Success => ResultState::Success,
+            // 「未确认完成」落在 Partial：结果卡的「请核对」描边与它语义一致。
+            Self::Unverified => ResultState::Partial,
             Self::Unrecognized => ResultState::Partial,
             Self::TimedOut => ResultState::Error,
         }
@@ -83,6 +93,7 @@ impl Phase {
     ///
     /// - 运行中：1.2s 呼吸（只变外框与状态点，整窗不闪、不弹 toast，不遮挡游戏）；
     /// - 未识别：2Hz 慢闪；
+    /// - 未确认完成：静态常亮（已经跑完了，别再闪，只提示人工核对）；
     /// - 超时：静态常亮不闪（提示「别再等了，手动确认」）；
     /// - 成功：200ms 单次高亮后回到常态。
     pub fn status_alpha(self, time: f64) -> f32 {
@@ -106,7 +117,7 @@ impl Phase {
                     0.25
                 }
             }
-            Self::TimedOut => 1.0,
+            Self::Unverified | Self::TimedOut => 1.0,
         }
     }
 }
@@ -1024,6 +1035,23 @@ mod tests {
         colors.sort_unstable();
         colors.dedup();
         assert_eq!(colors.len(), 5, "五态颜色必须互异");
+    }
+
+    #[test]
+    fn unverified_phase_says_so_instead_of_pretending_success() {
+        // 用户实测被「假成功」坑过：跑完但没证据时，标签必须自己说出来，且不许显示成
+        // 「未识别」（那是压根没认出场子）或「已完成」。
+        let pal = theme::palette(ThemeId::default());
+        assert_eq!(Phase::Unverified.label(), "未确认完成");
+        assert_ne!(Phase::Unverified.label(), Phase::Unrecognized.label());
+        assert_ne!(Phase::Unverified.label(), Phase::Success.label());
+        assert_eq!(Phase::Unverified.color(pal), pal.warn, "黄色提示，不是成功绿");
+        assert_eq!(Phase::Unverified.result_state(), ResultState::Partial);
+        assert_eq!(
+            Phase::Unverified.status_alpha(0.1),
+            Phase::Unverified.status_alpha(3.7),
+            "已经跑完了，静态常亮即可，不要再闪"
+        );
     }
 
     #[test]

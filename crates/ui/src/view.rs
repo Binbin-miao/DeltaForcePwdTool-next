@@ -2352,7 +2352,7 @@ mod tests {
         );
     }
 
-    /// 无头跑一帧主界面与设置页：五态 × 两种窗口尺寸 × 收起态都必须画得出来。
+    /// 无头跑一帧主界面与设置页：六态 × 两种窗口尺寸 × 收起态都必须画得出来。
     ///
     /// 这不是实机验证（不建窗口、不注入任何输入），只是把「画一帧会不会 panic」这条
     /// 底线钉住 —— 与设置页既有用例同一个套路。
@@ -2362,6 +2362,7 @@ mod tests {
             Phase::Idle,
             Phase::Running,
             Phase::Success,
+            Phase::Unverified,
             Phase::Unrecognized,
             Phase::TimedOut,
         ];

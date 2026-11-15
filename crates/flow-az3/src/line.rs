@@ -653,6 +653,7 @@ fn done(events: u64, summary: &str) -> Az3Outcome {
         steps: LINE_COLUMNS,
         events,
         summary: summary.to_owned(),
+        confirmed: true,
     }
 }
 

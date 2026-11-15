@@ -101,6 +101,13 @@ pub enum Az3Outcome {
         steps: usize,
         events: u64,
         summary: String,
+        /// 完成是否**有进度证据**（`true` = 判据直接读到了目标状态，例如黄键台 5/5 全勾）。
+        ///
+        /// 黄键台的退化档（进度格读不出，按「在册待点键点完」收尾）一律 `false`：
+        /// 见过 2 颗亮键、点完 2 颗 != 板子上没有剩余（用户实测就是这么漏 3 颗的）。
+        /// 调用方据此分档留证（`_ok` / `_unverified`）并区分文案，**不许**把它当成功播报。
+        /// 大保险 / 任务保险 / 信号线台的判据本身就是确定读数，恒为 `true`。
+        confirmed: bool,
     },
     Aborted {
         kind: Az3Kind,
@@ -112,6 +119,11 @@ pub enum Az3Outcome {
 impl Az3Outcome {
     pub fn is_done(&self) -> bool {
         matches!(self, Self::Done { .. })
+    }
+
+    /// 这条结论有没有进度证据；`Aborted` 恒为 `false`（它本来就不是完成）。
+    pub fn is_confirmed(&self) -> bool {
+        matches!(self, Self::Done { confirmed: true, .. })
     }
 
     pub fn kind(&self) -> Az3Kind {

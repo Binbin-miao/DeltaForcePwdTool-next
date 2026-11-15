@@ -158,6 +158,8 @@ impl DeltaApp {
                 }
                 UiEvent::Result(content) => self.state.set_result(content),
                 UiEvent::Succeeded(message) => self.finish(Phase::Success, message),
+                // 「跑完了但没证据」是独立一态：不许落「未识别」，更不许落「已完成」。
+                UiEvent::Unverified(message) => self.finish(Phase::Unverified, message),
                 UiEvent::Failed(message) => self.finish(Phase::Unrecognized, message),
                 UiEvent::Rejected(message) => self.finish(Phase::Unrecognized, message),
                 UiEvent::TimedOut(message) => self.finish(Phase::TimedOut, message),

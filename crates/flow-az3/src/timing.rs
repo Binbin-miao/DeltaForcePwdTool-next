@@ -188,6 +188,7 @@ pub fn run(
                     steps: hits,
                     events: pointer.event_count(),
                     summary: format!("大保险已按满 {TOTAL_CHARS} 个字符"),
+                    confirmed: true,
                 };
             }
         }
