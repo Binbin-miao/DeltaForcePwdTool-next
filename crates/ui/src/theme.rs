@@ -529,7 +529,9 @@ pub const SPACE_XXL: f32 = 32.0;
 
 // ── 窗口与区段尺寸（L-A 布局，`ui-themes.md` §3.1）─────────────────
 pub const WINDOW_SIZE: [f32; 2] = [400.0, 420.0];
-pub const WINDOW_MIN: [f32; 2] = [340.0, 360.0];
+/// 最小窗口。高度比标称少 36：开关网格固定 4 行（7 功能 + 3 附加），
+/// 再矮就只能压结果区或叠行 —— 这里守住「不放不下就缩小」这条底线。
+pub const WINDOW_MIN: [f32; 2] = [340.0, 384.0];
 pub const COLLAPSED_SIZE: [f32; 2] = [176.0, 36.0];
 /// 标题条：状态点 7px + 状态文字 15px + 右侧三个 16px 图标按钮。
 pub const TITLE_BAR_H: f32 = 32.0;
@@ -537,12 +539,11 @@ pub const TITLE_BAR_H: f32 = 32.0;
 pub const RESULT_H: f32 = 96.0;
 /// 结果区可压缩下限（最小窗口下仍要放得下 26px 结果 + 来源标签）。
 pub const RESULT_MIN_H: f32 = 64.0;
-/// 开关网格：3 行 × 2 列（32 行高 + 6 行距 = 108）。
-pub const GRID_H: f32 = 108.0;
+/// 开关网格的单行高（**行数不固定**：由格数按 3 列算 `div_ceil`）。
 pub const GRID_ROW_H: f32 = 32.0;
 pub const GRID_ROW_GAP: f32 = 6.0;
-/// 列间空隙：内容宽 376 − 2×178 = 20（列宽 178 由 §3.1 给定）。
-pub const GRID_COL_GAP: f32 = 20.0;
+/// 列间空隙：3 列一行（内容宽 376 = 3×120 + 2×8，最小窗 316 = 3×100 + 2×8）。
+pub const GRID_COL_GAP: f32 = 8.0;
 /// 主按钮：满宽 44。
 pub const PRIMARY_H: f32 = 44.0;
 /// 状态行：文案 12px + 底部 2px 进度轨。

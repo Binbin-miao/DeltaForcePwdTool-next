@@ -237,7 +237,7 @@ pub enum PrimaryState {
     Ready,
     /// 未校准 → 「先校准」→ 打开校准向导。
     NeedsCalibration,
-    /// 三个流程开关全关 → 「请开启至少一项」→ 当场打开流程开关。
+    /// 7 个功能开关全关 → 「请开启至少一项」→ 当场打开流程开关。
     NoFlow,
     /// 识别中 → 「取消操作」。
     Running,
@@ -494,7 +494,7 @@ pub enum Action {
     ToggleMorseAutoDownload,
     /// F 键低级键盘钩子总开关（spec D3 边界 3；关 = 卸载钩子）。
     ToggleFKeyHook,
-    /// 全关时的修复动作：把三个流程开关一并打开（「请开启至少一项」按钮的落点）。
+    /// 全关时的修复动作：把 7 个功能开关一并打开（「请开启至少一项」按钮的落点）。
     EnableFlows,
     /// 换主题（设置页，立即生效不重启）。
     SetTheme(ThemeId),
@@ -598,7 +598,7 @@ pub struct UiState {
     pub hotkey: String,
     /// 未校准项（空 = 已校准）。
     pub missing: Vec<String>,
-    /// 三个功能入口的开关。
+    /// 7 个功能开关（每个功能一格，见 [`FlowId`]）。
     pub toggles: Toggles,
     /// 进入当前状态后经过的秒数（成功 200ms 高亮 / 呼吸相位都靠它）。
     pub phase_elapsed: f64,
@@ -651,11 +651,75 @@ pub struct UiState {
     pub last_cancel_at: Option<f64>,
 }
 
-/// 开关网格的六格（spec D2 定稿：3 行 × 2 列，第 6 格是热键键帽）。
+/// 主页上 7 个功能开关的稳定标识。
+///
+/// 与 [`SceneKind`] 的分工：`SceneKind` 是**识别结果**（3 类），这里是**用户能单独
+/// 开关的功能**（7 个）—— AZ3 的四台子流程此前共用「操作台」一个开关，从这一版起
+/// 各占一格，新增功能只是「往 [`Self::ALL`] 末尾加一个变体」。
+///
+/// 下标即 [`Toggles`] 的存储位置，所以**只允许在末尾追加**：插队会让旧配置位序错位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowId {
+    /// 摩斯码解码（`SceneKind::Morse`）。
+    Morse,
+    /// 指纹识别（`SceneKind::Fingerprint`）。
+    Fingerprint,
+    /// 操作台：v5 旧旋钮流程（`SceneKind::Console`）。
+    Console,
+    /// AZ3 · 大保险（`Az3Kind::SafeTiming`）。
+    Az3Timing,
+    /// AZ3 · 任务保险（`Az3Kind::SafePins`）。
+    Az3Pins,
+    /// AZ3 · 黄键台（`Az3Kind::ModuleKeys`）。
+    Az3Keys,
+    /// AZ3 · 信号线台（`Az3Kind::SignalLine`）。
+    Az3Line,
+}
+
+impl FlowId {
+    /// 全部开关的固定顺序 = 主页网格顺序 = [`Toggles`] 的下标序。
+    pub const ALL: [Self; 7] = [
+        Self::Morse,
+        Self::Fingerprint,
+        Self::Console,
+        Self::Az3Timing,
+        Self::Az3Pins,
+        Self::Az3Keys,
+        Self::Az3Line,
+    ];
+
+    /// 存储下标 = 声明顺序（`ALL[i].index() == i` 有单测钉住，改顺序会红）。
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// 开关文案。**≤4 字**：3 列布局下每格约 120px，4 个汉字 + 28px 开关已是上限。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Morse => "摩斯码",
+            Self::Fingerprint => "指纹",
+            Self::Console => "操作台",
+            Self::Az3Timing => "大保险",
+            Self::Az3Pins => "任务保险",
+            Self::Az3Keys => "黄键台",
+            Self::Az3Line => "信号线台",
+        }
+    }
+
+    /// 是否是 AZ3 的四台子流程（旧「操作台」一体开关拆出来的部分）。
+    pub fn is_az3(self) -> bool {
+        matches!(
+            self,
+            Self::Az3Timing | Self::Az3Pins | Self::Az3Keys | Self::Az3Line
+        )
+    }
+}
+
+/// 主页开关网格的一格（行主序＝左上→右上→左中→…，3 列一行流式排）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GridCell {
-    /// 三个流程开关（摩斯 / 指纹 / 操作台）。
-    Flow(SceneKind),
+    /// 7 个功能开关之一。
+    Flow(FlowId),
     /// 指纹自动点击（`config.fingerprint_auto_click`）。
     FingerprintAutoClick,
     /// 摩斯自动下载（`config.auto_confirm`）。
@@ -665,64 +729,135 @@ pub enum GridCell {
 }
 
 impl GridCell {
-    /// 这一格被点击后要做什么（键帽没有动作）。
-    pub fn action(self) -> Option<Action> {
+    /// 格子文案（同样 ≤4 字，理由见 [`FlowId::label`]）。
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Flow(scene) => Some(Action::ToggleFlow(scene)),
-            Self::FingerprintAutoClick => Some(Action::ToggleFingerprintAutoClick),
-            Self::MorseAutoDownload => Some(Action::ToggleMorseAutoDownload),
-            Self::Keycap => None,
+            Self::Flow(flow) => flow.label(),
+            Self::FingerprintAutoClick => "自动点击",
+            Self::MorseAutoDownload => "自动下载",
+            Self::Keycap => "热键",
         }
     }
 }
 
-/// 三个功能入口开关。
+/// 升级前的开关形态：配置里只有这 3 个布尔。
+///
+/// 保留它是为了「缺失即开」的补齐语义 —— 旧的 `console` 值**刻意忽略**：
+/// 新版本里操作台拆成了 4 台独立的 AZ3 子开关，用户已经在用它们，
+/// 升级不该因为旧配置里没有这几项就把功能关掉（见 [`Toggles::from_legacy`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Toggles {
+pub struct LegacyToggles {
     pub morse: bool,
     pub fingerprint: bool,
     pub console: bool,
 }
 
+/// 主页 7 个功能开关的状态。
+///
+/// 存储选**定长数组 `[bool; 7]`** 而不是 `BTreeMap`：开关集合在编译期就固定
+/// （[`FlowId::ALL`]），数组给 O(1) 取值、`Copy`、零分配、零哈希 —— 网格每帧都读它。
+/// 新增功能是「往 [`FlowId`] 末尾加一个变体」，这里一行都不用改。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Toggles {
+    flags: [bool; FlowId::ALL.len()],
+}
+
+impl Default for Toggles {
+    /// 默认全开：与升级前「3 个开关默认开」一致，4 台 AZ3 也按「用户已在用」处理。
+    fn default() -> Self {
+        Self::all_on()
+    }
+}
+
 impl Toggles {
+    /// 7 个全开。
+    pub fn all_on() -> Self {
+        Self {
+            flags: [true; FlowId::ALL.len()],
+        }
+    }
+
+    /// 按 [`FlowId::ALL`] 的顺序给 7 个布尔（配置读入 / 测试用）。
+    pub fn from_flags(flags: [bool; FlowId::ALL.len()]) -> Self {
+        Self { flags }
+    }
+
+    /// 按 [`FlowId::ALL`] 的顺序取出 7 个布尔（**7 个字段全写**，不做部分保存）。
+    pub fn flags(self) -> [bool; FlowId::ALL.len()] {
+        self.flags
+    }
+
+    /// 单个功能开关的当前值。
+    pub fn get_flow(self, flow: FlowId) -> bool {
+        self.flags[flow.index()]
+    }
+
+    /// 直接置位一个功能开关（配置读入 / 批量修补用）。
+    pub fn set_flow(&mut self, flow: FlowId, on: bool) {
+        self.flags[flow.index()] = on;
+    }
+
+    /// 翻转一个功能开关（主页 7 格各自的点击落点）。
+    pub fn toggle_flow(&mut self, flow: FlowId) {
+        let on = &mut self.flags[flow.index()];
+        *on = !*on;
+    }
+
+    /// 场景级取值：`Console` = 4 台 AZ3 子开关**任一**为开（旧调用点的语义）。
     pub fn get(self, scene: SceneKind) -> bool {
         match scene {
-            SceneKind::Morse => self.morse,
-            SceneKind::Fingerprint => self.fingerprint,
-            SceneKind::Console => self.console,
+            SceneKind::Morse => self.get_flow(FlowId::Morse),
+            SceneKind::Fingerprint => self.get_flow(FlowId::Fingerprint),
+            SceneKind::Console => FlowId::ALL
+                .into_iter()
+                .any(|flow| flow.is_az3() && self.get_flow(flow)),
             SceneKind::Unknown => false,
         }
     }
 
-    /// 翻转一个开关；`Unknown` 没有开关可翻。
+    /// 场景级翻转：`Console` 是**一体**动作（任一台为开 → 4 台全关；全关 → 4 台全开）。
+    ///
+    /// 主页网格走的是逐台开关（[`Self::toggle_flow`]），这里留给既有的
+    /// [`Action::ToggleFlow`] 调用点，保持「操作台整体开关」的旧手感。
     pub fn toggle(&mut self, scene: SceneKind) {
         match scene {
-            SceneKind::Morse => self.morse = !self.morse,
-            SceneKind::Fingerprint => self.fingerprint = !self.fingerprint,
-            SceneKind::Console => self.console = !self.console,
+            SceneKind::Morse => self.toggle_flow(FlowId::Morse),
+            SceneKind::Fingerprint => self.toggle_flow(FlowId::Fingerprint),
+            SceneKind::Console => {
+                let wanted = !self.get(SceneKind::Console);
+                for flow in FlowId::ALL.into_iter().filter(|flow| flow.is_az3()) {
+                    self.set_flow(flow, wanted);
+                }
+            }
             SceneKind::Unknown => {}
         }
     }
 
-    /// 三个入口按 spec 顺序列出。
+    /// 三个场景入口按 spec 顺序列出。
     pub fn entries(self) -> [(SceneKind, bool); 3] {
         [
-            (SceneKind::Morse, self.morse),
-            (SceneKind::Fingerprint, self.fingerprint),
-            (SceneKind::Console, self.console),
+            (SceneKind::Morse, self.get(SceneKind::Morse)),
+            (SceneKind::Fingerprint, self.get(SceneKind::Fingerprint)),
+            (SceneKind::Console, self.get(SceneKind::Console)),
         ]
     }
 
-    /// 是否至少有一个流程开关为开（主按钮谓词的一半，§3.4）。
+    /// 是否至少有一个功能开关为开（主按钮谓词的一半，§3.4）。
     pub fn any_on(self) -> bool {
-        self.morse || self.fingerprint || self.console
+        self.flags.iter().any(|on| *on)
     }
 
-    /// 全关时的修复动作：三个一并打开。
+    /// 全关时的修复动作：7 个一并打开。
     pub fn enable_all(&mut self) {
-        self.morse = true;
-        self.fingerprint = true;
-        self.console = true;
+        *self = Self::all_on();
+    }
+
+    /// 旧配置（3 个布尔）→ 新的 7 个开关：缺的 4 项按 **开** 补齐。
+    pub fn from_legacy(legacy: LegacyToggles) -> Self {
+        let mut toggles = Self::all_on();
+        toggles.set_flow(FlowId::Morse, legacy.morse);
+        toggles.set_flow(FlowId::Fingerprint, legacy.fingerprint);
+        toggles
     }
 }
 
@@ -740,11 +875,7 @@ impl Default for UiState {
             notice_dismissed: false,
             hotkey: "F8".to_owned(),
             missing: Vec::new(),
-            toggles: Toggles {
-                morse: true,
-                fingerprint: true,
-                console: true,
-            },
+            toggles: Toggles::all_on(),
             phase_elapsed: 0.0,
             hotkey_editing: false,
             hotkey_conflict: None,
@@ -829,32 +960,30 @@ impl UiState {
         theme::resolve(self.theme_id, self.accent_override.as_deref())
     }
 
-    /// 开关网格的六格（行主序＝左上→右上→左中→…，spec D2 的档位表）。
-    pub fn grid(&self) -> [(GridCell, &'static str, bool); 6] {
-        [
-            (GridCell::Flow(SceneKind::Morse), "摩斯解码", self.toggles.morse),
-            (
-                GridCell::Flow(SceneKind::Fingerprint),
-                "指纹识别",
-                self.toggles.fingerprint,
-            ),
-            (
-                GridCell::Flow(SceneKind::Console),
-                "操作台 · BETA",
-                self.toggles.console,
-            ),
-            (
+    /// 主页开关网格：7 个功能开关 + 2 个附加开关 + 1 个热键键帽（共 10 格）。
+    ///
+    /// 顺序 = 先 7 个 [`FlowId::ALL`]，再附加开关，最后键帽；视图按 3 列一行流式排，
+    /// 所以这里**只需要维护内容**，行数由视图算（新增功能不必再改绘制代码）。
+    pub fn grid(&self) -> Vec<GridCell> {
+        FlowId::ALL
+            .into_iter()
+            .map(GridCell::Flow)
+            .chain([
                 GridCell::FingerprintAutoClick,
-                "指纹自动点击",
-                self.fingerprint_auto_click,
-            ),
-            (
                 GridCell::MorseAutoDownload,
-                "摩斯自动下载",
-                self.morse_auto_download,
-            ),
-            (GridCell::Keycap, "热键", false),
-        ]
+                GridCell::Keycap,
+            ])
+            .collect()
+    }
+
+    /// 一格当前是否为开（键帽恒 `false`：它只显示热键，不是开关）。
+    pub fn cell_on(&self, cell: GridCell) -> bool {
+        match cell {
+            GridCell::Flow(flow) => self.toggles.get_flow(flow),
+            GridCell::FingerprintAutoClick => self.fingerprint_auto_click,
+            GridCell::MorseAutoDownload => self.morse_auto_download,
+            GridCell::Keycap => false,
+        }
     }
 
     /// 结果区五态。
@@ -1393,13 +1522,9 @@ mod tests {
         assert_eq!(state.primary_state().action(), Action::OpenCalibration);
         assert!(!state.primary_state().filled());
 
-        // 三个流程开关全关 → 改文案 + 点它当场把开关打开。
+        // 7 个功能开关全关 → 改文案 + 点它当场把开关打开。
         state.missing.clear();
-        state.toggles = Toggles {
-            morse: false,
-            fingerprint: false,
-            console: false,
-        };
+        state.toggles = Toggles::from_flags([false; 7]);
         assert_eq!(state.primary_state(), PrimaryState::NoFlow);
         assert_eq!(state.primary_state().label(), "请开启至少一项");
         assert_eq!(state.primary_state().action(), Action::EnableFlows);
@@ -1452,39 +1577,126 @@ mod tests {
         assert!(!console_result(None, 0, 0).is_empty(), "标签仍要有内容");
     }
 
+    /// U-T1：7 个功能开关各翻各的（任何一个翻动都不许带动别的 6 个）。
+    ///
+    /// 反例：若 7 个功能共用同一个 bool / 只翻 `console` 一个字段，下面第一条
+    /// `assert!(!toggles.get_flow(flow))` 之后的「其余 6 个仍为开」立刻红。
     #[test]
-    fn grid_has_six_cells_in_the_spec_order() {
+    fn each_flow_switch_flips_only_itself() {
+        assert_eq!(FlowId::ALL.len(), 7, "用户要的是 7 个功能 7 个开关");
+        for (index, flow) in FlowId::ALL.iter().enumerate() {
+            assert_eq!(flow.index(), index, "下标必须等于存储位置，否则配置位序会错位");
+        }
+        for flow in FlowId::ALL {
+            let mut toggles = Toggles::all_on();
+            toggles.toggle_flow(flow);
+            assert!(!toggles.get_flow(flow), "{} 没被翻掉", flow.label());
+            for other in FlowId::ALL.into_iter().filter(|other| *other != flow) {
+                assert!(
+                    toggles.get_flow(other),
+                    "翻「{}」时「{}」跟着变了",
+                    flow.label(),
+                    other.label()
+                );
+            }
+        }
+    }
+
+    /// U-T3：`SceneKind::Console` = 4 台 AZ3 **任一**为开。
+    ///
+    /// 反例：只看一枚早已废弃的 `console` 字段 → 任一为开的分支永远 false。
+    #[test]
+    fn console_scene_is_on_when_any_az3_switch_is_on() {
+        let az3 = [
+            FlowId::Az3Timing,
+            FlowId::Az3Pins,
+            FlowId::Az3Keys,
+            FlowId::Az3Line,
+        ];
+        for flow in az3 {
+            let mut toggles = Toggles::from_flags([false; 7]);
+            toggles.set_flow(flow, true);
+            assert!(
+                toggles.get(SceneKind::Console),
+                "只开「{}」时操作台也必须算开着",
+                flow.label()
+            );
+        }
+        let mut all_off = Toggles::from_flags([false; 7]);
+        assert!(!all_off.get(SceneKind::Console), "4 台全关 = 操作台关");
+        // 场景级翻转是一体动作（旧调用点语义）：任一台为开 → 4 台全关；全关 → 4 台全开。
+        all_off.toggle(SceneKind::Console);
+        assert!(az3.iter().all(|flow| all_off.get_flow(*flow)), "一次翻开 4 台");
+        all_off.toggle(SceneKind::Console);
+        assert!(az3.iter().all(|flow| !all_off.get_flow(*flow)), "再翻一次关 4 台");
+    }
+
+    /// U-T4：`any_on()` 必须覆盖全部 7 个开关。
+    ///
+    /// 反例：漏算 4 个 AZ3 开关 → 只开「任务保险」时主按钮仍判「无流程可用」。
+    #[test]
+    fn any_on_counts_every_switch_including_the_az3_ones() {
+        assert!(!Toggles::from_flags([false; 7]).any_on(), "7 个全关 = 没有流程");
+        let mut toggles = Toggles::from_flags([false; 7]);
+        toggles.set_flow(FlowId::Az3Pins, true);
+        assert!(toggles.any_on(), "只开「任务保险」也算有流程开着");
+        for flow in FlowId::ALL {
+            let mut only = Toggles::from_flags([false; 7]);
+            only.set_flow(flow, true);
+            assert!(only.any_on(), "只开「{}」也必须有流程可用", flow.label());
+        }
+    }
+
+    /// U-T5：旧配置只有 3 个 bool，缺的 4 个 AZ3 子开关必须**按开补齐**。
+    ///
+    /// 反例：缺失即 `false` → 升级后用户的 4 台 AZ3 全被关掉，主按钮当场变
+    /// 「请开启至少一项」。
+    #[test]
+    fn legacy_three_bool_config_does_not_switch_the_az3_flows_off() {
+        let legacy = Toggles::from_legacy(LegacyToggles {
+            morse: false,
+            fingerprint: false,
+            console: false,
+        });
+        assert!(!legacy.get_flow(FlowId::Morse), "旧值照读");
+        assert!(!legacy.get_flow(FlowId::Fingerprint), "旧值照读");
+        for flow in FlowId::ALL.into_iter().filter(|flow| flow.is_az3()) {
+            assert!(
+                legacy.get_flow(flow),
+                "旧配置里没有「{}」这一项 → 升级不许把它关掉",
+                flow.label()
+            );
+        }
+        assert!(legacy.any_on(), "旧配置全 false 也不许变成「无流程可用」");
+        assert_eq!(legacy.flags().len(), 7, "写回时 7 个字段全写");
+    }
+
+    /// U-T2：网格 = 7 功能 + 2 附加开关 + 1 热键键帽。
+    ///
+    /// 反例：还返回定长 6 格 / 前 7 项不是 7 个 `FlowId` → 红。
+    #[test]
+    fn grid_has_seven_flows_plus_two_extras_and_one_keycap() {
         let mut state = UiState::default();
         let grid = state.grid();
-        assert_eq!(grid.len(), 6, "3 行 × 2 列 = 6 格");
-        let labels: Vec<&str> = grid.iter().map(|(_, label, _)| *label).collect();
-        assert_eq!(
-            labels,
-            vec![
-                "摩斯解码",
-                "指纹识别",
-                "操作台 · BETA",
-                "指纹自动点击",
-                "摩斯自动下载",
-                "热键"
-            ]
-        );
-        // 第 6 格是键帽：不可点，没有动作。
-        assert_eq!(grid[5].0, GridCell::Keycap);
-        assert_eq!(grid[5].0.action(), None);
-        assert!(!grid[5].2, "键帽没有开关状态");
-        // 五格各有动作，且都写回真实状态。
-        assert_eq!(
-            grid[3].0.action(),
-            Some(Action::ToggleFingerprintAutoClick)
-        );
-        assert_eq!(grid[4].0.action(), Some(Action::ToggleMorseAutoDownload));
-        assert_eq!(
-            grid[0].0.action(),
-            Some(Action::ToggleFlow(SceneKind::Morse))
-        );
+        assert_eq!(grid.len(), 10, "7 个功能 + 2 个附加 + 1 个键帽");
+        let flows: Vec<FlowId> = grid
+            .iter()
+            .filter_map(|cell| match cell {
+                GridCell::Flow(flow) => Some(*flow),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flows, FlowId::ALL.to_vec(), "前 7 格依次是 7 个功能");
+        assert_eq!(grid[7], GridCell::FingerprintAutoClick);
+        assert_eq!(grid[8], GridCell::MorseAutoDownload);
+        assert_eq!(grid[9], GridCell::Keycap);
+        // 键帽没有开关状态，其余 9 格都写回真实状态。
+        assert!(!state.cell_on(grid[9]), "键帽没有开关状态");
+        assert!(state.cell_on(grid[0]), "默认全开");
         state.fingerprint_auto_click = false;
-        assert!(!state.grid()[3].2);
+        assert!(!state.cell_on(GridCell::FingerprintAutoClick));
+        state.toggles.toggle_flow(FlowId::Az3Line);
+        assert!(!state.cell_on(GridCell::Flow(FlowId::Az3Line)));
     }
 
     #[test]

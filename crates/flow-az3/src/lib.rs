@@ -209,10 +209,6 @@ mod tests {
 
     const TARGET_W: u32 = 371;
     const TARGET_H: u32 = 86;
-    const TRACK_W: u32 = 531;
-    const TRACK_H: u32 = 76;
-    const INDICATOR_W: u32 = 531;
-    const INDICATOR_H: u32 = 86;
 
     /// 高亮带底色：半透明绿罩，够 `is_green_glow` 但不够「亮绿」。
     const BAND_GREEN: [u8; 3] = [60, 150, 60];
@@ -385,32 +381,43 @@ mod tests {
         paint_frame(TARGET_W, TARGET_H, &[(rect(0, 20, TARGET_W as i32, 40), FAIL_RED)])
     }
 
-    /// 任务保险指示条：前 `locked` 个槽为绿。
-    fn indicator_frame(locked: usize) -> Frame {
-        let centers = pin_local_centers();
-        let bars: Vec<(PxRect, [u8; 3])> = centers
-            .iter()
-            .take(locked)
-            .map(|&cx| (rect(cx - 30, 20, 60, 30), LOCK_GREEN))
-            .collect();
-        paint_frame(INDICATOR_W, INDICATOR_H, &bars)
-    }
+    // ── 任务保险合成帧（100% 脱敏：只复刻相对结构）──
 
-    /// 任务保险滑槽：`cursor_x` 处一根白游标；`target_x` 有目标方块。
-    fn track_frame(target_x: Option<i32>, cursor_x: i32) -> Frame {
-        let mut shapes = vec![(rect(cursor_x - 4, 16, 8, 54), WHITE)];
-        if let Some(target) = target_x {
-            shapes.push((rect(target - 5, 4, 10, 10), WHITE));
+    /// 整帧尺寸：轨道与底部指示条在**同一帧**里（执行层每帧只抓一次整帧）。
+    const PINS_W: u32 = 1280;
+    const PINS_H: u32 = 720;
+    /// 轨道：横贯画面的中灰长条（实机 720p 实测 x300..1050 / y188..202 / 高 15）。
+    const PINS_TRACK: PxRect = PxRect {
+        x: 300,
+        y: 188,
+        w: 750,
+        h: 15,
+    };
+    /// 轨道底色：中灰（实测行均值 67；指示条的绿条是饱和绿，两回事）。
+    const TRACK_GREY: [u8; 3] = [67, 67, 67];
+    /// 5 个目标方块的中心 x（间距 ≈105px，与实机同量级）。
+    const PIN_TARGET_XS: [i32; 5] = [413, 527, 634, 739, 845];
+
+    /// 任务保险整帧：轨道 + 每个目标一块「宽扁目标方块」+ 一根按 `offsets` 偏移的「窄高游标」
+    /// + 底部指示条前 `locked` 格绿条。
+    ///
+    /// `offsets[i]` = 第 i 根游标相对它目标方块中心的水平偏移（`0` = 正好压在目标上）。
+    fn pins_frame(offsets: &[i32], locked: usize) -> Frame {
+        let mut shapes = vec![(PINS_TRACK, TRACK_GREY)];
+        for (index, &center_x) in PIN_TARGET_XS.iter().enumerate() {
+            shapes.push((rect(center_x - 5, 187, 10, 17), WHITE));
+            let offset = offsets.get(index).copied().unwrap_or(0);
+            // 游标纵向伸出轨道带（实测 h 20~30 > 带高 15）—— 这正是「游标」的判据本体。
+            shapes.push((rect(center_x + offset - 2, 182, 5, 27), WHITE));
         }
-        paint_frame(TRACK_W, TRACK_H, &shapes)
-    }
-
-    fn pin_local_centers() -> Vec<i32> {
-        let az3 = test_az3();
-        az3.pin_center_x
-            .iter()
-            .map(|center| center - az3.track_band.x)
-            .collect()
+        let band = test_az3().indicator_band;
+        for slot in 0..locked.min(5) {
+            shapes.push((
+                rect(band.x + slot as i32 * 106, band.y + 20, 60, 30),
+                LOCK_GREEN,
+            ));
+        }
+        paint_frame(PINS_W, PINS_H, &shapes)
     }
 
     // ── 黄键台合成面板（100% 脱敏：与任何真实机位无关，只复刻相对结构）──
@@ -622,37 +629,29 @@ mod tests {
         assert_eq!(pointer.spaces, 0);
     }
 
-    // ── 任务保险 ──
+    // ── 任务保险（每帧量几何：轨道 + 目标方块 + 游标）──
 
     #[test]
-    fn safe_pins_presses_when_cursor_meets_target_and_finishes_all_locked() {
-        let centers = pin_local_centers();
-        let last = centers[4];
-        // 首帧游标还在容差区外（预武装），第二帧才压到目标上 → 按一次 → 全锁。
-        let mut frames = vec![
-            indicator_frame(4),
-            track_frame(Some(last), last + 30),
-            indicator_frame(4),
-            track_frame(Some(last), last + 6),
-            indicator_frame(5),
-        ];
-        frames.push(indicator_frame(5));
-        let mut screen = ScriptScreen::new(frames);
+    fn safe_pins_presses_when_a_cursor_meets_its_target_and_finishes_all_locked() {
+        // 首帧 5 根游标都偏开 40px（预武装）→ 第二帧第 1 根压到目标上 ⇒ 按 1 次空格；
+        // 指示条随后 5 格全绿 ⇒ Done 且**有进度证据**。
+        let mut screen = ScriptScreen::new(vec![
+            pins_frame(&[40, 40, 40, 40, 40], 0),
+            pins_frame(&[0, 40, 40, 40, 40], 0),
+            pins_frame(&[0, 40, 40, 40, 40], 5),
+        ]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
         assert!(outcome.is_done(), "{outcome:?}");
-        assert_eq!(pointer.spaces, 1);
+        assert!(outcome.is_confirmed(), "指示条 5 格全绿 = 有进度证据：{outcome:?}");
+        assert_eq!(pointer.spaces, 1, "{outcome:?}");
     }
 
     #[test]
     fn safe_pins_does_not_press_on_the_very_first_frame_already_aligned() {
-        // 首帧就对齐 = 还没「离开过容差区」，不许直接按（否则会按在早一格的时机上）。
-        let centers = pin_local_centers();
-        let last = centers[4];
-        let mut screen = ScriptScreen::new(vec![
-            indicator_frame(4),
-            track_frame(Some(last), last),
-        ]);
+        // 首帧就对齐 = 还没「离开过容差区」，不许直接按（会按在早一格的时机上）。
+        // 反例：去掉预武装 ⇒ 这里会看到 5 次空格（5 根游标全在对齐位）。
+        let mut screen = ScriptScreen::new(vec![pins_frame(&[0, 0, 0, 0, 0], 0)]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
         assert_eq!(pointer.spaces, 0, "{outcome:?}");
@@ -660,53 +659,69 @@ mod tests {
     }
 
     #[test]
-    fn safe_pins_finds_target_offset_from_the_slot_center() {
-        // 目标方块偏在槽中心 +45px（实测槽宽约 105px）：搜索半宽必须够大才找得到。
-        let centers = pin_local_centers();
-        let last = centers[4];
-        let offset = last + 45;
+    fn safe_pins_judges_each_pair_independently() {
+        // 只有第 1、4 根游标压在自己的目标上（其余仍偏开 40px）⇒ 同一帧只按这 2 对。
+        // 反例：只盯「第一个未锁定槽」的旧实现会连按同一对，或对没对齐的也按。
         let mut screen = ScriptScreen::new(vec![
-            indicator_frame(4),
-            track_frame(Some(offset), last + 20),
-            indicator_frame(4),
-            track_frame(Some(offset), offset),
-            indicator_frame(5),
+            pins_frame(&[40, 40, 40, 40, 40], 0),
+            pins_frame(&[0, 40, 40, 0, 40], 0),
+            pins_frame(&[0, 40, 40, 0, 40], 5),
         ]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
         assert!(outcome.is_done(), "{outcome:?}");
-        assert_eq!(pointer.spaces, 1);
+        assert_eq!(pointer.spaces, 2, "只有 2 对对齐 ⇒ 只按 2 次：{outcome:?}");
     }
 
     #[test]
     fn safe_pins_does_not_repeat_press_for_the_same_target() {
-        // 预武装一次后游标一直压在目标上、槽始终不锁定 → 只允许按一次空格。
-        let centers = pin_local_centers();
-        let last = centers[4];
+        // 预武装一次后游标一直压在目标上、指示条始终不亮 ⇒ 同一个目标只按一次。
         let mut screen = ScriptScreen::new(vec![
-            indicator_frame(4),
-            track_frame(Some(last), last + 30),
-            indicator_frame(4),
-            track_frame(Some(last), last),
+            pins_frame(&[40, 40, 40, 40, 40], 0),
+            pins_frame(&[0, 40, 40, 40, 40], 0),
         ]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
         assert_eq!(pointer.spaces, 1, "{outcome:?}");
-        assert!(!outcome.is_done());
+        assert!(
+            !outcome.is_confirmed(),
+            "指示条一格不亮时绝不许报「确认完成」：{outcome:?}"
+        );
     }
 
     #[test]
-    fn safe_pins_aborts_when_target_square_is_missing() {
-        // 只有游标、没有目标方块 → 绝不猜位置，连续 20 帧后放弃。
-        let centers = pin_local_centers();
-        let mut frames = vec![indicator_frame(0), track_frame(None, centers[0])];
-        frames.push(track_frame(None, centers[0]));
-        let mut screen = ScriptScreen::new(frames);
+    fn safe_pins_reports_unpaired_tracks_instead_of_guessing() {
+        // 只有游标、没有目标方块 ⇒ 一对也配不出来 ⇒ 一次都不按，收尾文案要说清「未配对」。
+        // 反例：配不上就瞎按，或把「没配对」当成「已完成」。
+        let cursors_only: Vec<(PxRect, [u8; 3])> = PIN_TARGET_XS
+            .iter()
+            .map(|&cx| (rect(cx - 2, 182, 5, 27), WHITE))
+            .collect();
+        let mut shapes = vec![(PINS_TRACK, TRACK_GREY)];
+        shapes.extend(cursors_only);
+        let mut screen = ScriptScreen::new(vec![paint_frame(PINS_W, PINS_H, &shapes)]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
-        assert!(!outcome.is_done());
-        assert!(abort_reason(&outcome).contains("第 1 槽目标位未识别"), "{outcome:?}");
-        assert_eq!(pointer.spaces, 0);
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(pointer.spaces, 0, "没有目标位就零输入：{outcome:?}");
+        assert!(
+            abort_reason(&outcome).contains("未能配对到目标"),
+            "必须说清卡在「配不上目标」：{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn safe_pins_aborts_with_zero_input_when_there_is_no_track_at_all() {
+        // 空白画面（没有任何中灰长条）⇒ 量不出轨道 ⇒ 连败后零输入退出。
+        let mut screen = ScriptScreen::new(vec![paint_frame(PINS_W, PINS_H, &[])]);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(pointer.events, 0, "定位失败必须零输入：{outcome:?}");
+        assert!(
+            abort_reason(&outcome).contains("轨道"),
+            "文案要点明「没找到轨道」：{outcome:?}"
+        );
     }
 
     // ── 黄键台（每帧自适应定位）──
@@ -731,7 +746,7 @@ mod tests {
 
     #[test]
     fn module_keys_aborts_with_zero_input_when_no_panel_is_visible() {
-        // 空白画面：定位连败 6 帧后零输入退出，并给出「正对面板」的提示。
+        // 空白画面：定位连败 LOCATE_FAIL_LIMIT 帧后零输入退出，并给出「正对面板」的提示。
         let mut screen = panel_screen(vec![blank_panel_frame()]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
@@ -743,16 +758,18 @@ mod tests {
     }
 
     #[test]
-    fn module_keys_tries_a_stuck_key_twice_then_marks_it_dead() {
-        // 同一颗键一直亮、进度永不推进 → 连点 2 轮（spec B6）就判死，不许无限重试。
+    fn module_keys_retries_a_stuck_key_until_the_strike_limit() {
+        // 同一颗键一直亮、进度永不推进 → 点满 DEAD_STRIKES 轮（spec A2：2→4）才判死，
+        // 判死后立刻按「1 键已点完但进度未满」收尾，不许无限重试。
+        // 反例：`DEAD_STRIKES = 2` 时这里只会看到 2 次点击。
         let mut screen = panel_screen(vec![panel_frame(&[3], 0, 16, true)]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
         assert!(!outcome.is_done(), "{outcome:?}");
         assert_eq!(
             pointer.clicks,
-            vec![panel_key_center(3); 2],
-            "同一颗键最多试 2 次：{outcome:?}"
+            vec![panel_key_center(3); usize::from(keys::DEAD_STRIKES)],
+            "同一颗键必须重试到判死线才放弃：{outcome:?}"
         );
     }
 
@@ -785,21 +802,52 @@ mod tests {
     }
 
     #[test]
-    fn module_keys_aborts_once_all_sixteen_keys_are_spent() {
-        // 16 格全亮、进度始终 0：每格最多试 2 轮（B6），之后立即 Abort，不烧满 15s 超时。
+    fn the_input_cap_leaves_room_for_a_full_sixteen_by_dead_strikes_retry() {
+        // P8：跨常量约束（LESSON-007：两个各自合理的数字相乘会变死代码）。
+        // `16 键 × DEAD_STRIKES(4) × 2 事件` = 128 是**合法**的最坏用量，正常档安全阀必须装得下。
+        // 反例：把 `AZ3_MAX_INPUT_EVENTS` 改回 120 ⇒ 128 > 120 ⇒ 这条红。
+        let cap = u64::from(delta_config::AZ3_MAX_INPUT_EVENTS);
+        let worst_case = 16 * u64::from(keys::DEAD_STRIKES) * 2;
+        assert!(
+            worst_case <= cap,
+            "合法最坏用量 {worst_case} 必须 ≤ 安全阀 {cap}，否则「重试到底」会被报成「疑似误判」"
+        );
+        // 抬高的同时不能失去安全网意义：实测误判乱点是 344/330/370 个事件。
+        let misjudged = 344u64;
+        assert!(cap < misjudged, "安全阀 {cap} 仍必须低于实测误判乱点 {misjudged}");
+    }
+
+    #[test]
+    fn module_keys_spends_all_sixteen_keys_without_hitting_the_input_cap() {
+        // 16 格全亮、进度始终 0：每格重试满 DEAD_STRIKES 轮才判死，共 16 × 4 = 64 次点击
+        // = **128 个输入事件**。这个量必须**装得进**正常档安全阀（现 160）：
+        // 它是「这一局没解开」的合法收尾，不该被误报成「疑似误判（多半不是键台）」。
+        // LESSON-007 的跨常量冲突：`DEAD_STRIKES` 从 2 提到 4 后 128 > 旧的 120，
+        // 于是上限跟着抬到 160 —— 这条断言就是钉住那个不等式。
         let mut screen = panel_screen(vec![panel_frame(&(0..16).collect::<Vec<_>>(), 0, 16, true)]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
         assert!(!outcome.is_done(), "{outcome:?}");
-        assert_eq!(pointer.clicks.len(), 16 * 2, "{outcome:?}");
+
+        let cap = u64::from(delta_config::AZ3_MAX_INPUT_EVENTS);
+        let worst_case = 16 * u64::from(keys::DEAD_STRIKES) * 2;
+        assert!(
+            worst_case <= cap,
+            "跨常量约束：16 键 × DEAD_STRIKES × 2 事件 = {worst_case} 必须 ≤ 安全阀 {cap}，\
+             否则「正常重试到底」会被报成「疑似误判」"
+        );
+        assert!(
+            abort_reason(&outcome).contains("已点完但进度未满"),
+            "合法收尾必须报「点完了但没解开」，不许报成误判：{outcome:?}"
+        );
+        assert_eq!(
+            pointer.events, worst_case,
+            "16 键各点满 DEAD_STRIKES 轮 = {worst_case} 个事件：{outcome:?}"
+        );
         let mut centres: Vec<(i32, i32)> = pointer.clicks.iter().map(|p| (p.x, p.y)).collect();
         centres.sort_unstable();
         centres.dedup();
-        assert_eq!(centres.len(), 16, "16 次点击必须落在 16 个不同的键中心上");
-        assert!(
-            abort_reason(&outcome).contains("16 键已点完但进度未满"),
-            "{outcome:?}"
-        );
+        assert_eq!(centres.len(), 16, "每一次点击都必须落在 16 颗键的中心上");
     }
 
     #[test]
@@ -916,13 +964,18 @@ mod tests {
 
     #[test]
     fn module_keys_falls_back_to_the_degraded_criterion_without_progress_boxes() {
-        // 进度框读不出来（退化）→ 不判进度；16 格都试过之后按退化判据收尾，
+        // 进度框读不出来（退化）→ 不判进度；16 格都重试到判死之后按退化判据收尾，
         // 且文案必须说明「用的是退化判据」，不许假装读到了进度。
+        // 退化档安全阀是 300 事件 = 150 次点击，装得下 16 × DEAD_STRIKES = 64 次。
         let mut screen = panel_screen(vec![panel_frame(&(0..16).collect::<Vec<_>>(), 0, 16, false)]);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::ModuleKeys, &mut screen, &mut pointer);
         assert!(outcome.is_done(), "{outcome:?}");
-        assert_eq!(pointer.clicks.len(), 16 * 2, "{outcome:?}");
+        assert_eq!(
+            pointer.clicks.len(),
+            16 * usize::from(keys::DEAD_STRIKES),
+            "16 格各重试到判死才收尾：{outcome:?}"
+        );
         let mut centres: Vec<(i32, i32)> = pointer.clicks.iter().map(|p| (p.x, p.y)).collect();
         centres.sort_unstable();
         centres.dedup();

@@ -300,14 +300,11 @@ impl Az3Kind {
 
 // ── AZ3 二级变体判别（有序：先强特征，后弱特征）──
 
-/// 任务保险：轨道带内竖直白块数量下限（5 槽，容忍 1 根被游标遮住）。
-const AZ3_PINS_MIN_SLOTS: usize = 4;
-/// 任务保险：每个滑槽在配置中心两侧的搜索半宽（与执行层同口径）。
-const AZ3_PIN_SEARCH_HALF_W: i32 = 40;
-/// 任务保险：竖直白块的高度下限。
-const AZ3_PIN_BAR_MIN_H: u32 = 18;
-/// 任务保险：竖直白块的宽度上限（细长才是游标，粗白块是别的 UI）。
-const AZ3_PIN_BAR_MAX_W: u32 = 10;
+/// 任务保险：轨道上至少要有这么多对「目标 + 游标」才算命中。
+///
+/// 实测进展中会同时存在 2~5 对（对数随进度变化），所以下限取 2 ——
+/// 旧值 4 来自「5 个固定滑槽里至少 4 个有白块」，那套固定槽判据已整段删除。
+const AZ3_PINS_MIN_PAIRS: usize = 2;
 /// 大保险：目标带亮绿占比下限。
 const AZ3_TIMING_GREEN_RATIO: f32 = 0.01;
 /// 大保险：目标带能切出的等距字符列下限。
@@ -331,7 +328,7 @@ pub fn az3_variant(frame: &Frame, view: &PxView) -> Az3Kind {
     if looks_like_keys(frame) {
         return Az3Kind::ModuleKeys;
     }
-    if looks_like_pins(frame, az3) {
+    if looks_like_pins(frame) {
         return Az3Kind::SafePins;
     }
     if looks_like_timing(frame, az3) {
@@ -364,25 +361,14 @@ fn looks_like_keys(frame: &Frame) -> bool {
     (0.72..=1.40).contains(&aspect)
 }
 
-/// 任务保险：5 个配置槽里至少有 4 个槽内有细长竖直白块（游标）。
+/// 任务保险：**一条连续长轨道 + 至少 2 对「白色目标方块 + 白色细竖线游标」**。
 ///
-/// 必须按「槽」计数而不是数全带白块：LED 数字、面板竖线这类白色元素也可能细长，
-/// 但它们不会同时出现在 5 个滑槽位置上。
-fn looks_like_pins(frame: &Frame, az3: &PxAz3) -> bool {
-    let filled = az3
-        .pin_center_x
-        .iter()
-        .filter(|&&center| {
-            let slot = delta_geom::PxRect {
-                x: center - AZ3_PIN_SEARCH_HALF_W,
-                y: az3.track_band.y,
-                w: AZ3_PIN_SEARCH_HALF_W * 2,
-                h: az3.track_band.h,
-            };
-            vertical_white_bars(frame, slot) > 0
-        })
-        .count();
-    filled >= AZ3_PINS_MIN_SLOTS
+/// 旧实现拿配置里 5 个写死的 `pin_center_x` 各开一个搜索窗数竖直白块（≥4 个算命中）。
+/// 实机轨道是一条**连续长轨道**，目标与游标的位置每局都变、对数随进度变化（2~5 对），
+/// 固定槽中心必然开在空白处 ⇒ 一个白块都找不到 ⇒ 这个界面永远判不出来。
+/// 现在判别与执行共用同一份逐帧几何（[`locate::locate_pins`]），不再有两套坐标。
+fn looks_like_pins(frame: &Frame) -> bool {
+    locate::locate_pins(frame).is_ok_and(|pins| pins.pairs.len() >= AZ3_PINS_MIN_PAIRS)
 }
 
 /// 大保险：目标带有亮绿高亮，且能被切成多个等距字符列。
@@ -430,37 +416,6 @@ fn color_columns(
     equidistant_column_peaks(&binary, min_columns).is_some()
 }
 
-/// 竖直白块数量：逐列统计白像素，够高且够窄的连续列段算一根。
-fn vertical_white_bars(frame: &Frame, rect: delta_geom::PxRect) -> usize {
-    let x0 = rect.x.max(0) as u32;
-    let y0 = rect.y.max(0) as u32;
-    let x1 = (rect.right().max(0) as u32).min(frame.w);
-    let y1 = (rect.bottom().max(0) as u32).min(frame.h);
-    if x1 <= x0 || y1 <= y0 {
-        return 0;
-    }
-
-    let mut bars = 0usize;
-    let mut run = 0u32;
-    for x in x0..x1 {
-        let tall = (y0..y1)
-            .filter(|&y| is_bright_white(frame.pixel(x, y)))
-            .count() as u32;
-        if tall >= AZ3_PIN_BAR_MIN_H {
-            run += 1;
-            continue;
-        }
-        if (1..=AZ3_PIN_BAR_MAX_W).contains(&run) {
-            bars += 1;
-        }
-        run = 0;
-    }
-    if (1..=AZ3_PIN_BAR_MAX_W).contains(&run) {
-        bars += 1;
-    }
-    bars
-}
-
 /// 统计指定像素矩形内满足谓词的像素占比（0..=1）。
 fn color_ratio(frame: &Frame, rect: delta_geom::PxRect, pred: impl Fn([u8; 3]) -> bool) -> f32 {
     let x0 = rect.x.max(0) as u32;
@@ -491,10 +446,6 @@ fn is_green_glow([b, g, r]: [u8; 3]) -> bool {
     g > 120 && g > r.saturating_add(25) && g > b.saturating_add(25)
 }
 
-fn is_bright_white([b, g, r]: [u8; 3]) -> bool {
-    r > 185 && g > 185 && b > 185
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +458,8 @@ mod tests {
     const W: u32 = 1280;
     const H: u32 = 720;
     const WHITE: [u8; 3] = [255, 255, 255];
+    /// 任务保险轨道的底色：中灰（720p 实测行均值 67，落在定位层的 55..110 带内）。
+    const TRACK_GREY: [u8; 3] = [67, 67, 67];
 
     struct Canvas {
         w: u32,
@@ -755,11 +708,18 @@ mod tests {
         canvas.frame()
     }
 
-    /// 任务保险：轨道带 (365,155)-(896,231) 内 5 根细长白竖条（实测槽中心 x）。
+    /// 任务保险：**一条连续长轨道** + 5 对「白色目标方块（宽扁）+ 白色细竖线（窄高，伸出带外）」。
+    ///
+    /// 100% 脱敏合成帧：只复刻相对结构（轨道是横贯画面的中灰长条、目标是宽扁白块、
+    /// 游标是窄高白条且纵向超出轨道带），不含任何真实机位 / 账号 / 路径。
+    /// 反例：旧的「5 个固定槽中心各一根竖白条」在这个帧里一对都配不上（没有目标白块），
+    /// 所以这条用例能拦住「退回固定槽判据」的改动。
     fn safe_pins_frame() -> Frame {
         let mut canvas = Canvas::new(W, H);
-        for center_x in [416, 527, 634, 739, 845] {
-            canvas.paint(rect(center_x - 4, 160, 8, 60), WHITE);
+        canvas.paint(rect(300, 188, 750, 15), TRACK_GREY);
+        for center_x in [413, 527, 634, 739, 845] {
+            canvas.paint(rect(center_x - 5, 187, 10, 17), WHITE);
+            canvas.paint(rect(center_x + 40 - 2, 182, 5, 27), WHITE);
         }
         canvas.frame()
     }

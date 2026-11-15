@@ -155,25 +155,43 @@ fn switch(painter: &egui::Painter, center: Pos2, on: bool, pal: &Palette) {
 
 // ── 主布局（`ui-themes.md` §3.1 的纵向分段表）─────────────────────
 
-/// L-A 分段的六个区段与网格六格。
-#[derive(Debug, Clone, Copy)]
+/// 开关网格每行的格数（3 列一行流式排）。
+const GRID_COLS: usize = 3;
+
+/// 网格行数：**由格数算出来**（`div_ceil`），不再硬编码 2 行。
+fn grid_rows(cells: usize) -> usize {
+    cells.div_ceil(GRID_COLS)
+}
+
+/// 网格区总高：`行数 × 行高 + (行数 − 1) × 行距`。
+fn grid_height(rows: usize) -> f32 {
+    if rows == 0 {
+        return 0.0;
+    }
+    let rows = rows as f32;
+    rows * theme::GRID_ROW_H + (rows - 1.0) * theme::GRID_ROW_GAP
+}
+
+/// L-A 分段的六个区段与开关网格的每格落点（格数决定行数）。
+#[derive(Debug, Clone)]
 struct MainRows {
     title: Rect,
     result: Rect,
-    grid: [Rect; 6],
+    grid: Vec<Rect>,
     primary: Rect,
     status: Rect,
     footer: Rect,
 }
 
-/// 由内容区算出纵向分段（纯函数，便于直接断言 400×420 / 340×360）。
+/// 由内容区与格数算出纵向分段（纯函数，便于直接断言 400×420 / 340×384）。
 ///
-/// 标称 388 = 32+8+96+12+108+12+44+8+32+8+28（§3.1 表格逐行的落点）；
+/// 标称 426 = 32+8+96+12+146+12+44+8+32+8+28（网格 4 行：4×32+3×6 = 146）；
 /// 窗口更矮时**先压结果区（96→64），再压段间距（→4）**——不压开关行高、不删行。
-fn main_rows(content: Rect) -> MainRows {
+fn main_rows(content: Rect, cells: usize) -> MainRows {
     let width = content.width();
+    let grid_h = grid_height(grid_rows(cells));
     let fixed = theme::TITLE_BAR_H
-        + theme::GRID_H
+        + grid_h
         + theme::PRIMARY_H
         + theme::STATUS_H
         + theme::FOOTER_H;
@@ -202,7 +220,7 @@ fn main_rows(content: Rect) -> MainRows {
     y = title.bottom() + gaps[0];
     let result = row(y, result_h);
     y = result.bottom() + gaps[1];
-    let grid_area = row(y, theme::GRID_H);
+    let grid_area = row(y, grid_h);
     y = grid_area.bottom() + gaps[2];
     let primary = row(y, theme::PRIMARY_H);
     y = primary.bottom() + gaps[3];
@@ -210,21 +228,22 @@ fn main_rows(content: Rect) -> MainRows {
     y = status.bottom() + gaps[4];
     let footer = row(y, theme::FOOTER_H);
 
-    // 3 行 × 2 列：列宽 =（内容宽 − 20）/2，行高 =（108 − 2×6）/3 = 32。
-    let cell_w = (width - theme::GRID_COL_GAP) / 2.0;
-    let cell_h = (theme::GRID_H - theme::GRID_ROW_GAP * 2.0) / 3.0;
-    let mut grid = [Rect::NOTHING; 6];
-    for (index, cell) in grid.iter_mut().enumerate() {
-        let column = index % 2;
-        let row_index = index / 2;
-        *cell = Rect::from_min_size(
-            Pos2::new(
-                content.left() + column as f32 * (cell_w + theme::GRID_COL_GAP),
-                grid_area.top() + row_index as f32 * (cell_h + theme::GRID_ROW_GAP),
-            ),
-            Vec2::new(cell_w, cell_h),
-        );
-    }
+    // 3 列一行：列宽 =（内容宽 − 2×列距）/3，行高固定 32（行数由格数决定）。
+    let cell_w = (width - theme::GRID_COL_GAP * (GRID_COLS as f32 - 1.0)) / GRID_COLS as f32;
+    let grid = (0..cells)
+        .map(|index| {
+            let column = index % GRID_COLS;
+            let row_index = index / GRID_COLS;
+            Rect::from_min_size(
+                Pos2::new(
+                    content.left() + column as f32 * (cell_w + theme::GRID_COL_GAP),
+                    grid_area.top()
+                        + row_index as f32 * (theme::GRID_ROW_H + theme::GRID_ROW_GAP),
+                ),
+                Vec2::new(cell_w, theme::GRID_ROW_H),
+            )
+        })
+        .collect();
 
     MainRows {
         title,
@@ -277,7 +296,8 @@ fn master_toggle(ui: &egui::Ui, rect: Rect, on: bool, hotkey: &str, pal: &Palett
 
 fn main_layout(ui: &egui::Ui, full: Rect, state: &mut UiState, pal: &Palette) -> Option<Action> {
     let content = full.shrink2(Vec2::new(theme::SPACE_M, theme::SPACE_S));
-    let rows = main_rows(content);
+    let cells = state.grid();
+    let rows = main_rows(content, cells.len());
     let mut action = None;
 
     // ── 1 标题条：状态点 + 状态文字 + 右侧三个 16px 图标 ────────────
@@ -343,11 +363,20 @@ fn main_layout(ui: &egui::Ui, full: Rect, state: &mut UiState, pal: &Palette) ->
         action = Some(produced);
     }
 
-    // ── 3 开关网格：3 行 × 2 列，六格 ────────────────────────────
-    for (index, (cell, label, on)) in state.grid().into_iter().enumerate() {
-        if let Some(produced) = grid_cell(ui, rows.grid[index], cell, label, on, &state.hotkey, pal)
-        {
-            action = Some(produced);
+    // ── 3 开关网格：3 列一行流式排，格数与行数都由 `state.grid()` 决定 ─────
+    for (index, cell) in cells.into_iter().enumerate() {
+        let on = state.cell_on(cell);
+        if !grid_cell(ui, rows.grid[index], cell, on, &state.hotkey, pal) {
+            continue;
+        }
+        match cell {
+            // shortcut: 7 个功能开关直接写 `UiState`。app 侧 `Action` 目前只有
+            // `SceneKind` 粒度，而本轮不许动 `crates/app`；下一轮接线改成
+            // `Action::ToggleFlowId(FlowId)` 后把这行换回去（`ToggleFlow` 保留给场景级）。
+            GridCell::Flow(flow) => state.toggles.toggle_flow(flow),
+            GridCell::FingerprintAutoClick => action = Some(Action::ToggleFingerprintAutoClick),
+            GridCell::MorseAutoDownload => action = Some(Action::ToggleMorseAutoDownload),
+            GridCell::Keycap => {}
         }
     }
 
@@ -491,16 +520,18 @@ fn source_label(scene: SceneKind) -> &'static str {
     }
 }
 
-/// 一格开关（或热键键帽）。
+/// 一格开关（或热键键帽）；返回「这一格被点了」。
+///
+/// 点击之后做什么由调用方按 [`GridCell`] 分派 —— 功能开关写 `UiState`，
+/// 两个附加开关返回 [`Action`]（它们要落盘），键帽没有动作。
 fn grid_cell(
     ui: &egui::Ui,
     rect: Rect,
     cell: GridCell,
-    label: &str,
     on: bool,
     hotkey: &str,
     pal: &Palette,
-) -> Option<Action> {
+) -> bool {
     let painter = ui.painter();
     if cell == GridCell::Keycap {
         // 键帽：空心描边块 + 等宽热键名，不可点。
@@ -517,9 +548,10 @@ fn grid_cell(
             theme::mono(pal.font_label),
             pal.text_2,
         );
-        return None;
+        return false;
     }
 
+    let label = cell.label();
     let response = clickable(ui, rect, label, Sense::click());
     painter.rect_filled(
         rect,
@@ -537,22 +569,21 @@ fn grid_cell(
         egui::StrokeKind::Inside,
     );
     painter.text(
-        rect.left_center() + Vec2::new(theme::SPACE_S + 2.0, 0.0),
+        rect.left_center() + Vec2::new(theme::SPACE_S, 0.0),
         Align2::LEFT_CENTER,
         label,
-        pal.text(pal.font_body),
+        pal.text(pal.font_label + 1.0),
         if on { pal.text_1 } else { pal.text_2 },
     );
+    // 3 列布局一格只有 ~120px：文案左贴 8px，轨道右缘也贴 8px（`switch` 按中心点画，
+    // 所以中心 = 右 − 8 − 半个轨道宽），保证 4 个汉字 + 开关都塞得进最小窗。
     switch(
         painter,
-        rect.right_center() - Vec2::new(theme::SPACE_M, 0.0),
+        rect.right_center() - Vec2::new(theme::SPACE_S + theme::SWITCH_W / 2.0, 0.0),
         on,
         pal,
     );
-    if response.clicked() {
-        return cell.action();
-    }
-    None
+    response.clicked()
 }
 
 /// 主按钮：可用态满宽实心 accent；不可用态改文案 + 描边（不静默禁用）。
@@ -2044,13 +2075,13 @@ mod tests {
         assert!((back.h - original.h).abs() < 1e-4);
     }
 
-    /// L-A 分段必须在 400×420 与最小 340×360 下都放得下：六格开关全区可见、
+    /// L-A 分段必须在 400×420 与最小 340×384 下都放得下：10 格开关全区可见、
     /// 结果区不压主按钮、所有区段都在内容区内。
     #[test]
     fn main_rows_match_the_l_a_segments_on_both_window_sizes() {
         for size in [theme::WINDOW_SIZE, theme::WINDOW_MIN] {
             let content = content_for(size);
-            let rows = main_rows(content);
+            let rows = main_rows(content, UiState::default().grid().len());
             for (name, rect) in [
                 ("标题条", rows.title),
                 ("结果区", rows.result),
@@ -2074,27 +2105,98 @@ mod tests {
             assert!(rows.title.bottom() <= rows.result.top());
             assert!(rows.result.bottom() <= rows.grid[0].top());
             assert!(
-                rows.grid[5].bottom() <= rows.primary.top(),
+                rows.grid.last().expect("网格不得为空").bottom() <= rows.primary.top(),
                 "{size:?} 下开关网格压到主按钮"
             );
             assert!(rows.primary.bottom() <= rows.status.top(), "结果区压到底部区段");
             assert!(rows.status.bottom() <= rows.footer.top());
-            // 两列不得重叠，且两列宽度相同。
+            // 同一行的三列不得重叠，且宽度相同。
             assert!((rows.grid[0].width() - rows.grid[1].width()).abs() < 0.01);
             assert!(rows.grid[0].right() <= rows.grid[1].left());
+            assert!(rows.grid[1].right() <= rows.grid[2].left(), "一行三列，各列不重叠");
         }
+    }
+
+    /// 3 列的硬约束：一格里的「文案 + 28px 开关」必须塞进**最小窗**的一格。
+    ///
+    /// 反例：给某功能起 6 个汉字的名字 / 偷偷把字号调大 → 文案压到开关上或画出格子。
+    #[test]
+    fn grid_labels_fit_a_cell_at_the_minimum_window_size() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let cells = UiState::default().grid();
+        let rect = main_rows(content_for(theme::WINDOW_MIN), cells.len()).grid[0];
+        let pal = pal();
+        let mut widest = 0.0_f32;
+        ctx.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    for cell in &cells {
+                        let galley = ui.painter().layout_no_wrap(
+                            cell.label().to_owned(),
+                            pal.text(pal.font_label + 1.0),
+                            pal.text_1,
+                        );
+                        let width = galley.size().x;
+                        assert!(
+                            width + theme::SPACE_S + theme::SWITCH_W + theme::SPACE_S
+                                <= rect.width(),
+                            "「{}」宽 {width:.1}px，塞不进 {:.1}px 的格子",
+                            cell.label(),
+                            rect.width()
+                        );
+                        widest = widest.max(width);
+                    }
+                });
+        })
+        .textures_delta
+        .clear();
+        assert!(widest > 0.0, "字体没装上，量不出宽度");
+    }
+
+    /// U-T6：网格行数跟着格数走（3 列一行流式排），不再硬编码 2 行。
+    ///
+    /// 反例：写死 `[Rect; 6]` / 写死 2 行 → 10 格时第 7~10 格没有落点（或全挤在一行）。
+    #[test]
+    fn grid_rows_follow_the_cell_count() {
+        assert_eq!(grid_rows(9), 3, "9 格 = 3 行");
+        assert_eq!(grid_rows(10), 4, "10 格 = 4 行（最后一格单独占一行）");
+        assert_eq!(grid_rows(0), 0, "0 格不画行");
+
+        let content = content_for(theme::WINDOW_SIZE);
+        let rows = main_rows(content, 10);
+        assert_eq!(rows.grid.len(), 10, "落点数量必须等于格数");
+        let row_step = theme::GRID_ROW_H + theme::GRID_ROW_GAP;
+        for index in [3, 6, 9] {
+            assert!(
+                (rows.grid[index].top() - rows.grid[index - 3].top() - row_step).abs() < 0.01,
+                "第 {index} 格必须比第 {} 格低一行",
+                index - 3
+            );
+            assert!(
+                (rows.grid[index].left() - rows.grid[0].left()).abs() < 0.01,
+                "每行都从第一列起排"
+            );
+        }
+        // 9 格时第 7~9 格仍在第 3 行（不能因为少一格就多长一行）。
+        let nine = main_rows(content, 9);
+        assert_eq!(nine.grid.len(), 9);
+        assert!((nine.grid[8].top() - nine.grid[6].top()).abs() < 0.01, "9 格只有 3 行");
     }
 
     /// 400×420 下分段落在 §3.1 表格的标称位置（允许 ±2px：富余空间补给了结果区）。
     #[test]
     fn nominal_segments_land_on_the_spec_table() {
         let content = content_for(theme::WINDOW_SIZE);
-        let rows = main_rows(content);
+        let rows = main_rows(content, 10);
         let y = |rect: Rect| rect.top() - content.top();
         assert!((y(rows.title) - 0.0).abs() < 0.01);
         assert!((y(rows.result) - 40.0).abs() < 0.01, "结果区应在 48（内容内 40）");
         assert!((y(rows.primary) - 284.0).abs() < 0.01, "主按钮应在 276（内容内 284）");
-        assert!((rows.result.height() - 112.0).abs() < 0.01, "富余高度补给结果区");
+        // 网格从 3 行变 4 行（+38px），这 38px 从结果区出：112 → 74（≥ RESULT_MIN_H）。
+        assert!((rows.result.height() - 74.0).abs() < 0.01, "富余高度补给结果区");
+        assert!(rows.result.height() >= theme::RESULT_MIN_H, "结果区不得低于可压缩下限");
     }
 
     #[test]
@@ -2338,11 +2440,7 @@ mod tests {
         state.missing = vec!["摩斯区域 #1".to_owned()];
         assert_eq!(state.primary_state(), PrimaryState::NeedsCalibration);
         state.missing.clear();
-        state.toggles = Toggles {
-            morse: false,
-            fingerprint: false,
-            console: false,
-        };
+        state.toggles = Toggles::from_flags([false; 7]);
         assert_eq!(state.primary_state(), PrimaryState::NoFlow);
         state.result = Some(crate::state::morse_result("427", true));
         assert_eq!(

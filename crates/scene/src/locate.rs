@@ -366,8 +366,13 @@ const WIRE_BAND_RATIO: (i32, i32) = (3, 4);
 
 /// 黄键台 4×4 键阵的边长。
 pub const KEY_GRID_SIDE: usize = 4;
-/// 4×4 组合里至少要命中的格数：允许 4 颗键正在发光/被 HUD 挡住。
-const KEY_MIN_HITS: usize = 12;
+/// 4×4 组合里至少要命中的格数：允许 5 颗键正在发光/被 HUD 挡住。
+///
+/// 实机 1080p 录像逐帧量过（230 个采样点）：面板完整可见的 6 秒里网格**只对上 11 颗**
+/// （`n95 = 12~13`、`hit95 = 11`），12 会把这 6 秒整段判成失败。
+/// 降到 11 的误判余量来自同一批采样点的反向统计：**非面板帧命中数最高 7**。
+/// 不许再往下调：`t=32` 那帧（远景误报）命中数正好 10，降到 10 就会把它认成键阵。
+const KEY_MIN_HITS: usize = 11;
 
 /// 「暗键」的灰度上限（键面近黑）。
 const KEY_DARK_LUMA: u8 = 95;
@@ -377,9 +382,12 @@ const KEY_SIDE: (u32, u32) = (18, 70);
 const KEY_ASPECT: (f32, f32) = (0.6, 1.7);
 /// 单颗键在自身外接框内的填充率下限。
 ///
-/// 720p 实机实测 0.47~0.56 —— 键面被白色图标与下方小字挖掉约一半，
+/// 720p 近景实测 0.47~0.56 —— 键面被白色图标与下方小字挖掉约一半，
 /// 按 0.55 会把 16 颗键只留下 1 颗，整台机器永远定位失败。
-const KEY_MIN_FILL: f32 = 0.40;
+///
+/// **远景/斜视会再低一档**：实测有 3~5 颗键恒为 **0.36 / 0.38 / 0.41**，在旧的 0.40 死线
+/// 上下抖动 ⇒ 每帧漏 3~5 颗 ⇒ 撞 [`KEY_MIN_HITS`] ⇒ 整台判失败。取 0.32 留 0.04 余量。
+const KEY_MIN_FILL: f32 = 0.32;
 /// 单颗键的最小面积。
 const KEY_MIN_AREA: u32 = 200;
 /// 4×4 键阵外接框的宽高比区间（键是方的、间距均匀 ⇒ 整阵近似正方形）。
@@ -550,6 +558,12 @@ pub enum LocateError {
     GridRows,
     #[error("没找到右侧的 4×4 按键阵（能对上号的暗色键块不足 12 个）")]
     Keys,
+    /// 任务保险：整帧找不到那条连续长轨道。
+    ///
+    /// 与「轨道在、但还没有目标」**必须分开**：后者是「还没出游标」，继续等；
+    /// 前者说明这不是任务保险界面（或镜头没对准），继续等只会空转到超时。
+    #[error("没找到任务保险的水平长轨道")]
+    Track,
 }
 
 /// 定位三态：**「还没长齐」与「真没有」必须分开**。
@@ -601,16 +615,25 @@ const PANEL_MIN_RATIO: f32 = 0.03;
 /// 探底色的采样步长（这一步只回答「在不在」，不需要逐像素）。
 const PANEL_SAMPLE_STEP: i32 = 4;
 
-/// 画面里有没有「蓝色面板」这一层底 —— **只看底色，不看结构**。
+/// 画面里有没有「面板」这一层底 —— 用来把 [`Locate::NotYet`]（面板已在、结构未齐）与
+/// [`Locate::Absent`]（真的不在这个界面）分开。不做 4×4 判定，所以淡入的中间态也能量到。
 ///
-/// 用来把 [`Locate::NotYet`]（底色已在、结构未齐）与 [`Locate::Absent`]
-/// （连底色都没有）分开；不做任何结构判定，所以淡入的中间态也能量到。
+/// 两条证据**任一成立**即可：
+/// 1. **深蓝底色**（[`is_panel_base`]）：信号线台 / 操作台面板的底色判据；
+/// 2. **暗色键阵**（[`key_grid_present`]）：黄键台的面板是**白色机箱**，深蓝占比实测
+///    **0.0**（阈值 0.03）⇒ 只认底色时 `NotYet` 分支永不进入，一失败就报 `Absent`，
+///    连撞失败上限后退出 —— 用户看到的就是「按第一次 F 必然失败」。
 pub fn panel_present(frame: &Frame) -> bool {
     if frame.w < MIN_FRAME_SIDE || frame.h < MIN_FRAME_SIDE {
         return false;
     }
     let (small, _) = normalize_frame(frame);
-    let roi = percent_rect_of(small.w, small.h, PANEL_ROI);
+    base_present(&small) || key_grid_present(&small)
+}
+
+/// 深蓝面板底色在 [`PANEL_ROI`] 里的占比是否达标。
+fn base_present(frame: &Frame) -> bool {
+    let roi = percent_rect_of(frame.w, frame.h, PANEL_ROI);
     let mut hit = 0u32;
     let mut total = 0u32;
     let mut y = roi.y;
@@ -618,7 +641,7 @@ pub fn panel_present(frame: &Frame) -> bool {
         let mut x = roi.x;
         while x < roi.right() {
             total += 1;
-            if is_panel_base(small.pixel(x as u32, y as u32)) {
+            if is_panel_base(frame.pixel(x as u32, y as u32)) {
                 hit += 1;
             }
             x += PANEL_SAMPLE_STEP;
@@ -626,6 +649,19 @@ pub fn panel_present(frame: &Frame) -> bool {
         y += PANEL_SAMPLE_STEP;
     }
     total > 0 && hit as f32 / total as f32 >= PANEL_MIN_RATIO
+}
+
+/// 黄键台键阵的「结构证据」门槛：画面里至少这么多颗暗色键面。
+///
+/// 真面板一帧有 16 颗键面（发光/遮挡时才少），而全片 230 个**非面板**采样点上
+/// 4×4 命中数最高只有 **7** —— 8 是「比误报高、比残缺面板低」的最小值，
+/// 因此它不会把走廊/背包认成键阵，又容得下「11 颗键对上了、5 颗被挡住」那种帧。
+const PANEL_KEYS_MIN_BLOCKS: usize = 8;
+
+/// 画面里有没有「一片大小一致的暗色键面」——只看键面候选，**不要求凑出 4×4**。
+fn key_grid_present(frame: &Frame) -> bool {
+    let gray = frame.luma();
+    uniform_blocks(&dark_blocks(&gray)).len() >= PANEL_KEYS_MIN_BLOCKS
 }
 
 /// 深蓝面板底色（整数比较，等价于 OpenCV 标度 `H 95..135 ∧ S 45..120 ∧ V 70..125`）。
@@ -1554,8 +1590,11 @@ pub fn locate_keys(frame: &Frame) -> Result<LocatedKeys, LocateError> {
     })
 }
 
-/// 黄键台三态定位：`locate_keys` 成功 = [`Locate::Found`]；失败但**面板底色已在** =
-/// [`Locate::NotYet`]（继续等，不计失败）；连底色都没有 = [`Locate::Absent`]。
+/// 黄键台三态定位：`locate_keys` 成功 = [`Locate::Found`]；失败但**面板已在** =
+/// [`Locate::NotYet`]（继续等，不计失败）；连面板都没有 = [`Locate::Absent`]。
+///
+/// 「面板已在」由 [`panel_present`] 判：深蓝底色**或**暗色键阵任一成立。黄键台的面板是
+/// 白色机箱、深蓝占比 0.0，只认底色会让这个分支对黄键台永远不成立。
 pub fn locate_keys_state(frame: &Frame) -> Locate<LocatedKeys> {
     match locate_keys(frame) {
         Ok(keys) => Locate::Found(keys),
@@ -2229,6 +2268,320 @@ fn gray_mask(gray: &GrayImage, rect: PxRect, keep: impl Fn(u8) -> bool) -> Optio
         }
     }
     Some(Masked { binary, x0, y0 })
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 任务保险（SafePins）：**一条连续长轨道** + 若干「白色目标方块」与「白色细竖线游标」
+// ══════════════════════════════════════════════════════════════════════════
+//
+// 旧实现把界面当成「5 个固定滑槽」：拿配置里的 `track_band` 裁一条带，再按 5 个写死的
+// `pin_center_x` 开 5 个搜索窗找白块。实机根本不是那样 —— 轨道是**一条连续长轨道**，
+// 上面分散若干「白色细竖线（游标）」与「白色方块/短横条（目标）」，对数随进度变化（实测 2~5 对），
+// 位置也不是任何固定百分比。于是固定槽中心必然错位：槽窗开在轨道空白处 ⇒ 一个白块都找不到。
+//
+// 现在几何全部每帧从画面量（[`locate_pins`]），与判别/执行共用同一份证据。
+
+/// 轨道带的高度区间（720p 实测 15px；面板上边框只有 1~3px，由此排掉）。
+const PIN_TRACK_H: (i32, i32) = (8, 40);
+/// 轨道至少要占帧宽的这么多：量到的只是某块面板的一段时不认。
+const PIN_TRACK_MIN_W: f32 = 0.25;
+/// 轨道底色的灰度区间（720p 实测 67；纯黑背景 0、亮面板边框 >140 都落在外面）。
+const PIN_TRACK_LUMA: (u32, u32) = (55, 110);
+/// 「非背景」像素的灰度下限：轨道底色 67 在内，面板深蓝底（约 40 以下）在外。
+const PIN_TRACK_FLOOR: u8 = 40;
+/// 轨道内白色元素（目标方块 / 游标）的灰度下限（实测纯白一族）。
+const PIN_WHITE_LUMA: u8 = 140;
+/// 目标方块：宽度区间（实测 10~40；轨道整条亮白头、面板亮边框都远超 40，由此排掉）。
+///
+/// 高度不设上限：目标只可能在**轨道带内**量（见 [`pin_targets`]），带高本身 ≤ 40，
+/// 再叠一道高度上限只会把「游标正压在目标上」那一帧（白块被连成一片）误杀。
+const PIN_TARGET_W: (u32, u32) = (10, 40);
+/// 游标：宽度区间（实测 2~8）与高度下限（实测 20~30）。
+const PIN_CURSOR_W: (u32, u32) = (1, 8);
+const PIN_CURSOR_MIN_H: u32 = 18;
+/// 纵向裁剪时轨道上下各放宽这么多：游标伸到带外的那一截必须一起量进来。
+const PIN_VERTICAL_SLACK: i32 = 6;
+/// 「伸出带外」的像素高度下限（≥3px 才算游标）。
+///
+/// 这是「游标 vs 目标方块」的**唯一分界线**，用实测数字定：目标方块（如 `(413,187,10,17)`）
+/// 相对轨道带最多溢出 1~2px；游标（如 `(621,182,5,27)`）至少溢出 3px。
+/// 按高度分类会在「游标正压在目标上」时失效 —— 两个白块连成一片，既不窄也不扁；
+/// 按「谁伸出带外」分类则两种情形都成立（目标是带内的东西，游标天生比带高）。
+const PIN_CURSOR_PROTRUDE: u32 = 3;
+/// 白色块的连通面积下限（滤掉抗锯齿边与噪点）。
+const PIN_MIN_BLOB: u32 = 8;
+
+/// 任务保险一帧量出来的几何。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedPins {
+    /// 连续长轨道（已剔除上下亮边框）。
+    pub track: PxRect,
+    /// 目标白块（短横条/方块），**按 x 升序**。
+    pub targets: Vec<PxRect>,
+    /// 游标细竖线，**按 x 升序**。
+    pub cursors: Vec<PxRect>,
+    /// `(目标下标, 游标下标, 两者中心的水平距离)`，按目标 x 升序。
+    ///
+    /// 配不上游标的目标**不进这里**，但仍留在 [`Self::targets`] 里供日志排查。
+    pub pairs: Vec<(usize, usize, i32)>,
+}
+
+impl LocatedPins {
+    /// 容差像素数：轨道宽的 0.6%（实测两像素级对齐，轨道 750px 时 ≈4.5px）。
+    ///
+    /// 容差按**轨道宽度**折算而不是写死像素：换分辨率、换机位时轨道会跟着缩放，
+    /// 写死像素的容差会一边太松（点早了）一边太紧（永远等不到）。
+    pub fn tolerance(&self) -> i32 {
+        ((self.track.w as f32 * PIN_TOL_RATIO).round() as i32).max(1)
+    }
+}
+
+/// 容差 = 轨道宽度 × 这个比例（0.6%）。
+const PIN_TOL_RATIO: f32 = 0.006;
+
+/// 一帧定位：轨道 → 带内白块二分类 → 目标/游标配对。全部几何由 `frame` 决定，不读配置。
+///
+/// 零值边界：**轨道在、但一个目标都没有**（刚开局游标还没出来）⇒ `Ok` 且 `pairs` 为空，
+/// 调用方按「还没出游标」继续等；**轨道都找不到** ⇒ `Err(LocateError::Track)`，
+/// 因为「没有轨道」= 这不是任务保险界面，继续等只会空转到超时。
+pub fn locate_pins(frame: &Frame) -> Result<LocatedPins, LocateError> {
+    if frame.w < MIN_FRAME_SIDE || frame.h < MIN_FRAME_SIDE {
+        return Err(LocateError::Frame {
+            w: frame.w,
+            h: frame.h,
+        });
+    }
+    // 与其他定位器同一口径：阈值全是 720p 绝对像素，判定在 720p 世界做，坐标乘回原图。
+    let (small, scale) = normalize_frame(frame);
+    let gray = small.luma();
+    let track = find_pin_track(&gray).ok_or(LocateError::Track)?;
+    let (targets, cursors) = pin_blobs(&gray, track);
+    let pairs = pair_pins(&targets, &cursors);
+    Ok(LocatedPins {
+        track: scale_rect(track, scale),
+        targets: targets.iter().map(|rect| scale_rect(*rect, scale)).collect(),
+        cursors: cursors.iter().map(|rect| scale_rect(*rect, scale)).collect(),
+        // 距离与矩形必须同一坐标口径，否则容差换算会差一个 `scale`。
+        pairs: pairs
+            .into_iter()
+            .map(|(target, cursor, distance)| {
+                (target, cursor, scale_axis(distance, scale))
+            })
+            .collect(),
+    })
+}
+
+/// 任务保险三态：`Found` = 轨道 + 白块量到了；`NotYet` = 面板底色已在但轨道还没长出来；
+/// `Absent` = 连面板都没有。判据与 [`locate_keys_state`] 完全同构（同一套 `panel_present`）。
+pub fn locate_pins_state(frame: &Frame) -> Locate<LocatedPins> {
+    match locate_pins(frame) {
+        Ok(pins) => Locate::Found(pins),
+        Err(LocateError::Frame { .. }) => Locate::Absent,
+        Err(_) if panel_present(frame) => Locate::NotYet,
+        Err(_) => Locate::Absent,
+    }
+}
+
+/// 找轨道：逐行统计「非背景像素数 + 其平均亮度」，合格行连成段，取**最宽**的一段。
+///
+/// 三条硬门槛缺一不可：
+/// 1. 该行非背景像素数 ≥ 帧宽 [`PIN_TRACK_MIN_W`]（否则只是某一小块面板）；
+/// 2. 这些像素的平均亮度在 [`PIN_TRACK_LUMA`]（轨道是中灰，不是纯黑也不是亮白）；
+/// 3. 连续合格行的高度在 [`PIN_TRACK_H`]（面板上边框实测只有 1~3px，靠这条排掉 ——
+///    它的**行均值同样落在 55..110**，只看亮度必然误判）。
+///
+/// 取「最宽」而不是「最靠上」：底部指示条的绿条也是中灰、也能连成 8~40px 高的一段，
+/// 但它窄（实测 5 格 + 间隙 < 轨道宽），轨道永远比它宽。
+fn find_pin_track(gray: &GrayImage) -> Option<PxRect> {
+    let min_w = (gray.w as f32 * PIN_TRACK_MIN_W).ceil() as u32;
+    let mut best: Option<PxRect> = None;
+    let mut run: Option<(u32, u32, u32, u32)> = None; // (top, bottom, left, width)
+    for y in 0..=gray.h {
+        // 末行用 `None` 收尾，省掉循环外的重复 flush。
+        let row = if y < gray.h {
+            track_row(gray, y, min_w)
+        } else {
+            None
+        };
+        let Some((left, width)) = row else {
+            if let Some(rect) = run.take().and_then(band_rect) {
+                best = wider(best, rect);
+            }
+            continue;
+        };
+        run = Some(match run {
+            Some((top, _, run_left, run_w)) => (top, y, run_left.min(left), run_w.max(width)),
+            None => (y, y, left, width),
+        });
+    }
+    best
+}
+
+/// 把一段连续合格行变成矩形；高度不在 [`PIN_TRACK_H`] 里就不算轨道。
+fn band_rect((top, bottom, left, width): (u32, u32, u32, u32)) -> Option<PxRect> {
+    let height = bottom + 1 - top;
+    if !within_i32(PIN_TRACK_H, height as i32) {
+        return None;
+    }
+    Some(PxRect {
+        x: left as i32,
+        y: top as i32,
+        w: width as i32,
+        h: height as i32,
+    })
+}
+
+/// 两个轨道候选里取更宽的那个（同宽取更高的，保证结果与遍历顺序无关）。
+fn wider(current: Option<PxRect>, candidate: PxRect) -> Option<PxRect> {
+    match current {
+        Some(rect) if (rect.w, rect.h) >= (candidate.w, candidate.h) => Some(rect),
+        _ => Some(candidate),
+    }
+}
+
+/// 单行是否够格当轨道带：返回 `(左缘 x, 跨度宽度)`，不够格返回 `None`。
+///
+/// 宽度用**非背景像素数**而不是「首尾跨度」：底部指示条 5 格之间有间隙，
+/// 按跨度算它也能凑够帧宽的 25%，按像素数算它就露馅了。
+fn track_row(gray: &GrayImage, y: u32, min_w: u32) -> Option<(u32, u32)> {
+    let row = gray.row(y);
+    let (mut count, mut sum) = (0u32, 0u32);
+    let (mut left, mut right) = (None, 0u32);
+    for (x, &luma) in row.iter().enumerate() {
+        if luma < PIN_TRACK_FLOOR {
+            continue;
+        }
+        count += 1;
+        sum += u32::from(luma);
+        left.get_or_insert(x as u32);
+        right = x as u32;
+    }
+    if count < min_w {
+        return None;
+    }
+    let mean = sum / count.max(1);
+    if !(PIN_TRACK_LUMA.0..=PIN_TRACK_LUMA.1).contains(&mean) {
+        return None;
+    }
+    let left = left?;
+    Some((left, right - left + 1))
+}
+
+/// 轨道内的白块二分类：**目标是「带内的宽块」，游标是「伸出带外的窄线」**。
+///
+/// 为什么不用「宽扁 vs 窄高」分类：游标压到目标上的那一帧（也就是**唯一该按空格的时刻**），
+/// 两个白块在二值图上连成一片 —— 既不窄也不扁，按宽高比分类会把它整块丢掉，
+/// 于是「对齐」这个状态永远观测不到。而「谁伸出轨道带」在两种情形下都成立：
+/// 目标是带内的东西（最多溢出 1~2px），游标天生比带高（实测 h 20~30 vs 带高 15）。
+fn pin_blobs(gray: &GrayImage, track: PxRect) -> (Vec<PxRect>, Vec<PxRect>) {
+    (pin_targets(gray, track), pin_cursors(gray, track))
+}
+
+/// 目标方块：**轨道带内**宽度落在 [`PIN_TARGET_W`] 的白块（按 x 升序）。
+///
+/// 带内裁剪自带「高度 ≤ 带高」的效果，且游标单独立在带内时只有 2~8px 宽，被宽度下限排掉。
+fn pin_targets(gray: &GrayImage, track: PxRect) -> Vec<PxRect> {
+    let Some(mask) = gray_mask(gray, track, |luma| luma > PIN_WHITE_LUMA) else {
+        return Vec::new();
+    };
+    let mut targets: Vec<PxRect> = external_contours(&mask.binary)
+        .into_iter()
+        .filter(|blob| blob.area >= PIN_MIN_BLOB)
+        .map(|blob| mask.to_frame(blob.region, 1))
+        .filter(|rect| (PIN_TARGET_W.0..=PIN_TARGET_W.1).contains(&(rect.w.max(0) as u32)))
+        .collect();
+    targets.sort_by_key(|rect| (rect.x + rect.w / 2, rect.y));
+    targets
+}
+
+/// 游标：**伸出轨道带 ≥ [`PIN_CURSOR_PROTRUDE`] 像素**的白色列段（按 x 升序）。
+///
+/// 逐列判「带外有没有白像素」，再把连续列段合并成一根游标，纵向范围取该列段的白像素外接框。
+fn pin_cursors(gray: &GrayImage, track: PxRect) -> Vec<PxRect> {
+    let window = PxRect {
+        x: track.x,
+        y: track.y - PIN_VERTICAL_SLACK,
+        w: track.w,
+        h: track.h + PIN_VERTICAL_SLACK * 2,
+    };
+    let Some(mask) = gray_mask(gray, window, |luma| luma > PIN_WHITE_LUMA) else {
+        return Vec::new();
+    };
+    let binary = &mask.binary;
+    let band_top = (track.y - window.y).max(0) as u32;
+    let band_bottom = band_top + track.h.max(0) as u32;
+    let mut cursors = Vec::new();
+    let mut start: Option<u32> = None;
+    for x in 0..binary.width() {
+        if column_protrudes(binary, x, band_top, band_bottom) {
+            start.get_or_insert(x);
+            continue;
+        }
+        if let Some(begin) = start.take() {
+            cursors.extend(cursor_of(binary, begin, x, window));
+        }
+    }
+    if let Some(begin) = start {
+        cursors.extend(cursor_of(binary, begin, binary.width(), window));
+    }
+    cursors.sort_by_key(|rect| (rect.x + rect.w / 2, rect.y));
+    cursors
+}
+
+/// 该列在轨道带外（上方或下方 ≥ [`PIN_CURSOR_PROTRUDE`] 像素处）有没有白像素。
+fn column_protrudes(binary: &BinaryImage, x: u32, band_top: u32, band_bottom: u32) -> bool {
+    let above = band_top
+        .checked_sub(PIN_CURSOR_PROTRUDE)
+        .is_some_and(|last| (0..=last).any(|y| binary.get(x, y)));
+    let below_start = band_bottom + PIN_CURSOR_PROTRUDE - 1;
+    above || (below_start..binary.height()).any(|y| binary.get(x, y))
+}
+
+/// 列段 `[start, end)` 的那根游标：纵向范围取段内白像素的外接框。
+///
+/// 宽度不在 [`PIN_CURSOR_W`] / 高度不到 [`PIN_CURSOR_MIN_H`] 的列段不是游标（噪点、装饰线）。
+fn cursor_of(binary: &BinaryImage, start: u32, end: u32, window: PxRect) -> Option<PxRect> {
+    let (mut top, mut bottom) = (None, 0u32);
+    for x in start..end {
+        for y in 0..binary.height() {
+            if !binary.get(x, y) {
+                continue;
+            }
+            top.get_or_insert(y);
+            bottom = y;
+        }
+    }
+    let top = top?;
+    let rect = PxRect {
+        x: window.x + start as i32,
+        y: window.y + top as i32,
+        w: (end - start) as i32,
+        h: (bottom + 1 - top) as i32,
+    };
+    let (w, h) = (rect.w.max(0) as u32, rect.h.max(0) as u32);
+    ((PIN_CURSOR_W.0..=PIN_CURSOR_W.1).contains(&w) && h >= PIN_CURSOR_MIN_H).then_some(rect)
+}
+
+/// 每个目标配「水平距离最近、且没被别的目标占用」的游标；配不上的目标不进结果。
+///
+/// 目标已按 x 升序 ⇒ 结果天然按目标 x 升序（调用方按顺序去重/记账）。
+fn pair_pins(targets: &[PxRect], cursors: &[PxRect]) -> Vec<(usize, usize, i32)> {
+    let mut used = vec![false; cursors.len()];
+    targets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, target)| {
+            let target_x = target.x + target.w / 2;
+            let (slot, distance) = cursors
+                .iter()
+                .enumerate()
+                .filter(|(slot, _)| !used[*slot])
+                .map(|(slot, cursor)| (slot, (cursor.x + cursor.w / 2 - target_x).abs()))
+                .min_by_key(|&(_, distance)| distance)?;
+            used[slot] = true;
+            Some((index, slot, distance))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3009,6 +3362,36 @@ pub(crate) mod keys_fixture {
         canvas
     }
 
+    /// 只画 `keep` 里的键（其余涂回台面）：用来造「缺了几格但四行四列都还在」的帧。
+    pub(crate) fn panel_with_only(keep: &[usize]) -> Canvas {
+        let mut canvas = Canvas::new(MACHINE);
+        canvas.rect(SCREEN, PANEL);
+        for &index in keep {
+            canvas.rect(key_rect(index), KEY);
+        }
+        canvas
+    }
+
+    /// 16 颗键都在，但第 `index` 颗的键面被挖空成「只剩一圈 2px 边」。
+    ///
+    /// 实机远景/斜视下卡住的那 3~5 颗键就是这种样子：键面被白色图标与下方小字挖掉大半，
+    /// 填充率掉到 **0.36~0.38**（spec §2.1）。外接框仍是 44×40（暗边是闭合的一圈），
+    /// 只有填充率低于旧的 0.40 死线。
+    pub(crate) fn panel_with_hollow_key(index: usize) -> Canvas {
+        let mut canvas = panel_with_keys(16);
+        let rect = key_rect(index);
+        canvas.rect(
+            PxRect {
+                x: rect.x + 2,
+                y: rect.y + 6,
+                w: rect.w - 4,
+                h: rect.h - 12,
+            },
+            MACHINE,
+        );
+        canvas
+    }
+
     /// 没有进度框的屏幕（进度判据要退化）。
     pub(crate) fn panel_without_boxes() -> Canvas {
         let mut canvas = Canvas::new(MACHINE);
@@ -3105,6 +3488,76 @@ mod keys_tests {
         );
     }
 
+    // ── t0：填充率 0.36 的键与 11 颗键（实机远景/斜视的真实现场）──
+
+    /// 实机卡住的那 5 颗键的编号：去掉的正好让**每行每列都还有键**，
+    /// 于是「凑不出 4×4」只能由命中数来解释，不会被行/列缺失掩盖。
+    const ELEVEN_KEY_SPREAD: [usize; 11] = [0, 3, 4, 5, 6, 8, 9, 10, 12, 13, 14];
+    /// 同上但只有 10 颗（`t=32` 那帧远景误报的命中数，spec §2.3）。
+    const TEN_KEY_SPREAD: [usize; 10] = [0, 4, 6, 8, 9, 10, 12, 13, 14, 15];
+
+    #[test]
+    fn a_key_filled_down_to_thirty_six_percent_is_still_a_dark_block() {
+        // 实测卡住的键填充率恒为 0.36/0.38（spec §2.1）。旧死线 0.40 把它整颗丢掉 ⇒
+        // 每帧漏 3~5 颗 ⇒ 撞 KEY_MIN_HITS ⇒ 整台判失败。
+        //
+        // 断言必须打在 `dark_blocks` 这一层：4×4 里的键尺寸完全一致，被丢掉的那颗由
+        // 「中位尺寸 + 交点中心」补出来，补出来的矩形与实测矩形**逐像素相同** ——
+        // 在 `locate_keys` 那一层看不出区别，只有候选集本身能证伪。
+        let key = key_rect(0);
+        let hole = PxRect {
+            x: key.x + 2,
+            y: key.y + 6,
+            w: key.w - 4,
+            h: key.h - 12,
+        };
+        let fill = (key.w * key.h - hole.w * hole.h) as f32 / (key.w * key.h) as f32;
+        assert!(
+            (0.32..0.40).contains(&fill),
+            "夹具的填充率必须落在实测量到的 0.36~0.38 区间（实际 {fill}），否则这条用例证不了什么"
+        );
+
+        let frame = panel_with_hollow_key(0).frame();
+        let blocks = dark_blocks(&frame.luma());
+        let kept = blocks
+            .iter()
+            .find(|block| block.x == key.x && block.y == key.y)
+            .unwrap_or_else(|| panic!("填充率 {fill} 的键必须被 dark_blocks 收下：{blocks:?}"));
+        assert_eq!((kept.w, kept.h), KEY_SIZE, "外接框仍是整颗键：{kept:?}");
+        // 端到端：16 颗键都在，整台照样可定位。
+        assert_eq!(
+            locate_keys(&frame).expect("16 颗键都在").cells.len(),
+            KEY_GRID_SIDE * KEY_GRID_SIDE
+        );
+    }
+
+    #[test]
+    fn eleven_keys_still_form_a_full_grid() {
+        // 面板完整可见的那几秒里网格只对上 11 颗（spec §2.1：hit95 = 11）：
+        // 缺的 5 格用中位键尺寸补出来，补出来的格照样要能点（spec B1）。
+        let frame = panel_with_only(&ELEVEN_KEY_SPREAD).frame();
+        let keys = locate_keys(&frame).expect("11 颗键必须仍能定出 4×4");
+        assert_eq!(keys.cells.len(), 16, "补满 16 格");
+        assert_eq!(keys.cells[0], key_rect(0), "命中格用实测矩形");
+        let missing = keys.cells[6];
+        assert_eq!(
+            (missing.x + missing.w / 2, missing.y + missing.h / 2),
+            key_center(6),
+            "补出来的格必须落在该键的几何中心上（否则会点在键缝里）：{missing:?}"
+        );
+        assert_eq!((missing.w, missing.h), KEY_SIZE, "补出来的格用中位键尺寸");
+    }
+
+    #[test]
+    fn ten_spread_keys_are_still_not_a_key_grid() {
+        // 10 颗、四行四列都在（只是稀疏）—— 仍然不许当成键阵。
+        // 这条是「KEY_MIN_HITS 不许再往下调」的回归钉：`t=32` 那帧远景误报命中 10。
+        assert_eq!(
+            locate_keys(&panel_with_only(&TEN_KEY_SPREAD).frame()),
+            Err(LocateError::Keys)
+        );
+    }
+
     #[test]
     fn missing_progress_boxes_degrade_to_an_empty_list() {
         // 读不到进度框不是定位失败：返回空，让执行层退化（绝不猜进度）。
@@ -3154,6 +3607,22 @@ mod keys_tests {
         // 面板底色已淡入、16 颗键还没长出来 —— 这正是「首开慢」的那 1.4s。
         let frame = Canvas::new([68, 70, 110]).frame();
         assert_eq!(locate_keys_state(&frame).state_name(), "NotYet");
+    }
+
+    #[test]
+    fn a_white_chassis_panel_with_a_half_grown_key_grid_is_not_yet_not_absent() {
+        // 黄键台的面板是**白色机箱**：深蓝占比实测 0.0，只认底色时这里会报 Absent
+        // ⇒ 定位一失败就收尾（用户实测：按第一次 F 必然失败，得再按一次）。
+        // 键阵已经在画面里（只是这一帧没凑齐 4×4）⇒ 必须报 NotYet，继续等且不计失败。
+        let half = panel_with_only(&TEN_KEY_SPREAD).frame();
+        assert_eq!(locate_keys(&half), Err(LocateError::Keys), "前提：这一帧定位失败");
+        assert_eq!(
+            locate_keys_state(&half).state_name(),
+            "NotYet",
+            "白机箱 + 暗键阵 = 面板已在，结构没长齐"
+        );
+        // 反例：整片台面一颗暗键都没有 ⇒ 真的不在这个界面。
+        assert_eq!(locate_keys_state(&Canvas::new(MACHINE).frame()).state_name(), "Absent");
     }
 
     #[test]
@@ -3530,3 +3999,158 @@ mod keys_tests {
     }
 }
 
+
+#[cfg(test)]
+mod pins_tests {
+    use super::*;
+    use std::time::Instant;
+
+    // ── 任务保险合成帧（100% 脱敏：只复刻相对结构，不含任何真实机位 / 账号 / 路径）──
+
+    const PIN_W: u32 = 640;
+    const PIN_H: u32 = 360;
+    /// 轨道：横贯画面的中灰长条（实机 720p 实测 y188..202、高 15，这里同量级）。
+    const TRACK: PxRect = PxRect {
+        x: 100,
+        y: 150,
+        w: 400,
+        h: 15,
+    };
+    /// 轨道底色：中灰（实测行均值 67）。
+    const TRACK_GREY: [u8; 3] = [67, 67, 67];
+    const WHITE: [u8; 3] = [255, 255, 255];
+
+    fn blank() -> Vec<u8> {
+        vec![0u8; (PIN_W * PIN_H * 4) as usize]
+    }
+
+    fn paint(data: &mut [u8], rect: PxRect, rgb: [u8; 3]) {
+        for y in rect.y.max(0)..rect.bottom().min(PIN_H as i32) {
+            for x in rect.x.max(0)..rect.right().min(PIN_W as i32) {
+                let index = ((y as u32 * PIN_W + x as u32) * 4) as usize;
+                data[index] = rgb[2];
+                data[index + 1] = rgb[1];
+                data[index + 2] = rgb[0];
+                data[index + 3] = 255;
+            }
+        }
+    }
+
+    fn frame_of(data: Vec<u8>) -> Frame {
+        Frame::new(PIN_W, PIN_H, data, Instant::now()).expect("合成帧长度正确")
+    }
+
+    /// 轨道 + 目标方块（宽扁、带内）+ 游标（窄高、伸出带外 6px）。
+    fn pins_frame(targets: &[i32], cursors: &[i32]) -> Frame {
+        let mut data = blank();
+        paint(&mut data, TRACK, TRACK_GREY);
+        for &center_x in targets {
+            paint(
+                &mut data,
+                PxRect {
+                    x: center_x - 5,
+                    y: 149,
+                    w: 10,
+                    h: 17,
+                },
+                WHITE,
+            );
+        }
+        for &center_x in cursors {
+            paint(
+                &mut data,
+                PxRect {
+                    x: center_x - 2,
+                    y: 144,
+                    w: 5,
+                    h: 27,
+                },
+                WHITE,
+            );
+        }
+        frame_of(data)
+    }
+
+    #[test]
+    fn pairs_two_targets_with_two_cursors() {
+        // 反例：旧的「5 个固定槽中心」判据在这张帧上一对都配不出来（压根没有槽位坐标）。
+        let pins = locate_pins(&pins_frame(&[200, 400], &[160, 430]))
+            .expect("轨道 + 2 对必须一次定位成功");
+        assert_eq!(pins.track, TRACK, "轨道必须量回原矩形");
+        assert_eq!(pins.targets.len(), 2, "目标白块：{:?}", pins.targets);
+        assert_eq!(pins.cursors.len(), 2, "游标细竖线：{:?}", pins.cursors);
+        assert_eq!(pins.pairs.len(), 2, "2 目标 2 游标必须配成 2 对：{:?}", pins.pairs);
+        assert_eq!(pins.pairs[0].2, 40, "第 1 对水平距离：{:?}", pins.pairs);
+        assert_eq!(pins.pairs[1].2, 30, "第 2 对水平距离：{:?}", pins.pairs);
+    }
+
+    #[test]
+    fn an_aligned_cursor_is_still_seen_on_top_of_its_target() {
+        // 对齐那一帧两个白块连成一片（既不窄也不扁）。按宽高比分类会把整块丢掉 ——
+        // 于是「游标压住目标」这个**唯一该按空格**的时刻永远观测不到。
+        let pins = locate_pins(&pins_frame(&[200, 400], &[200, 430]))
+            .expect("游标压在目标上也必须定位成功");
+        assert_eq!(pins.targets.len(), 2, "被压住的目标仍是目标：{:?}", pins.targets);
+        assert_eq!(pins.cursors.len(), 2, "压住目标的游标仍是游标：{:?}", pins.cursors);
+        assert_eq!(pins.pairs.len(), 2, "{:?}", pins.pairs);
+        assert_eq!(pins.pairs[0].2, 0, "压住 = 水平距离 0：{:?}", pins.pairs);
+        assert!(pins.pairs[0].2 <= pins.tolerance(), "必须落在容差内");
+    }
+
+    #[test]
+    fn five_pairs_come_back_sorted_by_target_x() {
+        // 反例：按 y 排序或配对顺序取决于遍历顺序 → 顺序断言红。
+        let pins = locate_pins(&pins_frame(
+            &[140, 220, 300, 380, 460],
+            &[150, 240, 280, 400, 450],
+        ))
+        .expect("5 对必须一次定位成功");
+        assert_eq!(pins.pairs.len(), 5, "{:?}", pins.pairs);
+        let centers: Vec<i32> = pins
+            .pairs
+            .iter()
+            .map(|(target, _, _)| {
+                let rect = pins.targets[*target];
+                rect.x + rect.w / 2
+            })
+            .collect();
+        assert!(
+            centers.windows(2).all(|pair| pair[0] < pair[1]),
+            "必须按目标 x 升序：{centers:?}"
+        );
+        let distances: Vec<i32> = pins.pairs.iter().map(|(_, _, distance)| *distance).collect();
+        assert_eq!(distances, vec![10, 20, 20, 20, 10], "每对取最近的空闲游标");
+    }
+
+    #[test]
+    fn a_track_without_cursors_is_ok_and_has_no_pairs() {
+        // 零值边界：轨道在、目标也在，但游标还没出来 ⇒ **不能报错**（调用方要继续等）。
+        // 反例：把「没有游标」当成 Err ⇒ 一开局就 Abort。
+        let pins = locate_pins(&pins_frame(&[200, 400], &[])).expect("没游标不是定位失败");
+        assert_eq!(pins.targets.len(), 2, "{:?}", pins.targets);
+        assert!(pins.cursors.is_empty(), "{:?}", pins.cursors);
+        assert!(pins.pairs.is_empty(), "配不上游标就不许编造配对：{:?}", pins.pairs);
+
+        // 连目标都没有（空盘面）也必须 Ok：那是「还没出题」，不是「不是这个界面」。
+        let empty = locate_pins(&pins_frame(&[], &[])).expect("空盘面仍算量到了轨道");
+        assert!(empty.targets.is_empty() && empty.pairs.is_empty());
+    }
+
+    #[test]
+    fn a_bright_thin_line_is_not_a_track() {
+        // 面板上边框：行均值同样落在 55..110、宽度也够，**只有 3px 的高度**把它和轨道分开。
+        // 反例：去掉高度门槛 ⇒ 这帧会返回一个 3px 高的「轨道」，后面一切判据全错位。
+        let mut data = blank();
+        paint(
+            &mut data,
+            PxRect {
+                x: 60,
+                y: 150,
+                w: 520,
+                h: 3,
+            },
+            [96, 96, 96],
+        );
+        assert_eq!(locate_pins(&frame_of(data)), Err(LocateError::Track));
+    }
+}

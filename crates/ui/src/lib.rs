@@ -10,8 +10,9 @@ pub mod wizard;
 
 pub use state::{
     az3_result, conflict_copy, console_result, fingerprint_result, format_sequence, morse_result, read_capture,
-    Action, CaptureBackend, CaptureOutcome, CaptureTestResult, GridCell, KeyChord, Phase,
-    PrimaryState, Progress, ResultContent, ResultState, SceneKind, ThemeId, UiState, CAPTURABLE,
+    Action, CaptureBackend, CaptureOutcome, CaptureTestResult, FlowId, GridCell, KeyChord, LegacyToggles,
+    Phase, PrimaryState, Progress, ResultContent, ResultState, SceneKind, ThemeId, Toggles, UiState,
+    CAPTURABLE,
 };
 pub use view::{
     main_window, settings_panel, wizard_window, SettingsAction, SettingsView, WizardAction,

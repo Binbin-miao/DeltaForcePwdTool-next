@@ -11,8 +11,8 @@ use delta_config::Config;
 use delta_geom::{MonitorInfo, PxRect};
 use delta_ui::{
     console_result, conflict_copy, Action, CaptureBackend, CaptureTestResult, KeyChord, Phase,
-    Progress, SceneKind, Step, ThemeId, UiState, Verdict, Wizard, WizardAction, WizardFrame,
-    WizardScene,
+    Progress, SceneKind, Step, ThemeId, Toggles, UiState, Verdict, Wizard, WizardAction,
+    WizardFrame, WizardScene,
 };
 
 use crate::keyhook::KeyHook;
@@ -339,9 +339,15 @@ impl DeltaApp {
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Action::OpenCalibration => self.enter_wizard(ctx),
             Action::OpenSettings => self.settings_open = true,
-            Action::ToggleFlow(scene) => self.state.toggles.toggle(scene),
+            Action::ToggleFlow(scene) => {
+                self.state.toggles.toggle(scene);
+                self.sync_flows();
+            }
             // 全关时的修复动作（主按钮文案「请开启至少一项」的落点）。
-            Action::EnableFlows => self.state.toggles.enable_all(),
+            Action::EnableFlows => {
+                self.state.toggles.enable_all();
+                self.sync_flows();
+            }
             Action::SetTheme(theme) => self.set_theme(theme),
             Action::SetAccent(accent) => self.set_accent(accent),
             Action::CommitKeywords(raw) => self.commit_keywords(&raw),
@@ -578,6 +584,30 @@ impl DeltaApp {
         }
         self.state.set_f_key_hook(false);
         self.state.notice = Some(NOTICE_KEY_HOOK_FAILED.to_owned());
+    }
+
+    /// 主页 7 个功能开关 → 配置 → 磁盘（**7 个字段全写**，不做部分保存）。
+    ///
+    /// 两处调用：
+    /// 1. 本文件的开关动作（`ToggleFlow` / `EnableFlows`）；
+    /// 2. 每帧画完主视图之后 —— `delta_ui` 的网格开关**直接改 `UiState`**
+    ///    （视图侧没有 `FlowId` 粒度的 `Action`），app 只能在这一帧结束后把差异收进配置。
+    ///
+    /// 只有真变过才落盘：读路径不会给定型帧平白写一次配置文件。
+    fn sync_flows(&mut self) {
+        let wanted = delta_config::FlowFlags::from_flags(self.state.toggles.flags());
+        let changed = match self.config.lock() {
+            Ok(mut config) => {
+                let changed = config.flows != wanted;
+                config.flows = wanted;
+                changed
+            }
+            // 锁中毒 = 配置内容已不可信：不写盘，也不造出界面与磁盘之间的假一致。
+            Err(_) => return,
+        };
+        if changed {
+            self.persist_settings();
+        }
     }
 
     /// 开关落盘：失败必须显形（内存里已生效，但重启后会丢）。
@@ -971,6 +1001,10 @@ impl eframe::App for DeltaApp {
         if let Some(action) = delta_ui::main_window(ui, &mut self.state, &pal) {
             self.handle(action, &ctx);
         }
+        // 网格里的 7 个功能开关由视图**直接改** `UiState`（不经过 `Action`），
+        // 所以这一帧结束后把差异收进配置并落盘 —— 少了这一句，开关只活在内存里，
+        // 重启后配置里还是旧的，界面与执行闸门各说一套。
+        self.sync_flows();
         self.schedule_repaint(&ctx);
     }
 
@@ -1159,6 +1193,9 @@ fn initial_state(config: &Config, monitor: MonitorInfo) -> UiState {
         morse_auto_download: config.auto_confirm,
         f_key_hook: config.f_key_hook_enabled,
         master_enabled: config.master_enabled,
+        // 7 个功能开关的界面初值必须来自配置：否则重启后界面显示全开、
+        // 而执行闸门按配置拦着 —— 用户看着「开着」却怎么按都没反应。
+        toggles: Toggles::from_flags(config.flows.flags()),
         hotkey_morse: config.hotkeys.morse.clone(),
         hotkey_fingerprint: config.hotkeys.fingerprint.clone(),
         hotkey_console: config.hotkeys.console.clone(),
@@ -1294,6 +1331,95 @@ mod tests {
             .config;
         assert!(!saved.fingerprint_auto_click);
         assert!(!saved.auto_confirm);
+    }
+
+    /// 启动时 7 个开关的界面初值必须来自配置。
+    ///
+    /// 反例：`UiState::default()` 的全开盖过配置 → 重启后界面显示「开」、
+    /// 而执行闸门按配置拦着，用户看着开着却怎么按都没反应。
+    #[test]
+    fn startup_flow_switches_come_from_the_config() {
+        let mut flags = [true; delta_config::Flow::ALL.len()];
+        flags[delta_config::Flow::Morse.index()] = false;
+        flags[delta_config::Flow::Az3Keys.index()] = false;
+        let config = Config {
+            flows: delta_config::FlowFlags::from_flags(flags),
+            ..Config::default()
+        };
+        let state = initial_state(&config, monitor(1920, 1080));
+        assert!(!state.toggles.get_flow(delta_ui::FlowId::Morse), "配置里关着");
+        assert!(!state.toggles.get_flow(delta_ui::FlowId::Az3Keys));
+        assert!(
+            state.toggles.get_flow(delta_ui::FlowId::Az3Line),
+            "其余 5 个必须照配置保持开"
+        );
+    }
+
+    /// 主页开关改动必须落进配置并写盘（重启后仍是关的）。
+    ///
+    /// 视图侧是**直接改 `UiState`** 的，所以这里模拟「画完一帧后收差异」那条路径。
+    #[test]
+    fn home_flow_switch_changes_reach_config_and_disk() {
+        let mut app = app_with_temp_config("flow-switches");
+        app.state.toggles.toggle_flow(delta_ui::FlowId::Az3Line);
+        app.sync_flows();
+
+        assert!(!app.snapshot().flows.get(delta_config::Flow::Az3Line), "配置必须跟着关");
+        let saved = delta_config::load(&app.config_path)
+            .expect("开关必须已落盘")
+            .config;
+        assert!(!saved.flows.get(delta_config::Flow::Az3Line), "磁盘必须是关的");
+        assert!(
+            saved.flows.get(delta_config::Flow::Morse),
+            "其余 6 个必须原样保持开"
+        );
+
+        // 翻回来也要写回（不是只写一次）。
+        app.state.toggles.toggle_flow(delta_ui::FlowId::Az3Line);
+        app.sync_flows();
+        let saved = delta_config::load(&app.config_path)
+            .expect("开关必须已落盘")
+            .config;
+        assert!(saved.flows.get(delta_config::Flow::Az3Line), "重新打开必须写回");
+    }
+
+    /// 没有差异时不许写盘：主视图每帧都会调 `sync_flows`，它不能变成「每帧写一次配置」。
+    #[test]
+    fn syncing_flows_without_a_change_never_touches_the_disk() {
+        let mut app = app_with_temp_config("flow-noop");
+        let _ = std::fs::remove_file(&app.config_path);
+        app.sync_flows();
+        assert!(
+            !app.config_path.exists(),
+            "没变过的开关不该产生配置文件写入"
+        );
+    }
+
+    /// 漂移守卫：配置侧 `Flow::ALL` 与界面侧 `FlowId::ALL` 必须同序同名。
+    ///
+    /// 位序错位 = 用户关「黄键台」其实关掉了别的一个功能（`flags()` 是位置耦合的）。
+    #[test]
+    fn config_and_ui_flow_tables_stay_in_lockstep() {
+        assert_eq!(
+            delta_config::Flow::ALL.len(),
+            delta_ui::FlowId::ALL.len(),
+            "两边的开关数量必须一致"
+        );
+        for (config_flow, ui_flow) in delta_config::Flow::ALL
+            .into_iter()
+            .zip(delta_ui::FlowId::ALL)
+        {
+            assert_eq!(
+                config_flow.index(),
+                ui_flow.index(),
+                "位序必须一致（旧配置按位序读）"
+            );
+            assert_eq!(
+                config_flow.label(),
+                ui_flow.label(),
+                "主页开关文案必须一致"
+            );
+        }
     }
 
     #[test]

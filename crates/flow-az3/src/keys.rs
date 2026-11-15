@@ -10,7 +10,7 @@
 //!    （[`State::observed`]），不看这一帧还亮不亮；不要求顺序，点过的记 `clicked`；
 //!    黄（待点）与绿（已激活）必须是两个谓词：点完变绿就该立刻收手，不许重复点；
 //! 3. 点完等 [`CLICK_ACK_TIMEOUT_MS`]：**只有进度推进或变绿勾才算吃下**
-//!    （黄光熄灭 ≠ 完成：熄灭也可能只是游戏自己收了高亮），连续 2 轮无效判 `dead`；
+//!    （黄光熄灭 ≠ 完成：熄灭也可能只是游戏自己收了高亮），连续 [`DEAD_STRIKES`] 轮无效判 `dead`；
 //! 4. 进度**回退**（`checked < peak_checked`）= 游戏换了新一局 / 点了无效键把状态清掉 ⇒ 清账本重来；
 //! 5. 左侧进度格读到 **5 个 ✓** → Done。
 //!
@@ -61,12 +61,26 @@ const GREEN_CHECK_PIXELS: u32 = 6;
 /// 点击后等待游戏确认（变绿勾 / 进度推进）的上限；超时判定这一轮无效。
 ///
 /// 1080p 实测「点击 → 动画 → 变绿」明显超过 400ms，400ms 会在动画中途判超时、白记 strike。
-/// **只此一处放宽**：`DEAD_STRIKES` / `LOCATE_FAIL_LIMIT` 等其它常量一律不动。
 const CLICK_ACK_TIMEOUT_MS: u64 = 700;
-/// 同一颗键连续这么多轮「点了还亮且进度没动」才判死（spec B6）。
-const DEAD_STRIKES: u8 = 2;
-/// 连续多少帧定位失败才放弃（50ms 轮询下 ≈0.3s 容错）。
-const LOCATE_FAIL_LIMIT: u32 = 6;
+/// 同一颗键连续这么多轮「点了还亮且进度没动」才判死（spec B6 / 用户原话「点击完右边按键
+/// 没变绿的要重试点击」）。
+///
+/// 旧的 2 次就判死 + [`is_spent`] 永真 ⇒ 同一颗键**整局**再也不会被点，用户看到的就是
+/// 「点了一下就再也不点了，右边按键一直没变绿」。4 次 = 3 次重新尝试，
+/// 覆盖实测那 700ms 内的动画抖动/站位微调，同时又留着上限不死磕一颗坏键。
+///
+/// **跨常量约束**（LESSON-007：两个各自合理的数字相乘会变死代码）：16 颗键各重试满
+/// `DEAD_STRIKES` 轮 = `16 × 4 × 2 = 128` 个输入事件，必须**装得进**正常档安全阀
+/// `AZ3_MAX_INPUT_EVENTS`（现 160）。旧上限 120 装不下 128 ⇒ 「16 格全亮且进度永不动」
+/// 那一局会先撞安全阀报「疑似误判」，把一局**合法但没解开**的收尾说成「多半不是键台」。
+/// 160 仍远低于实测误判乱点（344 / 330 / 370）：真跑飞时远远越过它。
+pub(crate) const DEAD_STRIKES: u8 = 4;
+/// 连续多少帧定位失败才放弃（`Az3Config::poll_interval_ms` 默认 50ms ⇒ 20 帧 ≈1.0s 轮询，
+/// 加上每帧抓帧 + 判定的开销，墙钟约 1.2~1.4s）。
+///
+/// 旧的 6 帧（≈0.3s）在用户「按下热键那一瞬间手还在动、站位还在微调」时必然放弃 ——
+/// 于是每次都得按第二次 F。同仓 `flow-console` 给的是 5~6s，这里取 20 帧作第一步。
+const LOCATE_FAIL_LIMIT: u32 = 20;
 /// 少于这么多个进度格就读不到进度（退化判据）。
 const MIN_PROGRESS_BOXES: usize = 3;
 /// 退化模式下最多允许「盘面被重置」几次（防死循环兜底，spec §3 t2）。
@@ -253,6 +267,12 @@ struct State {
     seen: [bool; CELLS],
     /// 报告口径：本任务累计**判死**的格（同上）。
     dead_ever: [bool; CELLS],
+    /// 报告口径：每颗判死的键**被判死前重试了几轮**（同上，不随重开一局清零）。
+    ///
+    /// 与 `strikes` 的分工：`strikes` 是「本局盘面还差几轮判死」（重开一局必须清零），
+    /// 这里是「它到底重试过几次」，供日志的 `判死格位` 括注。少了它，日志只能写「点了 N 次」——
+    /// 用户看不出「到底重试过没有」，而那正是这一轮要回答的问题（spec B4）。
+    dead_retries: [u8; CELLS],
     /// 最后一次「**从没亮过 → 亮**」的时刻（毫秒）。在册格重复亮不算新消息。
     ///
     /// 收工静默期的起算点：游戏一次只亮一个键，点完手上这颗之后一个新的目标可能
@@ -475,6 +495,7 @@ impl State {
             if self.strikes[index] >= DEAD_STRIKES {
                 self.dead[index] = true;
                 self.dead_ever[index] = true;
+                self.dead_retries[index] = self.strikes[index];
             } else {
                 self.clicked[index] = false;
             }
@@ -594,11 +615,22 @@ impl State {
     }
 
     /// 进度文案：读不到进度时说清「读不到」，不编数字。
+    ///
+    /// 有判死的键时**必须把重试次数一起写出来**（spec B4）：用户原话是「点击完右边按键没变绿
+    /// 的要重试点击」，所以「点了一下就放弃」与「重试了 4 次才放弃」在文案里必须是两句话。
     fn progress_text(&self) -> String {
-        match self.checked {
+        let progress = match self.checked {
             Some(checked) => format!("进度 {checked}/{TOTAL_STAGES}"),
             None => "进度格未识别，未判进度".to_owned(),
+        };
+        let dead_count = self.dead_ever.iter().filter(|dead| **dead).count();
+        if dead_count == 0 {
+            return progress;
         }
+        format!(
+            "{progress}；判死 {dead_count} 颗：{}",
+            dead_list(&self.dead_ever, &self.dead_retries)
+        )
     }
 
     /// 过程日志正文（多行）：把「凭什么收尾 / 到底点了几颗 / 见过与判死哪些格 / 跑了几帧」写全。
@@ -609,6 +641,7 @@ impl State {
     /// 3. **点击数 + 点击格位** —— 一共发了几下、落在第几行第几列（裸下标没人看得懂）；
     /// 4. **见过哪些格 / 判死格位** —— 漏点的第一嫌疑是「压根没采到那颗键的闪光」，
     ///    只有把「见过 2 格」与「见过 5 格但 3 格判死」区分开，才谈得上定位问题；
+    ///    判死格位还带**每颗的重试次数**（`（重试 K 次）`）：用户要看见「重试」真的发生过；
     /// 5. **帧数 / 耗时 / 静默等待帧数** —— 实测有「0.2 秒就收工」的局：游戏是分批亮的，
     ///    「跑 4 帧就收工」一眼就能看出可疑；`静默等待` 则把「等到期才收尾」与
     ///    「静默期没等到就撞上超时」区分开（前者 N 帧会明显偏多）。
@@ -633,7 +666,7 @@ impl State {
             list_cells(&self.touched),
             list_cells(&self.seen),
             self.seen.iter().filter(|lit| **lit).count(),
-            list_cells(&self.dead_ever),
+            dead_list(&self.dead_ever, &self.dead_retries),
             self.frames,
             self.elapsed_ms(),
             self.quiet_wait_frames,
@@ -771,6 +804,29 @@ fn list_cells(flags: &[bool; CELLS]) -> String {
     let names: Vec<String> = (0..CELLS)
         .filter(|&index| flags.get(index).copied().unwrap_or(false))
         .map(cell_name)
+        .collect();
+    if names.is_empty() {
+        "无".to_owned()
+    } else {
+        names.join("、")
+    }
+}
+
+/// 判死清单（`第1行第2列（重试 4 次）`）；一个都没有时写「无」。
+///
+/// `重试 K 次` 的 K = 这颗键**点了 K 次都没等到变绿勾/进度推进**才被判死的轮数
+/// （`strikes` 的终值）。日志里只写「点了 N 次」看不出「到底重试过没有」，
+/// 而那正是用户这一轮要问的事（spec B4）。
+fn dead_list(dead: &[bool; CELLS], retries: &[u8; CELLS]) -> String {
+    let names: Vec<String> = (0..CELLS)
+        .filter(|&index| dead.get(index).copied().unwrap_or(false))
+        .map(|index| {
+            format!(
+                "{}（重试 {} 次）",
+                cell_name(index),
+                retries.get(index).copied().unwrap_or(0)
+            )
+        })
         .collect();
     if names.is_empty() {
         "无".to_owned()
@@ -1454,14 +1510,19 @@ mod tests {
         // 日志正文必须交代清楚「凭什么收尾」。
         assert!(trace.contains("判据档: 退化档"), "{trace}");
         assert!(trace.contains("进度格: 未识别"), "{trace}");
-        assert!(trace.contains("点击数: 4"), "两格各重试一次共 4 下：{trace}");
+        assert!(
+            trace.contains(&format!("点击数: {}", 2 * usize::from(DEAD_STRIKES))),
+            "两格各「重试到判死」= DEAD_STRIKES 下：{trace}"
+        );
         assert!(
             trace.contains("点击格位: 第1行第1列、第2行第2列"),
             "点击格位必须是「第几行第几列」：{trace}"
         );
         assert!(
-            trace.contains("判死格位: 第1行第1列、第2行第2列"),
-            "两格都点不动，必须记进判死清单：{trace}"
+            trace.contains(&format!(
+                "判死格位: 第1行第1列（重试 {DEAD_STRIKES} 次）、第2行第2列（重试 {DEAD_STRIKES} 次）"
+            )),
+            "两格都点不动，判死清单必须写明各自重试了几次：{trace}"
         );
         // 实测那局 0.2 秒就收工：帧数/耗时留在正文里，下一轮一眼能看出收尾是否过早。
         let elapsed = trace
@@ -1498,6 +1559,7 @@ mod tests {
             state.touched[index] = true;
         }
         state.dead_ever[3] = true;
+        state.dead_retries[3] = DEAD_STRIKES;
         state.checked = None;
         state.progress_boxes = 2;
         state.clicks = 2;
@@ -1519,7 +1581,10 @@ mod tests {
             body.contains("见过哪些格: 第1行第1列、第3行第2列（共 2 格）"),
             "{body}"
         );
-        assert!(body.contains("判死格位: 第1行第4列"), "{body}");
+        assert!(
+            body.contains(&format!("判死格位: 第1行第4列（重试 {DEAD_STRIKES} 次）")),
+            "判死格位必须带重试次数，否则看不出「点了一下就放弃」还是「重试过才放弃」：{body}"
+        );
         assert!(
             body.contains("耗时: 12 帧 / 550ms（首帧→收尾）"),
             "帧数与耗时必须能看出「跑了几帧就收工」：{body}"
@@ -1636,40 +1701,96 @@ mod tests {
     #[test]
     fn a_new_lit_key_inside_the_quiet_window_restarts_it() {
         // ④ 静默期内又亮了新键 ⇒ 起算点刷新，继续等下一个。
+        //
+        // 时刻表**不许依赖 `DEAD_STRIKES` 的具体数字**（旧版把 750/1500/2250/3000 刻死，
+        // 那套数字是 DEAD_STRIKES=2 的副产物）：这里让新亮的那颗键「再失误一次就判死」，
+        // 于是「盘面无靶点」这个前提与常量无关，用例只盯静默期本身。
         let mut state = spent_board(&[0], 0);
         let mut clock = StepClock { now: 0 };
 
-        // t=0：键 9 新亮 → 点掉（第 1 下）。
-        assert!(step_board(&mut state, &panel_frame(&[9], false), &mut clock).is_none());
-        assert_eq!(state.clicks, 1);
-
-        // t=750：熄灭 → ack 超时判无效 → 再试一次（第 2 下）。
-        clock.now = 750;
-        assert!(step_board(&mut state, &panel_frame(&[], false), &mut clock).is_none());
-        assert_eq!(state.clicks, 2);
-
-        // t=1500：键 9 判死；**这一帧键 11 新亮** ⇒ 静默期起算点刷新到 1500，点掉它。
-        clock.now = 1_500;
-        assert!(step_board(&mut state, &panel_frame(&[11], false), &mut clock).is_none());
+        // t=1900（静默期还剩 100ms）：键 5 新亮 ⇒ 点掉它，起算点刷新到 1900。
+        clock.now = 1_900;
+        assert!(step_board(&mut state, &panel_frame(&[5], false), &mut clock).is_none());
         assert_eq!(
             state.last_new_lit_ms,
-            Some(1_500),
+            Some(1_900),
             "见到新亮键必须刷新静默期，否则会按旧起算点提前收工"
         );
-        assert_eq!(state.clicks, 3);
+        assert!(state.clicked[5], "新亮的键必须当场点掉");
 
-        // t=2250 / t=3000：键 11 先判无效、再判死 ⇒ 盘面无靶点。
-        clock.now = 2_250;
-        assert!(step_board(&mut state, &panel_frame(&[], false), &mut clock).is_none());
-        clock.now = 3_000;
-        // 若起算点没刷新（仍是 0），此刻早已过 2000ms 静默期 ⇒ 会收工。
-        // 刷新之后静默期到 3500ms 才结束 ⇒ 必须继续等。
+        // t=2600：键 5 这一次超时即判死 ⇒ 盘面无靶点。
+        state.strikes[5] = DEAD_STRIKES - 1;
+        state.click_ms = 1_900;
+        clock.now = 2_600;
         let outcome = step_board(&mut state, &panel_frame(&[], false), &mut clock);
+        assert!(state.dead[5], "前提：此刻盘面上已经没有可点的键");
+        // 若起算点没刷新（仍是 0），此刻早已过 2000ms 静默期 ⇒ 会立刻收工。
+        // 刷新之后静默期到 3900ms 才满 ⇒ 必须继续等。
         assert!(
             outcome.is_none(),
             "新亮键刷新了静默期，此刻还不许收工：{outcome:?}"
         );
-        assert!(state.quiet_wait_frames >= 1);
+        assert_eq!(state.quiet_wait_frames, 1, "必须记成「在等静默期」而不是「无靶点收尾」");
+    }
+
+    // ── 定位连败的容错窗口（用户：按下热键时手还在动、站位还在微调）──
+
+    /// 整片纯黑的帧：没有任何暗键候选，`locate_keys` 必然失败。
+    fn unlocatable_frame() -> Frame {
+        frame_with_rect(PANEL_W, PANEL_H, PxRect::ZERO, [0, 0, 0])
+    }
+
+    #[test]
+    fn nineteen_locate_misses_are_tolerated_and_the_twentieth_stops_the_run() {
+        // 实测旧上限 6 帧（≈0.4s）就收尾：用户按 F 的那一瞬间画面还没定住，于是必按第二次。
+        // 这条钉住「容错窗口 = 20 帧」：前 19 帧只记账不收尾，第 20 帧才收尾，且全程零注入。
+        let frame = unlocatable_frame();
+        let mut state = State::default();
+        let mut clock = StepClock { now: 0 };
+
+        for misses in 1..20u32 {
+            let outcome = step_board(&mut state, &frame, &mut clock);
+            assert!(
+                outcome.is_none(),
+                "第 {misses} 帧定位失败就收尾 = 容错窗口还是旧的 6 帧：{outcome:?}"
+            );
+            assert_eq!(state.locate_misses, misses, "失败帧数必须逐帧记账");
+        }
+        assert_eq!(state.clicks, 0, "定位失败期间绝不注入");
+
+        let outcome = step_board(&mut state, &frame, &mut clock).expect("第 20 帧必须收尾");
+        assert!(!outcome.is_done(), "一次没点过就收尾不可能算完成：{outcome:?}");
+        assert_eq!(state.locate_misses, 20);
+    }
+
+    // ── 点了没变绿必须重试（用户原话：「点击完右边按键没变绿的要重试点击」）──
+
+    #[test]
+    fn a_key_that_never_turns_green_is_retried_three_times_before_it_is_given_up_on() {
+        // 反例：`DEAD_STRIKES = 2` 时第 2 轮就判死，这条断言在第 2 轮就红。
+        let mut state = State::default();
+        for round in 1..=3u8 {
+            state.clicked[5] = true;
+            state.pending.push(5);
+            state.click_ms = 0;
+            assert!(
+                !state.waiting(None, &[], CLICK_ACK_TIMEOUT_MS),
+                "第 {round} 轮超时后必须放回可点池，不许直接判死"
+            );
+            assert!(!state.dead[5], "第 {round} 轮还没到判死线");
+            assert!(!state.clicked[5], "第 {round} 轮必须允许重试");
+            assert_eq!(state.strikes[5], round, "无效轮数必须逐轮累计");
+        }
+
+        state.clicked[5] = true;
+        state.pending.push(5);
+        state.click_ms = 0;
+        assert!(!state.waiting(None, &[], CLICK_ACK_TIMEOUT_MS));
+        assert!(state.dead[5], "第 4 轮才判死（旧值 2 会在第 2 轮就走到这里）");
+        assert_eq!(
+            state.dead_retries[5], 4,
+            "判死时必须记下重试过几次，否则日志只能写「点了 N 次」"
+        );
     }
 
     #[test]

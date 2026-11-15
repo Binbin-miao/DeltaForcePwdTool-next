@@ -145,6 +145,7 @@ fn stage_name(error: LocateError) -> &'static str {
         LocateError::GridColumns => "GridColumns",
         LocateError::GridRows => "GridRows",
         LocateError::Keys => "Keys",
+        LocateError::Track => "Track",
     }
 }
 

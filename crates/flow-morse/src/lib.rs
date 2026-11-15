@@ -758,6 +758,26 @@ mod tests {
     }
 
     #[test]
+    fn morse_timing_keeps_the_upstream_python_speed() {
+        // spec G4 / §5：用户拍板「按原本 python 版本的点击速度和开启延迟即可」——
+        // 这三项与 `_upstream/core/morse.py` 逐项一致，任何一项被改慢/改快都必须在这里红。
+        // 用户若仍觉得慢，下一轮查的是「按 F 后到第一帧」那段，不是这三个数。
+        let timings = Timings::default();
+        assert_eq!(
+            timings.key_interval_ms, 50,
+            "数字间间隔 = python `time.sleep(0.05)`"
+        );
+        assert_eq!(
+            timings.morse_after_input_ms, 600,
+            "按完到点确认 = python `time.sleep(0.6)`"
+        );
+        assert_eq!(
+            MORSE_CONFIRM_CLICK_INTERVAL_MS, 100,
+            "确认点击间隔 = python `click_sequence(delay=0.1)`"
+        );
+    }
+
+    #[test]
     fn aspect_two_point_zero_is_a_dot() {
         // 20x10：aspect 恰为 2.0 → 点（严格大于才判划）。
         let exact = Region {

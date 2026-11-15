@@ -130,6 +130,136 @@ impl<'de> Deserialize<'de> for ThemeId {
     }
 }
 
+/// 主页上 7 个**可独立开关**的功能（用户拍板：每个功能一个开关）。
+///
+/// 持久化用的枚举放在本 crate：`delta-ui` 依赖本 crate，反向不成立，所以界面侧的
+/// `delta_ui::FlowId` 不能拿来当配置类型。两张表的顺序与标签必须一致 ——
+/// `delta-app` 有一条漂移守卫用例把它们钉在一起，任何一侧改字/挪位都会当场变红。
+///
+/// 下标即 [`FlowFlags::flags`] 的位序，所以**只允许在末尾追加**：插队会让旧配置位序错位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Flow {
+    /// 摩斯码解码。
+    Morse,
+    /// 指纹识别。
+    Fingerprint,
+    /// 操作台：v5 旧旋钮流程（AZ3 四台都没命中时才轮到它）。
+    Console,
+    /// AZ3 · 大保险。
+    Az3Timing,
+    /// AZ3 · 任务保险。
+    Az3Pins,
+    /// AZ3 · 黄键台。
+    Az3Keys,
+    /// AZ3 · 信号线台。
+    Az3Line,
+}
+
+impl Flow {
+    /// 固定顺序 = 主页网格顺序 = [`FlowFlags::flags`] 下标序。
+    pub const ALL: [Self; 7] = [
+        Self::Morse,
+        Self::Fingerprint,
+        Self::Console,
+        Self::Az3Timing,
+        Self::Az3Pins,
+        Self::Az3Keys,
+        Self::Az3Line,
+    ];
+
+    /// 存储下标（声明顺序）。
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// 中文名：主页开关格与闸门文案 `<功能名>开关已关闭` 共用这一份字面量。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Morse => "摩斯码",
+            Self::Fingerprint => "指纹",
+            Self::Console => "操作台",
+            Self::Az3Timing => "大保险",
+            Self::Az3Pins => "任务保险",
+            Self::Az3Keys => "黄键台",
+            Self::Az3Line => "信号线台",
+        }
+    }
+}
+
+/// 7 个功能开关（[`Config::flows`]）：关掉的功能在 `delta-app::worker::run_once` 里
+/// 被闸门拦住，零注入、也不再多抓一帧。
+///
+/// 默认**全开**：升级不许把用户正在用的功能悄悄关掉（旧配置里没有这个字段时同样全开）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlowFlags {
+    pub morse: bool,
+    pub fingerprint: bool,
+    /// v5 旧旋钮操作台（AZ3 四台各有自己的开关，不受它支配）。
+    pub console: bool,
+    pub az3_timing: bool,
+    pub az3_pins: bool,
+    pub az3_keys: bool,
+    pub az3_line: bool,
+}
+
+impl Default for FlowFlags {
+    fn default() -> Self {
+        Self::all_on()
+    }
+}
+
+impl FlowFlags {
+    /// 7 个全开。
+    pub const fn all_on() -> Self {
+        Self {
+            morse: true,
+            fingerprint: true,
+            console: true,
+            az3_timing: true,
+            az3_pins: true,
+            az3_keys: true,
+            az3_line: true,
+        }
+    }
+
+    /// 单个功能的开关值。
+    pub const fn get(self, flow: Flow) -> bool {
+        match flow {
+            Flow::Morse => self.morse,
+            Flow::Fingerprint => self.fingerprint,
+            Flow::Console => self.console,
+            Flow::Az3Timing => self.az3_timing,
+            Flow::Az3Pins => self.az3_pins,
+            Flow::Az3Keys => self.az3_keys,
+            Flow::Az3Line => self.az3_line,
+        }
+    }
+
+    /// 按 [`Flow::ALL`] 顺序取出 7 个布尔（与 `delta_ui::Toggles::flags` 同一口径）。
+    pub const fn flags(self) -> [bool; Flow::ALL.len()] {
+        [self.morse, self.fingerprint, self.console, self.az3_timing, self.az3_pins, self.az3_keys, self.az3_line]
+    }
+
+    /// 按 [`Flow::ALL`] 顺序装 7 个布尔（**7 个字段全写**，不做部分保存）。
+    pub const fn from_flags(flags: [bool; Flow::ALL.len()]) -> Self {
+        Self {
+            morse: flags[Flow::Morse.index()],
+            fingerprint: flags[Flow::Fingerprint.index()],
+            console: flags[Flow::Console.index()],
+            az3_timing: flags[Flow::Az3Timing.index()],
+            az3_pins: flags[Flow::Az3Pins.index()],
+            az3_keys: flags[Flow::Az3Keys.index()],
+            az3_line: flags[Flow::Az3Line.index()],
+        }
+    }
+
+    /// 是否至少有一个功能开着（全关 = 没有任何流程可跑）。
+    pub fn any_on(self) -> bool {
+        self.flags().iter().any(|on| *on)
+    }
+}
+
 /// 主显示器尺寸 + 全部校准区域（**只存百分比**）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -182,6 +312,12 @@ pub struct Config {
     /// 与 `f_key_hook_enabled` 的区别：那个只管 F 键钩子，这个管全部入口。
     #[serde(default = "default_true")]
     pub master_enabled: bool,
+    /// 主页 7 个功能各自的开关（用户拍板：独立启用/禁用）。
+    ///
+    /// **在总开关放行之后**才生效：总开关是「整体别动」，这 7 个是「哪几项别动」。
+    /// 缺字段（旧配置）⇒ 全开，升级不许把用户正在用的功能关掉。
+    #[serde(default)]
+    pub flows: FlowFlags,
     /// 前台窗口标题命中这些关键词才响应 F 键（spec D3 边界 5）。
     ///
     /// 默认 `["三角洲", "Delta Force"]`；匹配规则是**大小写不敏感的子串包含**。
@@ -226,6 +362,7 @@ impl Default for Config {
             always_on_top: false,
             f_key_hook_enabled: true,
             master_enabled: true,
+            flows: FlowFlags::all_on(),
             game_title_keywords: default_game_title_keywords(),
             theme_id: ThemeId::default(),
             accent_override: None,
@@ -468,15 +605,20 @@ impl Default for FingerprintConfig {
 
 /// **正常路径**（进度格读得到）的输入事件硬上限（安全网，不是可调参数）。
 ///
-/// 合法用量：单盘最坏 = 16 颗键全亮 × 2 轮判死重试 × 2 事件（点击 = 按下 + 抬起）
-/// = **64 个事件**（`module_keys_aborts_once_all_sixteen_keys_are_spent` 实测就是这个量）。
-/// 上限必须高于它，否则「16 格全亮、进度不动」这种**合法**收尾会被误报成「疑似误判」。
+/// 合法用量：单盘最坏 = 16 颗键全亮 × `DEAD_STRIKES`(flow-az3，现 4) 轮判死重试 × 2 事件
+/// （点击 = 按下 + 抬起）= `16 × 4 × 2` = **128 个事件**
+/// （`module_keys_aborts_once_all_sixteen_keys_are_spent` 实测就是走到这个量）。
 ///
-/// 120 = 合法最坏 64 的约 2 倍，同时仍远低于实测误判乱点（344 / 330 / 370）。
+/// 上限必须**高于**它，否则「16 格全亮、进度不动」这种**合法**收尾会被误报成「疑似误判」——
+/// 把「这局没解开」说成「这不是键台」，归因全错（LESSON-007：两个各自合理的数字相乘）。
 ///
-/// 历史：曾按「一屏 5 颗亮键 × 1 事件」估成 60 —— 那个估计漏了两件事：
-/// 一次点击是**两个**事件，且单盘可能 16 颗键全亮（每颗还要重试一次）。
-pub const AZ3_MAX_INPUT_EVENTS: u32 = 120;
+/// 160 = 合法最坏 128 + 32 余量（允许几帧重复确认与末轮补点），
+/// 同时仍远低于实测误判乱点（344 / 330 / 370）—— 真跑飞时 `16 键全点一遍只需 32 事件`，
+/// 撞不到这条线，所以 160 挡不住「正常一轮」，只挡得住「无穷重试」。
+///
+/// 历史：曾按「一屏 5 颗亮键 × 1 事件」估成 60（漏了「一次点击两个事件」与「16 键全亮」）；
+/// 后按 2 轮判死估成 120，`DEAD_STRIKES` 从 2 提到 4 之后 128 > 120，必须跟着抬到 160。
+pub const AZ3_MAX_INPUT_EVENTS: u32 = 160;
 
 /// **退化路径**（进度格读不到、靠「16 格点完」收尾）的输入事件硬上限。
 ///
@@ -785,8 +927,14 @@ pub mod builtin {
 
     /// AZ3 大保险：5×5 字符矩阵区域（1280×720 实测）。
     pub const AZ3_GRID_REGION: PctRect = rect(0.215, 0.330, 0.310, 0.300);
-    /// AZ3 大保险：高亮目标行带（1280×720 实测：x 0.225–0.515、y 0.455–0.548，留上下余量）。
-    pub const AZ3_TARGET_BAND: PctRect = rect(0.225, 0.440, 0.290, 0.120);
+    /// AZ3 大保险：高亮目标行带。
+    ///
+    /// 与 [`AZ3_GRID_REGION`] **同 x 同 w**（`0.215 / 0.310`，右边界 0.525）：目标行带只在
+    /// 网格的竖直方向上开一个横条，水平范围必须盖住整张 5×5 字符矩阵。
+    /// 旧值 `x = 0.225 / w = 0.290`（右边界 0.515）比网格窄了 10 个千分点，
+    /// 用户截图里网格区实测占 `x ≈ 0.27..0.55` —— 右边那一小截第 5 列会被切在带外，
+    /// 高亮绿像素与等距字符列的计数都会偏低（大保险时判时不中）。
+    pub const AZ3_TARGET_BAND: PctRect = rect(0.215, 0.440, 0.310, 0.120);
     /// AZ3 大保险：右侧「破解成功」圆钮（1280×720 实测）。
     pub const AZ3_CRACK_BUTTON: PctRect = rect(0.600, 0.330, 0.140, 0.240);
     /// AZ3 任务保险：5 槽横向轨道（1280×720 实测：y 0.225–0.315）。
@@ -1548,6 +1696,99 @@ mod tests {
                 .as_deref(),
             Some("#B23A2A")
         );
+    }
+
+    /// W-T1：旧配置没有 `flows` 键 ⇒ 7 个全开（升级不许把用户在用的功能悄悄关掉）。
+    ///
+    /// 反例：`flows` 字段上的 `#[serde(default)]` 漏写 → 缺字段按 `false` 填 → 全关，
+    /// 主按钮当场变「请开启至少一项」，用户的功能看着像被升级弄没了。
+    #[test]
+    fn legacy_config_without_flows_switches_everything_on() {
+        let legacy: Config = serde_json::from_str(r#"{"ocr_enabled":true}"#).expect("老配置合法");
+        assert_eq!(legacy.flows, FlowFlags::all_on(), "缺字段必须全开");
+        assert!(legacy.flows.any_on(), "全开必须满足 any_on");
+        for flow in Flow::ALL {
+            assert!(legacy.flows.get(flow), "「{}」不该被升级关掉", flow.label());
+        }
+    }
+
+    /// 关闭状态必须跨启动保持，且写回时 **7 个字段全写**（不做部分保存）。
+    #[test]
+    fn flow_switches_survive_a_round_trip_with_all_seven_fields_written() {
+        let config: Config = serde_json::from_str(r#"{"flows":{"morse":false,"az3_keys":false}}"#)
+            .expect("可读");
+        assert!(!config.flows.get(Flow::Morse), "配置里写的必须生效");
+        assert!(!config.flows.get(Flow::Az3Keys));
+        assert!(config.flows.get(Flow::Fingerprint), "没写的字段按默认（开）补齐");
+
+        let dumped = serde_json::to_string(&config).expect("序列化");
+        for key in [
+            "morse",
+            "fingerprint",
+            "console",
+            "az3_timing",
+            "az3_pins",
+            "az3_keys",
+            "az3_line",
+        ] {
+            assert!(
+                dumped.contains(&format!("\"{key}\":")),
+                "写回必须包含 {key}，实际：{dumped}"
+            );
+        }
+        let round_trip: Config = serde_json::from_str(&dumped).expect("反序列化");
+        assert_eq!(round_trip.flows, config.flows, "往返必须不变");
+        assert!(!round_trip.flows.get(Flow::Morse), "关闭状态必须跨启动保持");
+    }
+
+    /// W-T6：`any_on()` 必须覆盖全部 7 个开关；全关为 `false`。
+    ///
+    /// 反例：漏算 4 个 AZ3 开关 → 只开「信号线台」时仍判「没有任何流程可跑」。
+    #[test]
+    fn any_on_counts_all_seven_switches() {
+        assert!(
+            !FlowFlags::from_flags([false; Flow::ALL.len()]).any_on(),
+            "7 个全关 = 没有流程"
+        );
+        assert!(FlowFlags::all_on().any_on());
+        for (index, flow) in Flow::ALL.into_iter().enumerate() {
+            let mut flags = [false; Flow::ALL.len()];
+            flags[index] = true;
+            assert!(
+                FlowFlags::from_flags(flags).any_on(),
+                "只开「{}」也算有流程可用",
+                flow.label()
+            );
+        }
+    }
+
+    /// `flags()` / `from_flags()` / `get()` 必须指向同一批字段。
+    ///
+    /// 反例：`from_flags` 里两个下标抄重 → 关一个开关其实关掉了另一个（旧配置位序串台）。
+    #[test]
+    fn flag_order_and_getters_stay_in_sync() {
+        for (index, flow) in Flow::ALL.into_iter().enumerate() {
+            assert_eq!(flow.index(), index, "下标必须等于声明位置");
+            let mut flags = [false; Flow::ALL.len()];
+            flags[index] = true;
+            let built = FlowFlags::from_flags(flags);
+            assert!(built.get(flow), "「{}」的位序与 get() 不一致", flow.label());
+            assert_eq!(built.flags(), flags, "flags() 必须原样还原位序");
+        }
+        // 一次只关一个：其余 6 个不许跟着变。
+        for flow in Flow::ALL {
+            let mut flags = [true; Flow::ALL.len()];
+            flags[flow.index()] = false;
+            let off = FlowFlags::from_flags(flags);
+            for other in Flow::ALL.into_iter().filter(|other| *other != flow) {
+                assert!(
+                    off.get(other),
+                    "关「{}」时「{}」跟着变了",
+                    flow.label(),
+                    other.label()
+                );
+            }
+        }
     }
 
     #[test]

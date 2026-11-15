@@ -7,7 +7,6 @@
 //! 颜色语义（`Frame::pixel` 返回 `[B, G, R]`）：
 //! - [`is_green_glow`]：游戏里的亮绿色（高亮带、锁定条、成功圆钮）
 //! - [`is_red_glow`]：整条高亮带变红（大保险按错的唯一信号）
-//! - [`is_white`]：任务保险的白色游标与目标方块、信号线台的白竖线
 //! - [`is_yellow_glow`]：黄键台待点按键的纯黄/琥珀高亮（排除已经变绿的完成态）
 
 use delta_capture::Frame;
@@ -75,10 +74,6 @@ pub(crate) fn is_green_glow([b, g, r]: [u8; 3]) -> bool {
 
 pub(crate) fn is_red_glow([b, g, r]: [u8; 3]) -> bool {
     r > 110 && r > g.saturating_add(40) && r > b.saturating_add(40)
-}
-
-pub(crate) fn is_white([b, g, r]: [u8; 3]) -> bool {
-    r > 170 && g > 170 && b > 170
 }
 
 /// 纯黄/琥珀高亮（黄键台里**还没点**的亮键）。

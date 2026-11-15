@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use delta_capture::{CaptureBackend, CaptureSession, Frame};
-use delta_config::{Config, PxView, Timings};
+use delta_config::{Config, Flow, FlowFlags, PxView, Timings};
 use delta_flow_az3::Clock;
 use delta_geom::{MonitorInfo, PxPoint, PxRect};
 use delta_hotkey::Hotkey;
@@ -546,7 +546,21 @@ fn classify_poll_frame(
     match guard.verdict(frame) {
         ui_guard::UiVerdict::Target(scene) => PollVerdict::Ready(Some(scene)),
         ui_guard::UiVerdict::Reject(reason) if elapsed_ms >= QUICK_REJECT_MS => {
-            PollVerdict::Reject(reason)
+            // **受控兜底**：`images/ui/` 里没有 `pins.png` / `timing.png` 模板（实测硬凑也
+            // 凑不出来：40 帧保险柜正样本的 `best` 中位只有 0.183、28/40 帧 < 0.30），
+            // 于是这两个界面的模板结论恒为 `Reject` —— 用户看到的就是「按 F 完全没反应」。
+            //
+            // 只有 AZ3 二级判别（[`delta_scene::az3_variant`]）点名的 `SafePins` /
+            // `SafeTiming` 才放行：它的判据（轨道上的目标/游标对、目标带里的绿游标列）
+            // 远严于一级 `detect`（后者会把走廊判成 `Console`），而且分支只可能走到
+            // 「模板已判拒绝 **且** 已等满 QUICK_REJECT_MS」之后 —— 任何模板能命中的成功路径
+            // 都在上面 `Target` 分支就返回了，兜底不覆盖、不改变它们。
+            match delta_scene::az3_variant(frame, view) {
+                delta_scene::Az3Kind::SafePins | delta_scene::Az3Kind::SafeTiming => {
+                    PollVerdict::Ready(None)
+                }
+                _ => PollVerdict::Reject(reason),
+            }
         }
         ui_guard::UiVerdict::Reject(_) | ui_guard::UiVerdict::Gray => PollVerdict::NotYet,
     }
@@ -863,6 +877,58 @@ fn probe(config: &Arc<Mutex<Config>>, monitor: MonitorInfo, tx: &mpsc::Sender<Ui
     }
 }
 
+/// 功能开关闸门拦下时的唯一文案来源（`<功能名>` 与主页开关格同名）。
+///
+/// 必须点出「在主页哪里能打开」：只说「已关闭」，用户会以为程序坏了；
+/// 反过来只关掉不提示，按 F10 毫无反应是最难查的一类现象。
+fn flow_disabled_notice(flow: Flow) -> String {
+    format!("{}开关已关闭（在主页开关里打开后可继续）", flow.label())
+}
+
+/// 判别结果 → 它对应的那个功能开关。`Unknown` 没有对应功能 ⇒ `None`。
+///
+/// 这是「哪个开关管哪条流程」的**唯一映射表**：`console` 只管 v5 旧旋钮操作台，
+/// AZ3 四台各由自己的开关支配 —— 拿 `console` 一个键管四台，用户关掉大保险会连
+/// 黄键台一起失效（这正是「独立开关」要避免的）。
+fn flow_of(scene: SceneKind, az3: delta_scene::Az3Kind) -> Option<Flow> {
+    use delta_scene::Az3Kind;
+    match (scene, az3) {
+        (SceneKind::Morse, _) => Some(Flow::Morse),
+        (SceneKind::Fingerprint, _) => Some(Flow::Fingerprint),
+        (SceneKind::Console, Az3Kind::SafeTiming) => Some(Flow::Az3Timing),
+        (SceneKind::Console, Az3Kind::SafePins) => Some(Flow::Az3Pins),
+        (SceneKind::Console, Az3Kind::ModuleKeys) => Some(Flow::Az3Keys),
+        (SceneKind::Console, Az3Kind::SignalLine) => Some(Flow::Az3Line),
+        // AZ3 四台都没命中 ⇒ 只剩 v5 旧旋钮操作台。
+        (SceneKind::Console, Az3Kind::None) => Some(Flow::Console),
+        // 没认出界面：与开关无关，交给原「未识别」拒绝分支（不许误报成「开关已关闭」）。
+        (SceneKind::Unknown, _) => None,
+    }
+}
+
+/// 开关闸门：`Ok(())` = 放行，`Err(文案)` = 零注入退出。
+fn flow_gate(flows: FlowFlags, flow: Flow) -> Result<(), String> {
+    match flows.get(flow) {
+        true => Ok(()),
+        false => Err(flow_disabled_notice(flow)),
+    }
+}
+
+/// 强制入口在**抓任何一帧之前**就能确定的功能。
+///
+/// `F5` / `F6` / `F10` / `F11` 直接点名了场景与变体，所以它们的闸门不必等一帧；
+/// `F7`（`Force(Console)` 且没指定变体）还要投票判是哪个台子 ⇒ `None`，交给判别后的闸门。
+/// 强制 ≠ 绕过开关：用户关掉「黄键台」后按 F10 必须什么都不做。
+fn forced_flow(forced: Option<SceneKind>, forced_az3: Option<delta_scene::Az3Kind>) -> Option<Flow> {
+    match (forced, forced_az3) {
+        (Some(SceneKind::Console), Some(kind)) => flow_of(SceneKind::Console, kind),
+        // F7 只点名了「操作台」，是哪个台子还要投票 ⇒ 交给判别后的那道闸门。
+        (Some(SceneKind::Console), None) => None,
+        (Some(scene), _) => flow_of(scene, delta_scene::Az3Kind::None),
+        (None, _) => None,
+    }
+}
+
 /// 一次完整的一键识别。
 ///
 /// 顺序不可交换（spec §2.2 不变量 8）：**找窗激活 → 截图判别 → 分发 flow**。
@@ -891,6 +957,16 @@ fn run_once(
     if !snapshot.master_enabled {
         let _ = tx.send(UiEvent::Rejected(NOTICE_MASTER_PAUSED.to_owned()));
         return;
+    }
+
+    // 功能开关闸门（强制入口）：F5/F6/F10/F11 已经点名了功能，**不必等任何一帧**就能判，
+    // 所以这条排在 `focus_game_window()` 与 `open_session()` 之前 —— 关掉的功能
+    // 一次激活、一次抓帧都不做。强制 ≠ 绕过开关。
+    if let Some(flow) = forced_flow(forced, forced_az3) {
+        if let Err(notice) = flow_gate(snapshot.flows, flow) {
+            let _ = tx.send(UiEvent::Rejected(notice));
+            return;
+        }
     }
 
     // Q5：模板闸**并入**面板等待循环（用户拍板：解锁界面用 UI 判定模板）。
@@ -973,6 +1049,15 @@ fn run_once(
         Some(kind) => (kind, delta_scene::Az3Kind::None, true, ""),
         None => auto_classify(&frame, &view, hint),
     };
+    // 功能开关闸门（自动判别 / F7 路径）：判别必须看一眼画面，这一帧已经抓过了，
+    // 但闸门排在**读序列、就绪等待、任何注入之前** —— 关掉的功能不再抓第二帧、
+    // 不建第二个会话、一个输入事件都不发。
+    if let Some(flow) = flow_of(scene, az3_kind) {
+        if let Err(notice) = flow_gate(snapshot.flows, flow) {
+            let _ = tx.send(UiEvent::Rejected(notice));
+            return;
+        }
+    }
     let sequence = if scene == SceneKind::Console && reads_led_sequence(az3_kind) {
         read_sequence(&mut session, led_region_for(&view, az3_kind))
             .ok()
@@ -2128,6 +2213,90 @@ mod tests {
         );
     }
 
+    /// 任务保险结构帧（1280×720 合成，100% 脱敏）：一条中灰长轨道 + 5 对「目标方块 + 游标」。
+    ///
+    /// `images/ui/` 里**没有** `pins.png` 模板（实测硬凑也凑不出来：40 帧正样本 `best` 中位
+    /// 0.183），所以这一帧在模板口径下必然是 `Reject` —— 正是「Q5 模板闸把保险柜拒死」的复现。
+    fn pins_screen_frame() -> Frame {
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        let mut data = vec![0u8; (W * H * 4) as usize];
+        let rect = |x: i32, y: i32, w: i32, h: i32| PxRect { x, y, w, h };
+        paint(&mut data, W, rect(300, 188, 750, 15), [67, 67, 67]);
+        for center_x in [413, 527, 634, 739, 845] {
+            paint(&mut data, W, rect(center_x - 5, 187, 10, 17), [255, 255, 255]);
+            paint(&mut data, W, rect(center_x + 38, 182, 5, 27), [255, 255, 255]);
+        }
+        Frame::new(W, H, data, std::time::Instant::now()).expect("合成帧")
+    }
+
+    #[test]
+    fn a_pins_frame_rejected_by_templates_is_rescued_by_the_az3_structure() {
+        // Q5 根因 A：`images/ui/` 没有 `pins.png`/`timing.png`，这两个界面的模板结论恒为
+        // `Reject` ⇒ 用户看到「按 F 完全没反应」。兜底只在「模板已判拒绝 **且** 等满
+        // QUICK_REJECT_MS」之后放行，且只放行 AZ3 二级判别点名的保险柜两类。
+        let guard = ui_guard::UiGuard::load(&ui_templates_dir());
+        let frame = pins_screen_frame();
+        assert_eq!(
+            guard.verdict(&frame),
+            ui_guard::UiVerdict::Reject(ui_guard::NOT_UNLOCK_SCREEN),
+            "前提：没有 pins 模板，这一帧在模板口径下就是「一张都不像」"
+        );
+        assert_eq!(
+            delta_scene::az3_variant(&frame, &led_view()),
+            delta_scene::Az3Kind::SafePins,
+            "前提：AZ3 二级判别认得出这是任务保险"
+        );
+
+        // 未到时限：继续等（兜底不许把「拒绝时限」这道闸拆掉）。
+        assert_eq!(
+            classify_poll_frame(&guard, &frame, &led_view(), QUICK_REJECT_MS - 1),
+            PollVerdict::NotYet,
+            "拒绝时限之内一律不许下结论"
+        );
+        // 到时限：模板说「不像」，但结构确认是保险柜 ⇒ 放行；hint=None（不冒充任何模板场景）。
+        assert_eq!(
+            classify_poll_frame(&guard, &frame, &led_view(), QUICK_REJECT_MS),
+            PollVerdict::Ready(None),
+            "保险柜不许被模板闸拒死"
+        );
+    }
+
+    #[test]
+    fn a_corridor_frame_is_still_rejected_after_the_fallback() {
+        // 反例（兜底放太宽）：只要不是保险柜结构，就该照旧「这不是解锁界面」。
+        let guard = ui_guard::UiGuard::load(&ui_templates_dir());
+        let frame = flat_frame();
+        assert_eq!(
+            delta_scene::az3_variant(&frame, &led_view()),
+            delta_scene::Az3Kind::None,
+            "前提：走廊帧上没有任何 AZ3 结构"
+        );
+        assert_eq!(
+            classify_poll_frame(&guard, &frame, &led_view(), QUICK_REJECT_MS),
+            PollVerdict::Reject(ui_guard::NOT_UNLOCK_SCREEN),
+            "兜底只认保险柜，不许放宽成「什么都放行」"
+        );
+    }
+
+    #[test]
+    fn a_template_hit_keeps_its_scene_hint() {
+        // 反例（判定顺序写反）：兜底只挂在 `Reject` 分支上，模板点名了界面就必须原样带着场景走，
+        // 一旦被兜底改写成 `Ready(None)`，worker 就丢了「这是莫斯」这条路由信息。
+        let guard = ui_guard::UiGuard::load(&ui_templates_dir());
+        let frame = frame_showing("morse");
+        assert_eq!(
+            guard.verdict(&frame),
+            ui_guard::UiVerdict::Target(delta_scene::Scene::Morse),
+            "前提：这一帧在模板口径下就是莫斯面板"
+        );
+        assert_eq!(
+            classify_poll_frame(&guard, &frame, &led_view(), QUICK_REJECT_MS),
+            PollVerdict::Ready(Some(delta_scene::Scene::Morse)),
+            "模板结论必须原样透传"
+        );
+    }
+
     #[test]
     fn an_empty_template_library_never_rejects() {
         // 素材被误删/没打包 ⇒ 快速拒绝整段失效，退化为 v6.7 的 1.2s 路径（绝不放狠话）。
@@ -2346,6 +2515,238 @@ mod tests {
         assert_eq!(
             az3_evidence_detail("大保险", 6, "   "),
             "AZ3类型: 大保险, 已发输入事件: 6"
+        );
+    }
+
+    /// 只关掉 `off` 里列出的开关，其余全开。
+    fn flows_with(off: &[Flow]) -> FlowFlags {
+        let mut flags = [true; Flow::ALL.len()];
+        for flow in off {
+            flags[flow.index()] = false;
+        }
+        FlowFlags::from_flags(flags)
+    }
+
+    /// (场景, AZ3 变体, 对应开关) 的完整组合表。
+    fn flow_cases() -> [(SceneKind, delta_scene::Az3Kind, Flow); 7] {
+        use delta_scene::Az3Kind;
+        [
+            (SceneKind::Morse, Az3Kind::None, Flow::Morse),
+            (SceneKind::Fingerprint, Az3Kind::None, Flow::Fingerprint),
+            (SceneKind::Console, Az3Kind::SafeTiming, Flow::Az3Timing),
+            (SceneKind::Console, Az3Kind::SafePins, Flow::Az3Pins),
+            (SceneKind::Console, Az3Kind::ModuleKeys, Flow::Az3Keys),
+            (SceneKind::Console, Az3Kind::SignalLine, Flow::Az3Line),
+            (SceneKind::Console, Az3Kind::None, Flow::Console),
+        ]
+    }
+
+    /// W-T2 / W-T3：每个判别结果都归**自己那个**开关管，关掉就拦下，文案点明功能名。
+    ///
+    /// 反例①：只闸 `console` 一个开关 → 黄键台那两行 `flow_of` 落不到自己的开关，红。
+    /// 反例②：`flow_gate` 恒 `Ok`（只写不读）→ 所有 `expect_err` 立刻红。
+    #[test]
+    fn every_flow_has_its_own_switch_and_is_blocked_when_it_is_off() {
+        for (scene, az3, flow) in flow_cases() {
+            assert_eq!(
+                flow_of(scene, az3),
+                Some(flow),
+                "{scene:?}/{az3:?} 该归「{}」管",
+                flow.label()
+            );
+            assert!(
+                flow_gate(FlowFlags::all_on(), flow).is_ok(),
+                "全开时「{}」必须放行",
+                flow.label()
+            );
+            let notice = flow_gate(flows_with(&[flow]), flow).expect_err("关掉必须拦住");
+            assert!(
+                notice.contains(flow.label()),
+                "文案要点出是哪个功能：{notice}"
+            );
+            assert!(
+                notice.contains("开关已关闭") && notice.contains("主页"),
+                "文案要说出「开关已关闭」与去哪打开：{notice}"
+            );
+        }
+        // 没认出界面时没有对应功能：不许把「未识别」说成「开关已关闭」。
+        assert_eq!(flow_of(SceneKind::Unknown, delta_scene::Az3Kind::None), None);
+    }
+
+    /// 关掉一个开关**只**影响它自己（这就是「独立启用/禁用」的定义）。
+    ///
+    /// 反例：7 个开关共用一个 bool / 映射表里两行抄重 → 关「摩斯码」时别的功能一起失效。
+    #[test]
+    fn turning_one_switch_off_leaves_every_other_flow_runnable() {
+        for off in Flow::ALL {
+            let flows = flows_with(&[off]);
+            for (scene, az3, _) in flow_cases() {
+                let flow = flow_of(scene, az3).expect("已知界面必有对应开关");
+                assert_eq!(
+                    flow_gate(flows, flow).is_err(),
+                    flow == off,
+                    "关「{}」时对「{}」的放行判断错了",
+                    off.label(),
+                    flow.label()
+                );
+            }
+        }
+        // 7 个全关：每条流程都被拦住（不会有哪条悄悄漏跑）。
+        let all_off = flows_with(&Flow::ALL);
+        for (_, _, flow) in flow_cases() {
+            assert!(flow_gate(all_off, flow).is_err(), "「{}」漏跑了", flow.label());
+        }
+    }
+
+    /// W-T4：4 台 AZ3 各由自己的开关支配，`console` 只管 v5 旧旋钮。
+    ///
+    /// 反例：拿 `console` 一个开关管全部 AZ3 → 第一行就红（用户关掉大保险会连任务保险一起失效）。
+    #[test]
+    fn az3_variants_are_not_governed_by_the_legacy_console_switch() {
+        // 旧操作台关着，任务保险照样能跑。
+        let console_off = flows_with(&[Flow::Console]);
+        assert!(
+            flow_gate(console_off, Flow::Az3Pins).is_ok(),
+            "旧操作台开关不该关掉任务保险"
+        );
+        // 任务保险关着，旧操作台照样能跑。
+        let pins_off = flows_with(&[Flow::Az3Pins]);
+        assert!(
+            flow_gate(pins_off, Flow::Console).is_ok(),
+            "任务保险开关不该关掉旧操作台"
+        );
+        assert!(flow_gate(pins_off, Flow::Az3Pins).is_err(), "自己的开关才算数");
+    }
+
+    /// W-T5：强制入口的开关在**抓帧前**就能确定；F7 的台子还要投票 ⇒ 交给判别后的闸门。
+    ///
+    /// 反例：`forced_flow` 对 `Force(Console)` 直接返回 `Flow::Console` → F7 在
+    /// 「操作台关、任务保险开」时被误拦（明明该由投票结果说了算）。
+    #[test]
+    fn forced_hotkeys_map_to_the_switch_they_name() {
+        use delta_scene::Az3Kind;
+        assert_eq!(
+            forced_flow(Some(SceneKind::Morse), None),
+            Some(Flow::Morse),
+            "F5 点名摩斯"
+        );
+        assert_eq!(
+            forced_flow(Some(SceneKind::Fingerprint), None),
+            Some(Flow::Fingerprint),
+            "F6 点名指纹"
+        );
+        assert_eq!(
+            forced_flow(Some(SceneKind::Console), Some(Az3Kind::ModuleKeys)),
+            Some(Flow::Az3Keys),
+            "F10 点名黄键台"
+        );
+        assert_eq!(
+            forced_flow(Some(SceneKind::Console), Some(Az3Kind::SignalLine)),
+            Some(Flow::Az3Line),
+            "F11 点名信号线台"
+        );
+        assert_eq!(
+            forced_flow(Some(SceneKind::Console), None),
+            None,
+            "F7 还要投票判台子，不能在抓帧前抢答"
+        );
+        assert_eq!(forced_flow(None, None), None, "自动路径不预先闸");
+    }
+
+    /// W-T5（真实路径）：关掉的功能，强制热键也必须在**激活窗口 / 建会话之前**退出。
+    ///
+    /// 只断言事件表恰好是「开始 + 开关已关闭」：那条文案只能由闸门发出，而闸门排在
+    /// `focus_game_window()` 与 `open_session()` 之前 —— 对上文案即证明零激活、零抓帧、零注入。
+    #[test]
+    fn a_disabled_flow_stops_forced_hotkeys_before_any_side_effect() {
+        use std::sync::mpsc::channel;
+
+        let cases = [
+            (Some(SceneKind::Morse), None, Flow::Morse),
+            (Some(SceneKind::Fingerprint), None, Flow::Fingerprint),
+            (
+                Some(SceneKind::Console),
+                Some(delta_scene::Az3Kind::ModuleKeys),
+                Flow::Az3Keys,
+            ),
+            (
+                Some(SceneKind::Console),
+                Some(delta_scene::Az3Kind::SignalLine),
+                Flow::Az3Line,
+            ),
+        ];
+        for (forced, forced_az3, off) in cases {
+            let config = Arc::new(Mutex::new(Config {
+                flows: flows_with(&[off]),
+                ..Config::default()
+            }));
+            let cancel = AtomicBool::new(false);
+            let (tx, rx) = channel();
+
+            run_once(
+                &config,
+                MonitorInfo::new(1280, 720).expect("合法显示器"),
+                &tx,
+                &cancel,
+                forced,
+                forced_az3,
+            );
+
+            let events: Vec<UiEvent> = rx.try_iter().collect();
+            assert_eq!(
+                events.len(),
+                2,
+                "关掉「{}」后强制键必须零副作用退出：{events:?}",
+                off.label()
+            );
+            assert!(matches!(events[0], UiEvent::Started), "先报开始");
+            assert!(
+                matches!(
+                    &events[1],
+                    UiEvent::Rejected(notice)
+                        if notice == &format!("{}开关已关闭（在主页开关里打开后可继续）", off.label())
+                ),
+                "必须是该功能的开关闸门文案，实际：{:?}",
+                events[1]
+            );
+            assert!(
+                !cancel.load(Ordering::SeqCst),
+                "闸门是只读放行判断，不该动别人的取消位"
+            );
+        }
+    }
+
+    /// 同一个功能开着时，强制键不会被闸门拦下（否则上面那条用例可能只是「什么都拦」）。
+    ///
+    /// 断言到「不是开关文案」为止：真跑下去会去打游戏窗口，测试环境里不该发生，
+    /// 这里只要证明闸门放行了 —— 后面的失败来自窗口/采集，与开关无关。
+    #[test]
+    fn an_enabled_flow_is_not_stopped_by_the_flow_gate() {
+        use std::sync::mpsc::channel;
+
+        let config = Arc::new(Mutex::new(Config {
+            flows: flows_with(&[Flow::Morse]),
+            ..Config::default()
+        }));
+        let cancel = AtomicBool::new(true); // 先置取消：真进去也会立刻在流程边界收手。
+        let (tx, rx) = channel();
+
+        run_once(
+            &config,
+            MonitorInfo::new(1280, 720).expect("合法显示器"),
+            &tx,
+            &cancel,
+            Some(SceneKind::Fingerprint),
+            None,
+        );
+
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                UiEvent::Rejected(notice) if notice.contains("开关已关闭")
+            )),
+            "指纹开着，不该被「摩斯码已关闭」拦下：{events:?}"
         );
     }
 }
