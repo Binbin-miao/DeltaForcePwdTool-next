@@ -613,10 +613,13 @@ pub struct UiState {
     pub f_key_hook: bool,
     /// 识别总开关：关 = 任何热键（F/F5/F6/F7/F8）都不再触发识别，连截图都不抓。
     pub master_enabled: bool,
-    /// 三个强制入口的热键名（设置页逐行可改；全局热键用 [`Self::hotkey`]）。
+    /// 强制入口的热键名（设置页逐行可改；全局热键用 [`Self::hotkey`]）。
     pub hotkey_morse: String,
     pub hotkey_fingerprint: String,
     pub hotkey_console: String,
+    /// 操作台里两个 AZ3 台子的独立强制键（默认 `F10` / `F11`）。
+    pub hotkey_keys: String,
+    pub hotkey_line: String,
     /// 识别总开关的翻转键（默认 `F9`；关着的时候它照样有效）。
     pub hotkey_master: String,
     /// 正在捕获的槽位（只在 `hotkey_editing` 为真时有效）。
@@ -746,6 +749,8 @@ impl Default for UiState {
             hotkey_morse: "F5".to_owned(),
             hotkey_fingerprint: "F6".to_owned(),
             hotkey_console: "F7".to_owned(),
+            hotkey_keys: "F10".to_owned(),
+            hotkey_line: "F11".to_owned(),
             hotkey_master: "F9".to_owned(),
             hotkey_slot: delta_config::HotkeySlot::Scene,
             game_title_keywords: keywords.clone(),
@@ -767,6 +772,8 @@ impl UiState {
             delta_config::HotkeySlot::Morse => self.hotkey_morse = name,
             delta_config::HotkeySlot::Fingerprint => self.hotkey_fingerprint = name,
             delta_config::HotkeySlot::Console => self.hotkey_console = name,
+            delta_config::HotkeySlot::Keys => self.hotkey_keys = name,
+            delta_config::HotkeySlot::Line => self.hotkey_line = name,
         }
     }
 

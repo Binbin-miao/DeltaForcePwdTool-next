@@ -610,6 +610,13 @@ pub struct Hotkeys {
     pub fingerprint: String,
     /// 强制跑操作台。
     pub console: String,
+    /// 强制跑黄键台（AZ3 `ModuleKeys`，默认 `F10`）。
+    ///
+    /// 与 `console` 的分工：`console` 进去后还要靠 UI 模板闸再判是哪个台子；
+    /// 这个键是**用户已明确站在黄键台前**，直接进黄键台流程，不再判别。
+    pub keys: String,
+    /// 强制跑横线台（AZ3 `SignalLine`，默认 `F11`）。语义同上。
+    pub line: String,
     /// 识别总开关的翻转键（默认 `F9`）。
     ///
     /// 与上面四个的分工：那四个**发起**识别，这个只**开关**识别 ——
@@ -617,9 +624,10 @@ pub struct Hotkeys {
     pub master: String,
 }
 
-/// 五个可独立改键的槽位（设置页逐个可点）。
+/// 七个可独立改键的槽位（设置页逐个可点）。
 ///
-/// 与 [`Hotkeys`] 的字段一一对应；`Scene` 是「一键识别」，其余三个是强制入口，
+/// 与 [`Hotkeys`] 的字段一一对应；`Scene` 是「一键识别」，中间四个是强制入口
+/// （`Keys` / `Line` 进一步细到 AZ3 变体，不再判别），
 /// `Master` 是识别总开关的翻转键（唯一一个**不发起**识别的槽位）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HotkeySlot {
@@ -631,18 +639,24 @@ pub enum HotkeySlot {
     Fingerprint,
     /// 强制操作台。
     Console,
+    /// 强制黄键台（AZ3 `ModuleKeys`）。
+    Keys,
+    /// 强制横线台（AZ3 `SignalLine`）。
+    Line,
     /// 翻转识别总开关。
     Master,
 }
 
 impl HotkeySlot {
-    /// 按设置页显示顺序排列（`Master` 紧跟总开关行、排在四个识别键之前）。
-    pub const ALL: [Self; 5] = [
+    /// 按设置页显示顺序排列（`Master` 紧跟总开关行、排在识别键之前）。
+    pub const ALL: [Self; 7] = [
         Self::Master,
         Self::Scene,
         Self::Morse,
         Self::Fingerprint,
         Self::Console,
+        Self::Keys,
+        Self::Line,
     ];
 
     /// 数组下标（`ALL` 的位置）。
@@ -653,6 +667,8 @@ impl HotkeySlot {
             Self::Morse => 2,
             Self::Fingerprint => 3,
             Self::Console => 4,
+            Self::Keys => 5,
+            Self::Line => 6,
         }
     }
 
@@ -664,6 +680,8 @@ impl HotkeySlot {
             Self::Morse => "摩斯热键",
             Self::Fingerprint => "指纹热键",
             Self::Console => "操作台热键",
+            Self::Keys => "黄键台热键",
+            Self::Line => "横线台热键",
         }
     }
 
@@ -675,6 +693,8 @@ impl HotkeySlot {
             Self::Morse => &keys.morse,
             Self::Fingerprint => &keys.fingerprint,
             Self::Console => &keys.console,
+            Self::Keys => &keys.keys,
+            Self::Line => &keys.line,
         }
     }
 
@@ -686,6 +706,8 @@ impl HotkeySlot {
             Self::Morse => keys.morse = value,
             Self::Fingerprint => keys.fingerprint = value,
             Self::Console => keys.console = value,
+            Self::Keys => keys.keys = value,
+            Self::Line => keys.line = value,
         }
     }
 }
@@ -698,6 +720,9 @@ impl Default for Hotkeys {
             morse: "F5".to_owned(),
             fingerprint: "F6".to_owned(),
             console: "F7".to_owned(),
+            // F10/F11：把「操作台里的两个 AZ3 台子」拆成独立强制键，接在 F7 之后。
+            keys: "F10".to_owned(),
+            line: "F11".to_owned(),
             // 总开关翻转键：紧挨 F5~F8，游戏里通常空着。
             master: "F9".to_owned(),
         }
@@ -913,13 +938,15 @@ pub fn single_key_rejection(hotkey: &str) -> Option<&'static str> {
 }
 
 impl Hotkeys {
-    /// 五个字段（按配置顺序），供逐一校验。
-    pub fn fields(&self) -> [(&'static str, &str); 5] {
+    /// 七个字段（按配置顺序），供逐一校验。
+    pub fn fields(&self) -> [(&'static str, &str); 7] {
         [
             ("hotkeys.scene", &self.scene),
             ("hotkeys.morse", &self.morse),
             ("hotkeys.fingerprint", &self.fingerprint),
             ("hotkeys.console", &self.console),
+            ("hotkeys.keys", &self.keys),
+            ("hotkeys.line", &self.line),
             ("hotkeys.master", &self.master),
         ]
     }
@@ -1365,11 +1392,12 @@ mod tests {
     #[test]
     fn every_hotkey_slot_owns_one_index_and_one_field() {
         // 槽位下标直接当数组下标用（热键泵的 `bound[]`）：重复就是串键，越界就是崩。
-        let mut seen = [false; 5];
+        let slots = HotkeySlot::ALL.len();
+        let mut seen = vec![false; slots];
         let mut names = Vec::new();
         for slot in HotkeySlot::ALL {
             let index = slot.index();
-            assert!(index < 5, "{slot:?} 下标越界");
+            assert!(index < slots, "{slot:?} 下标越界");
             assert!(!seen[index], "{slot:?} 的下标与别的槽位撞了");
             seen[index] = true;
             // 写进去的必须从这个槽读得回来（读写指向同一字段）。
@@ -1379,17 +1407,41 @@ mod tests {
             assert_eq!(HotkeySlot::read(slot, &keys), marker, "{slot:?} 读写不是同一个字段");
             names.push(slot.read(&Hotkeys::default()).to_owned());
         }
-        assert!(seen.iter().all(|hit| *hit), "ALL 必须覆盖全部五个槽位");
+        assert!(seen.iter().all(|hit| *hit), "ALL 必须覆盖全部槽位");
         assert_eq!(
             Hotkeys::default().fields().len(),
             HotkeySlot::ALL.len(),
             "校验列表漏一项 = 某个键永远不被校验"
         );
-        // 五个默认键互不相同：同一个键注册两次只会成功一个。
+        // 默认键互不相同：同一个键注册两次只会成功一个。
         let mut unique = names.clone();
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), names.len(), "默认键位重复：{names:?}");
+    }
+
+    #[test]
+    fn the_two_force_az3_hotkeys_default_to_f10_and_f11_and_survive_old_configs() {
+        // 用户拍板：黄键台 / 横线台各有独立强制键，默认 F10 / F11。
+        let default = Config::default().hotkeys;
+        assert_eq!(default.keys, "F10");
+        assert_eq!(default.line, "F11");
+
+        // 老配置里没有这两个字段 ⇒ 必须回落默认值，不能是空串
+        // （空串注册不上 = 功能静默消失，用户按 F10 毫无反应且没有任何提示）。
+        let legacy: Config = serde_json::from_str(r#"{"hotkeys":{"scene":"F8"}}"#).expect("老配置合法");
+        assert_eq!(legacy.hotkeys.keys, "F10", "缺字段必须回落 F10");
+        assert_eq!(legacy.hotkeys.line, "F11", "缺字段必须回落 F11");
+
+        // 改过之后必须原样回得来（跨启动保持）。
+        let custom: Config = serde_json::from_str(r#"{"hotkeys":{"keys":"Ctrl+Alt+K","line":"Ctrl+Alt+L"}}"#)
+            .expect("可读");
+        assert_eq!(custom.hotkeys.keys, "Ctrl+Alt+K");
+        assert_eq!(custom.hotkeys.line, "Ctrl+Alt+L");
+        let dumped = serde_json::to_string(&custom).expect("序列化");
+        let round_trip: Config = serde_json::from_str(&dumped).expect("反序列化");
+        assert_eq!(round_trip.hotkeys.keys, "Ctrl+Alt+K");
+        assert_eq!(round_trip.hotkeys.line, "Ctrl+Alt+L");
     }
 
     #[test]

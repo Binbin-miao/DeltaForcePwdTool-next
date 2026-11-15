@@ -884,6 +884,8 @@ impl eframe::App for DeltaApp {
             let hotkey_morse = self.state.hotkey_morse.clone();
             let hotkey_fingerprint = self.state.hotkey_fingerprint.clone();
             let hotkey_console = self.state.hotkey_console.clone();
+            let hotkey_keys = self.state.hotkey_keys.clone();
+            let hotkey_line = self.state.hotkey_line.clone();
             let hotkey_master = self.state.hotkey_master.clone();
             let hotkey_editing = self.state.hotkey_editing;
             let capture_locked = !self.state.capture_switchable();
@@ -905,6 +907,8 @@ impl eframe::App for DeltaApp {
                     hotkey_morse: &hotkey_morse,
                     hotkey_fingerprint: &hotkey_fingerprint,
                     hotkey_console: &hotkey_console,
+                    hotkey_keys: &hotkey_keys,
+                    hotkey_line: &hotkey_line,
                     hotkey_slot: self.state.hotkey_slot,
                     hotkey_editing,
                     hotkey_conflict: conflict.as_deref(),
@@ -1156,6 +1160,8 @@ fn initial_state(config: &Config, monitor: MonitorInfo) -> UiState {
         hotkey_morse: config.hotkeys.morse.clone(),
         hotkey_fingerprint: config.hotkeys.fingerprint.clone(),
         hotkey_console: config.hotkeys.console.clone(),
+        hotkey_keys: config.hotkeys.keys.clone(),
+        hotkey_line: config.hotkeys.line.clone(),
         hotkey_master: config.hotkeys.master.clone(),
         hotkey_slot: delta_config::HotkeySlot::Scene,
         game_title_keywords: config.game_title_keywords.clone(),

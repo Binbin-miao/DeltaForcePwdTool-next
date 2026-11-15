@@ -74,6 +74,9 @@ pub enum Cmd {
     Trigger,
     /// 强制跑指定场景，跳过自动判别（对齐上游「F5 只跑摩斯 / F6 只跑指纹」）。
     Force(SceneKind),
+    /// 强制跑指定 AZ3 变体（F10 黄键台 / F11 横线台）：连「操作台里是哪个台子」都不判，
+    /// 用户按键即命令（见 `run_once` 的 `forced_az3`）。
+    ForceAz3(delta_scene::Az3Kind),
     /// 只读检查：找窗 + 场景判别，不产生任何输入。
     Probe,
     /// 翻转识别总开关（不发起任何识别）。
@@ -144,8 +147,9 @@ impl Worker {
         let cancel = Arc::new(AtomicBool::new(false));
         let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
 
-        // 五个热键：一键识别（自动判别）+ 三个强制键（对齐上游 F5/F6，另加操作台 F7）
-        // + 识别总开关（F9）。五个都能在设置里改；改键消息带槽位，泵只重绑被改的那一个。
+        // 七个热键：一键识别（自动判别）+ 五个强制键（F5 摩斯 / F6 指纹 / F7 操作台
+        // / F10 黄键台 / F11 横线台）+ 识别总开关（F9）。全部都能在设置里改；
+        // 改键消息带槽位，泵只重绑被改的那一个。
         let bindings: Vec<(delta_config::HotkeySlot, String)> = {
             let keys = match config.lock() {
                 Ok(cfg) => cfg.hotkeys.clone(),
@@ -176,8 +180,9 @@ impl Worker {
                     let mut routes: Vec<(u32, Cmd)> = Vec::new();
                     // 每个槽当前在案的 `(注册 id, 实际 Hotkey, 键名)`；改键失败靠它回滚（D2），
                     // 所以不能只记名字，也不能事后重新解析。
-                    let mut bound: [Option<(u32, Hotkey, String)>; 5] =
-                        [None, None, None, None, None];
+                    // 长度直接取自 `HotkeySlot::ALL`：加槽位时这里不必再回来数一遍。
+                    let mut bound: [Option<(u32, Hotkey, String)>; delta_config::HotkeySlot::ALL.len()] =
+                        std::array::from_fn(|_| None);
                     for (slot, name) in &bindings {
                         let hotkey = platform::startup_hotkey(name);
                         match hotkeys.register(hotkey) {
@@ -277,11 +282,24 @@ impl Worker {
                             }
                             Cmd::Trigger => {
                                 cancel.store(false, Ordering::SeqCst);
-                                run_once(&config, monitor, &event_tx, &cancel, None);
+                                run_once(&config, monitor, &event_tx, &cancel, None, None);
                             }
                             Cmd::Force(kind) => {
                                 cancel.store(false, Ordering::SeqCst);
-                                run_once(&config, monitor, &event_tx, &cancel, Some(kind));
+                                run_once(&config, monitor, &event_tx, &cancel, Some(kind), None);
+                            }
+                            Cmd::ForceAz3(kind) => {
+                                cancel.store(false, Ordering::SeqCst);
+                                // AZ3 变体都住在「操作台」这个场景下：强制场景 = Console，
+                                // 强制变体藏在第二个参数里（跳过 `az3_variant` 投票）。
+                                run_once(
+                                    &config,
+                                    monitor,
+                                    &event_tx,
+                                    &cancel,
+                                    Some(SceneKind::Console),
+                                    Some(kind),
+                                );
                             }
                         }
                     }
@@ -314,6 +332,8 @@ fn cmd_for(slot: delta_config::HotkeySlot) -> Cmd {
         delta_config::HotkeySlot::Morse => Cmd::Force(SceneKind::Morse),
         delta_config::HotkeySlot::Fingerprint => Cmd::Force(SceneKind::Fingerprint),
         delta_config::HotkeySlot::Console => Cmd::Force(SceneKind::Console),
+        delta_config::HotkeySlot::Keys => Cmd::ForceAz3(delta_scene::Az3Kind::ModuleKeys),
+        delta_config::HotkeySlot::Line => Cmd::ForceAz3(delta_scene::Az3Kind::SignalLine),
     }
 }
 
@@ -852,6 +872,10 @@ fn run_once(
     tx: &mpsc::Sender<UiEvent>,
     cancel: &AtomicBool,
     forced: Option<SceneKind>,
+    // F10/F11 的强制 AZ3 变体：与 `forced = Some(Console)` 成对出现。有值时**不再投票**
+    // （`az3_variant`）也不做变体复核 —— 用户已明确站在哪个台子前，模板/投票是给
+    // 「盲按 F」用的，不是给强制键用的。
+    forced_az3: Option<delta_scene::Az3Kind>,
 ) {
     let _ = tx.send(UiEvent::Started);
     let snapshot = snapshot(config);
@@ -908,7 +932,10 @@ fn run_once(
     // Q1/Q3/Q5：面板 0.4s 才淡入、首颗亮键 1.8s 才出现 —— 单帧判别必然判失败，
     // 这就是「第一次按 F 没用、要按两次」的根因。这里等画面真的长起来再判，
     // 模板判定在同一轮里完成（拒绝也从这里出去，不再是「先聚焦再白等」）。
-    let Some(ReadyFrame { frame, hint }) = await_frame(
+    let Some(ReadyFrame {
+        mut frame,
+        hint,
+    }) = await_frame(
         ReadyContext {
             session: &mut session,
             full,
@@ -933,7 +960,8 @@ fn run_once(
     let (scene, az3_kind, actionable, reason) = match forced {
         Some(SceneKind::Console) => (
             SceneKind::Console,
-            delta_scene::az3_variant(&frame, &view),
+            // 强制指定了变体就直接采信（F10/F11）；否则才走「操作台里是哪个台子」的投票。
+            forced_az3.unwrap_or_else(|| delta_scene::az3_variant(&frame, &view)),
             true,
             "",
         ),
@@ -970,17 +998,30 @@ fn run_once(
 
     // Q1/Q5：**真开跑前再抓一帧**。
     // - 黄键台：只等「面板结构量得出来」（spec B2/B3、P1；亮键像素不是就绪判据）；
-    // - 同时复核 AZ3 变体，不一致立即拒绝 —— 把「误判 × 上百次乱点」压到 ≤1 帧。
+    // - 自动模式还要复核 AZ3 变体，不一致立即拒绝 —— 把「误判 × 上百次乱点」压到 ≤1 帧。
+    // - 强制模式（F10/F11）**不复核、不拒绝**：用户已明确站在哪个台子前。但黄键台仍要等面板
+    //   量得出来 —— 面板刚打开是 1% 进度、零亮键，单帧必然定位失败；等不到就用手上这一帧
+    //   交给 flow 自己容错（强制语义下宁可让流程兜底，也不在这里把用户拦下来）。
     if scene == SceneKind::Console && az3_kind.is_known() {
-        let verdict = if az3_kind == delta_scene::Az3Kind::ModuleKeys {
-            wait_keys_ready(&mut session, full, cancel, tx)
+        if forced_az3.is_some() {
+            // 强制：不投票、不复核、不拒绝。黄键台仍等「面板量得出来」再开跑，等不到就用手上
+            // 这一帧交给 flow 自己容错（`Locate` 没有 frame 时不留副本：1080p 一帧 8.3MB）。
+            if az3_kind == delta_scene::Az3Kind::ModuleKeys {
+                if let Locate::Found(ready) = wait_keys_ready(&mut session, full, cancel, tx) {
+                    frame = ready;
+                }
+            }
         } else {
-            // 其余 AZ3 玩法没有「面板量不全」这条就绪判据，复核用的就是刚判别过的那一帧。
-            Locate::Found(frame.clone())
-        };
-        if let Err(reason) = confirm_az3(verdict, &view, az3_kind, &snapshot, monitor) {
-            let _ = tx.send(UiEvent::Rejected(reason));
-            return;
+            let verdict = if az3_kind == delta_scene::Az3Kind::ModuleKeys {
+                wait_keys_ready(&mut session, full, cancel, tx)
+            } else {
+                // 其余 AZ3 玩法没有「面板量不全」这条就绪判据，复核用的就是刚判别过的那一帧。
+                Locate::Found(frame.clone())
+            };
+            if let Err(reason) = confirm_az3(verdict, &view, az3_kind, &snapshot, monitor) {
+                let _ = tx.send(UiEvent::Rejected(reason));
+                return;
+            }
         }
     }
 
@@ -1606,6 +1647,7 @@ mod tests {
             &tx,
             &cancel,
             None,
+            None,
         );
 
         let events: Vec<UiEvent> = rx.try_iter().collect();
@@ -1655,6 +1697,29 @@ mod tests {
     fn master_slot_maps_to_the_toggle_command() {
         assert_eq!(cmd_for(delta_config::HotkeySlot::Master), Cmd::ToggleMaster);
         assert_ne!(cmd_for(delta_config::HotkeySlot::Scene), Cmd::ToggleMaster);
+    }
+
+    /// F10/F11 必须各自派发**自己那个** AZ3 变体，而不是笼统的「操作台」。
+    ///
+    /// 这是「拆成两个强制键」的核心断言：两个槽位对调或都落到 `Console`，
+    /// 用户按 F10 会跑横线台，而界面上看不出任何异常。
+    #[test]
+    fn keys_and_line_slots_force_their_own_az3_variant() {
+        assert_eq!(
+            cmd_for(delta_config::HotkeySlot::Keys),
+            Cmd::ForceAz3(delta_scene::Az3Kind::ModuleKeys),
+            "F10 必须是黄键台"
+        );
+        assert_eq!(
+            cmd_for(delta_config::HotkeySlot::Line),
+            Cmd::ForceAz3(delta_scene::Az3Kind::SignalLine),
+            "F11 必须是横线台"
+        );
+        // 旧 F7 保持原样：它仍然只到「操作台」，由模板闸再判台子。
+        assert_eq!(
+            cmd_for(delta_config::HotkeySlot::Console),
+            Cmd::Force(SceneKind::Console)
+        );
     }
 
     /// 唤醒把手没注入时不能崩；注入后必须真的调一次。

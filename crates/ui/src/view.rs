@@ -1178,6 +1178,9 @@ struct SettingsRows {
     morse: Rect,
     fingerprint: Rect,
     console: Rect,
+    /// 黄键台 / 横线台（F10/F11）：紧跟在「操作台」之后。
+    keys: Rect,
+    line: Rect,
     ocr: Rect,
     theme: Rect,
     accent: Rect,
@@ -1207,6 +1210,8 @@ fn settings_rows(content: Rect, has_result: bool) -> SettingsRows {
     let morse = next(SETTINGS_LINE_H);
     let fingerprint = next(SETTINGS_LINE_H);
     let console = next(SETTINGS_LINE_H);
+    let keys = next(SETTINGS_LINE_H);
+    let line = next(SETTINGS_LINE_H);
     let ocr = next(SETTINGS_LINE_H);
     let theme_row = next(SETTINGS_LINE_H);
     let accent = next(SETTINGS_LINE_H);
@@ -1227,6 +1232,8 @@ fn settings_rows(content: Rect, has_result: bool) -> SettingsRows {
         morse,
         fingerprint,
         console,
+        keys,
+        line,
         ocr,
         theme: theme_row,
         accent,
@@ -1241,10 +1248,11 @@ fn settings_rows(content: Rect, has_result: bool) -> SettingsRows {
 
 /// 设置页滚动区的总高度（含标题留给视口的余量）。
 fn settings_inner_height(has_result: bool) -> f32 {
-    // 10 行单行控件：总开关 + 总开关热键 + 四个热键 + 兜底 + 主题 + 主色 + F 键监听。
-    let lines = 10.0 * SETTINGS_LINE_H;
+    // 12 行单行控件：总开关 + 总开关热键 + 六个热键（全局/摩斯/指纹/操作台/黄键台/横线台）
+    // + 兜底 + 主题 + 主色 + F 键监听。
+    let lines = 12.0 * SETTINGS_LINE_H;
     let rows = 2.0 * SETTINGS_ROW_H + if has_result { CAPTURE_RESULT_H } else { SETTINGS_ROW_H };
-    let gaps = 13.0 * SETTINGS_GAP;
+    let gaps = 15.0 * SETTINGS_GAP;
     theme::TITLE_BAR_H + theme::SPACE_S + lines + rows + gaps
 }
 
@@ -1325,6 +1333,8 @@ pub struct SettingsView<'a> {
     pub hotkey_morse: &'a str,
     pub hotkey_fingerprint: &'a str,
     pub hotkey_console: &'a str,
+    pub hotkey_keys: &'a str,
+    pub hotkey_line: &'a str,
     /// 正在捕获的槽位（`hotkey_editing` 为真时才有意义）。
     pub hotkey_slot: delta_config::HotkeySlot,
     /// 是否正在捕获新热键（捕获态只显示提示，没有任何文本输入框）。
@@ -1583,6 +1593,18 @@ pub fn settings_panel(
             title: "操作台热键",
             key: view.hotkey_console,
             slot: delta_config::HotkeySlot::Console,
+        },
+        HotkeyRow {
+            rect: rows.keys,
+            title: "黄键台热键",
+            key: view.hotkey_keys,
+            slot: delta_config::HotkeySlot::Keys,
+        },
+        HotkeyRow {
+            rect: rows.line,
+            title: "横线台热键",
+            key: view.hotkey_line,
+            slot: delta_config::HotkeySlot::Line,
         },
     ];
     // 捕获结算先于既有控件：这一帧的按键/取消不会被按钮点击覆盖掉。
@@ -2212,6 +2234,8 @@ mod tests {
                         hotkey_morse: "F5",
                         hotkey_fingerprint: "F6",
                         hotkey_console: "F7",
+                        hotkey_keys: "F10",
+                        hotkey_line: "F11",
                         hotkey_slot: delta_config::HotkeySlot::Scene,
                         hotkey_editing,
                         hotkey_conflict: None,
@@ -2390,6 +2414,8 @@ mod tests {
                                         hotkey_morse: "F5",
                                         hotkey_fingerprint: "F6",
                                         hotkey_console: "F7",
+                                        hotkey_keys: "F10",
+                                        hotkey_line: "F11",
                                         hotkey_slot: delta_config::HotkeySlot::Scene,
                                         hotkey_editing: false,
                                         hotkey_conflict: None,
