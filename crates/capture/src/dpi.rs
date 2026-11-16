@@ -41,26 +41,23 @@ pub fn ensure_dpi_awareness() -> DpiAwareness {
 }
 
 unsafe fn apply() -> DpiAwareness {
-    if let Some(set_context) =
-        resolve::<SetDpiAwarenessContextFn>(w!("user32.dll"), b"SetProcessDpiAwarenessContext\0")
-    {
-        if set_context(PER_MONITOR_AWARE_V2 as *mut c_void) != 0 {
-            return DpiAwareness::PerMonitorV2;
-        }
-    }
-    if let Some(set_awareness) =
-        resolve::<SetDpiAwarenessFn>(w!("shcore.dll"), b"SetProcessDpiAwareness\0")
-    {
-        if set_awareness(PROCESS_PER_MONITOR_DPI_AWARE) == 0 {
-            return DpiAwareness::PerMonitor;
-        }
-    }
-    if let Some(set_aware) = resolve::<SetDpiAwareFn>(w!("user32.dll"), b"SetProcessDPIAware\0") {
-        if set_aware() != 0 {
-            return DpiAwareness::System;
-        }
-    }
-    DpiAwareness::Unchanged
+    choose_awareness(|level| match level {
+        DpiAwareness::PerMonitorV2 =>
+            resolve::<SetDpiAwarenessContextFn>(w!("user32.dll"), b"SetProcessDpiAwarenessContext\0")
+                .is_some_and(|set| set(PER_MONITOR_AWARE_V2 as *mut c_void) != 0),
+        DpiAwareness::PerMonitor =>
+            resolve::<SetDpiAwarenessFn>(w!("shcore.dll"), b"SetProcessDpiAwareness\0")
+                .is_some_and(|set| set(PROCESS_PER_MONITOR_DPI_AWARE) == 0),
+        DpiAwareness::System =>
+            resolve::<SetDpiAwareFn>(w!("user32.dll"), b"SetProcessDPIAware\0")
+                .is_some_and(|set| set() != 0),
+        DpiAwareness::Unchanged => false,
+    })
+}
+
+fn choose_awareness(mut set: impl FnMut(DpiAwareness) -> bool) -> DpiAwareness {
+    [DpiAwareness::PerMonitorV2, DpiAwareness::PerMonitor, DpiAwareness::System]
+        .into_iter().find(|level| set(*level)).unwrap_or(DpiAwareness::Unchanged)
 }
 
 /// 取符号地址并转成目标函数指针；任一环节缺失都返回 `None`（交由下一级回落）。
@@ -75,6 +72,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn awareness_fallback_stops_at_the_first_supported_level() {
+        let mut attempted = Vec::new();
+        let chosen = choose_awareness(|level| {
+            attempted.push(level);
+            level == DpiAwareness::PerMonitor
+        });
+        assert_eq!(chosen, DpiAwareness::PerMonitor);
+        assert_eq!(attempted, vec![DpiAwareness::PerMonitorV2, DpiAwareness::PerMonitor]);
+    }
+
+    #[test]
+    fn unsupported_awareness_keeps_the_existing_state() {
+        assert_eq!(choose_awareness(|_| false), DpiAwareness::Unchanged);
+    }
+
+    #[test]
+    #[ignore = "真实 DPI 系统集成；游戏运行期间禁止执行，须单独授权"]
     fn awareness_is_idempotent() {
         let first = ensure_dpi_awareness();
         let second = ensure_dpi_awareness();

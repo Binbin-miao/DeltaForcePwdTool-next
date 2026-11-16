@@ -36,7 +36,12 @@ pub(crate) fn yield_count() -> usize {
     YIELDS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// 让出 1ms 给系统输入队列；同时记账，供 B6 断言「录制路径一次都没让」。
+/// 纯策略：首步不等待，只有真实投递每四个子步让出一次。
+fn yields_at(live: bool, index: usize) -> bool {
+    live && index > 0 && index.is_multiple_of(YIELD_EVERY_SUBSTEPS)
+}
+
+/// 让出 1ms 给系统输入队列并记录次数。
 fn yield_once() {
     #[cfg(test)]
     YIELDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -62,7 +67,7 @@ impl Drag {
         }
     }
 
-    /// 录制模式：事件序列写进返回的 [`RecordHandle`]，**不碰系统光标**。测试专用。
+    /// 录制模式：固定 1920×1080 几何，事件写进 [`RecordHandle`]，不查询桌面、不碰系统光标。
     pub fn recording() -> (Self, RecordHandle) {
         let handle = RecordHandle::default();
         (
@@ -79,7 +84,10 @@ impl Drag {
         if self.pressed {
             return Err(InputError::AlreadyPressed);
         }
-        let screen = screen_size()?;
+        let screen = match self.sink {
+            Sink::Live => screen_size()?,
+            Sink::Record(_) => (1920, 1080),
+        };
         let (x, y) = (
             crate::inject::normalise(at.x, screen.0),
             crate::inject::normalise(at.y, screen.1),
@@ -96,7 +104,7 @@ impl Drag {
             return Err(InputError::NotPressed);
         }
         for (index, (step_x, step_y)) in split_steps(dx, dy).into_iter().enumerate() {
-            if self.yields_at(index) {
+            if yields_at(matches!(self.sink, Sink::Live), index) {
                 yield_once();
             }
             self.sink.emit(Injected::Move {
@@ -105,13 +113,6 @@ impl Drag {
             })?;
         }
         Ok(())
-    }
-
-    /// 第 `index` 个子步**之前**是否让出 1ms。
-    ///
-    /// 只有真实注入需要让：录制路径不碰系统光标，sleep 只会让测试变慢。
-    fn yields_at(&self, index: usize) -> bool {
-        matches!(self.sink, Sink::Live) && index > 0 && index.is_multiple_of(YIELD_EVERY_SUBSTEPS)
     }
 
     /// 抬起左键。
@@ -275,20 +276,23 @@ mod tests {
 
     #[test]
     fn only_the_live_path_yields_and_only_every_fourth_substep() {
-        let live = Drag {
-            sink: Sink::Live,
-            pressed: true,
-        };
-        assert!(!live.yields_at(0), "第一个子步之前不该等");
-        assert!(!live.yields_at(1));
-        assert!(!live.yields_at(3));
-        assert!(live.yields_at(YIELD_EVERY_SUBSTEPS), "第 4 个子步之前让出一次");
-        assert!(live.yields_at(YIELD_EVERY_SUBSTEPS * 2));
+        assert!(!yields_at(true, 0), "第一个子步之前不该等");
+        assert!(!yields_at(true, 1));
+        assert!(!yields_at(true, 3));
+        assert!(yields_at(true, YIELD_EVERY_SUBSTEPS));
+        assert!(yields_at(true, YIELD_EVERY_SUBSTEPS * 2));
+        assert!(!(0..=YIELD_EVERY_SUBSTEPS * 3).any(|index| yields_at(false, index)));
+    }
 
-        let (recording, _log) = Drag::recording();
-        assert!(
-            !(1..=YIELD_EVERY_SUBSTEPS * 3).any(|index| recording.yields_at(index)),
-            "录制路径任何子步都不许让出"
-        );
+    #[test]
+    fn recording_uses_fixed_geometry_without_a_system_query() {
+        let (mut drag, log) = Drag::recording();
+        drag.begin(PxPoint { x: 1919, y: 1079 }).expect("固定几何");
+        drag.end().expect("抬手");
+        assert_eq!(log.events(), vec![
+            Injected::MoveAbsolute { x: 65535, y: 65535 },
+            Injected::LeftDown,
+            Injected::LeftUp,
+        ]);
     }
 }

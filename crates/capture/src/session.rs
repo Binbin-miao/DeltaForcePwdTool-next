@@ -54,6 +54,8 @@ impl fmt::Display for CaptureBackend {
 enum Backend {
     BitBlt,
     Wgc(wgc::WgcSession),
+    #[cfg(test)]
+    Script(Box<dyn FnMut(PxRect) -> Result<Frame, CaptureError> + Send>),
 }
 
 /// 一次识别任务的采集会话：后端 + 已用配额，`Drop` 时释放全部采集对象。
@@ -110,6 +112,8 @@ impl CaptureSession {
         match &mut self.backend {
             Backend::BitBlt => gdi::capture(rect),
             Backend::Wgc(session) => session.grab(rect),
+            #[cfg(test)]
+            Backend::Script(grab) => grab(rect),
         }
     }
 }
@@ -117,6 +121,20 @@ impl CaptureSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scripted_session(budget: u32) -> CaptureSession {
+        CaptureSession {
+            backend: Backend::Script(Box::new(|rect| Frame::new(
+                rect.w as u32,
+                rect.h as u32,
+                vec![255; (rect.w * rect.h * 4) as usize],
+                std::time::Instant::now(),
+            ))),
+            kind: CaptureBackend::BitBlt,
+            budget,
+            used: 0,
+        }
+    }
 
     fn tiny_rect() -> PxRect {
         PxRect {
@@ -137,8 +155,7 @@ mod tests {
 
     #[test]
     fn the_twenty_first_grab_is_rejected_by_the_budget() {
-        let mut session =
-            CaptureSession::new(CaptureBackend::BitBlt).expect("BitBlt 会话可建");
+        let mut session = scripted_session(FRAME_BUDGET);
         assert_eq!(session.budget(), FRAME_BUDGET);
         for round in 0..FRAME_BUDGET {
             session
@@ -164,8 +181,7 @@ mod tests {
 
     #[test]
     fn with_budget_enforces_custom_limit() {
-        let mut session =
-            CaptureSession::with_budget(CaptureBackend::BitBlt, 3).expect("BitBlt 会话可建");
+        let mut session = scripted_session(3);
         assert_eq!(session.budget(), 3);
         for _ in 0..3 {
             session.grab(tiny_rect()).expect("配额内应成功");
@@ -177,19 +193,30 @@ mod tests {
 
     #[test]
     fn a_new_session_starts_with_a_full_budget() {
-        let mut first =
-            CaptureSession::new(CaptureBackend::BitBlt).expect("BitBlt 会话可建");
+        let mut first = scripted_session(FRAME_BUDGET);
         first.grab(tiny_rect()).expect("抓取");
         assert_eq!(first.frames_taken(), 1);
         drop(first);
 
-        let second =
-            CaptureSession::new(CaptureBackend::BitBlt).expect("BitBlt 会话可建");
+        let second = scripted_session(FRAME_BUDGET);
         assert_eq!(second.frames_taken(), 0, "任务结束配额必须归零");
         assert_eq!(second.backend(), CaptureBackend::BitBlt);
     }
 
     #[test]
+    fn zero_budget_does_not_call_the_capture_backend() {
+        let mut session = CaptureSession {
+            backend: Backend::Script(Box::new(|_| panic!("零配额不能调用后端"))),
+            kind: CaptureBackend::Wgc,
+            budget: 0,
+            used: 0,
+        };
+        assert!(matches!(session.grab(tiny_rect()), Err(CaptureError::BudgetExceeded { limit: 0 })));
+        assert_eq!(session.frames_taken(), 0);
+    }
+
+    #[test]
+    #[ignore = "真实 WGC 抓屏；游戏运行期间禁止执行，须单独授权"]
     fn wgc_captures_a_real_frame_when_the_backend_is_available() {
         let mut session = match CaptureSession::new(CaptureBackend::Wgc) {
             Ok(session) => session,
@@ -211,6 +238,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "真实 WGC 初始化；游戏运行期间禁止执行，须单独授权"]
     fn wgc_session_initialises_or_reports_a_readable_hresult() {
         // 本机可能没有可用的 D3D11 适配器：两条分支都必须给出可定位的信息，且绝不回退 BitBlt。
         match CaptureSession::new(CaptureBackend::Wgc) {

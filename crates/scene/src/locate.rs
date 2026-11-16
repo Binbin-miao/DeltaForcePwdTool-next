@@ -1495,7 +1495,11 @@ fn runs(profile: &[u32], threshold: u32) -> Vec<(usize, usize)> {
     out
 }
 
-/// 从候选值里挑 4 个间距最均匀的（滑动窗口即可：非连续组合只会让间距更不均匀）。
+/// 从候选值里挑 4 个间距最均匀的。
+///
+/// **必须枚举组合，不能只看连续窗口**：实测 `drag_row3` 里亮线横段把第 2 根列切成
+/// 417/426/435 三片，真正的 4 列（285/426/577/728）在候选表里因此不连续 ——
+/// 只看 `windows(4)` 就只能全拒，报成 `GridColumns`，用户看到的是「横线台没反应」。
 ///
 /// 这是「4 列 / 4 行」的判据本体：不等距就说明数歪了（把标签或边框算成了列），
 /// 此时返回 `None`，调用方报错而不是猜。
@@ -1504,25 +1508,43 @@ fn most_even(values: &[i32], min_gap: i32) -> Option<[i32; 4]> {
         return None;
     }
     let mut best: Option<(f32, [i32; 4])> = None;
-    for window in values.windows(4) {
-        let gaps = [
-            window[1] - window[0],
-            window[2] - window[1],
-            window[3] - window[2],
-        ];
-        if gaps.iter().any(|&gap| gap < min_gap) {
-            continue;
-        }
-        let (low, high) = (
-            *gaps.iter().min().unwrap_or(&0),
-            *gaps.iter().max().unwrap_or(&0),
-        );
-        let spread = (high - low) as f32 / high as f32;
-        if spread > SPACING_SPREAD {
-            continue;
-        }
-        if best.is_none_or(|(current, _)| spread < current) {
-            best = Some((spread, [window[0], window[1], window[2], window[3]]));
+    let count = values.len();
+    // 四层枚举 + 逐层 min_gap 剪枝：候选表实测 10~20 个，剪枝后组合很少。
+    for a in 0..count - 3 {
+        for b in (a + 1)..count - 2 {
+            if values[b] - values[a] < min_gap {
+                continue;
+            }
+            for c in (b + 1)..count - 1 {
+                if values[c] - values[b] < min_gap {
+                    continue;
+                }
+                for d in (c + 1)..count {
+                    if values[d] - values[c] < min_gap {
+                        continue;
+                    }
+                    let gaps = [
+                        values[b] - values[a],
+                        values[c] - values[b],
+                        values[d] - values[c],
+                    ];
+                    let high = *gaps.iter().max().unwrap_or(&0);
+                    if high <= 0 {
+                        continue;
+                    }
+                    let low = *gaps.iter().min().unwrap_or(&0);
+                    let spread = (high - low) as f32 / high as f32;
+                    if spread > SPACING_SPREAD {
+                        continue;
+                    }
+                    if best.is_none_or(|(current, _)| spread < current) {
+                        best = Some((
+                            spread,
+                            [values[a], values[b], values[c], values[d]],
+                        ));
+                    }
+                }
+            }
         }
     }
     best.map(|(_, picked)| picked)
@@ -3343,18 +3365,33 @@ mod tests {
     }
 
     #[test]
-    fn a_split_column_peak_is_what_makes_the_evenness_check_give_up() {
+    fn a_split_column_peak_is_tolerated_by_combining_non_contiguous_candidates() {
         // `drag_row3` 实测候选（720p，探针 `diagnose_line_grid` 原样输出）：
         // 亮线横段压在档位条上，把第 2 根切成 417/426/435；真正的 4 列
-        // （285/426/577/728）因此在候选表里**不连续** —— `most_even` 只看连续窗口，
-        // 只能返回 None。这才是 `LocateError::GridColumns` 的真身，不是「屏幕上没有 4 列」。
+        // （285/426/577/728）因此在候选表里**不连续**。
+        // 旧实现只看连续窗口 ⇒ 只能返回 None ⇒ 报 `GridColumns` ⇒ 用户看到「横线台没反应」。
+        //
+        // 断言按「落在哪一根列」判，不钉死单个像素：第 1 根被切成 267/274/285 三片，
+        // 274 那组的间距反而更均匀（152/151/151），光凭候选表分不出谁是峰值 ——
+        // 但两者相隔 11px，都落在同一根列条内，点下去效果一样。
         let candidates = [
             138, 157, 184, 212, 228, 267, 274, 285, 417, 426, 435, 577, 728, 772, 785,
         ];
-        assert_eq!(most_even(&candidates, 89), None);
-        // 反证：把碎峰还原成一根（417/426/435 → 426）之后，同一份候选立刻定得出 4 列。
+        let picked = most_even(&candidates, 89).expect("碎峰不该让整张表判失败");
+        for (got, want) in picked.iter().zip([285, 426, 577, 728]) {
+            assert!(
+                (got - want).abs() <= 15,
+                "第 {} 列落到 {got}，离真列 {want} 超过 15px：{picked:?}",
+                want
+            );
+        }
+        // 碎峰还原成一根之后结论必须一致（否则说明是靠碎峰凑出来的）。
         let repaired = [138, 157, 184, 212, 228, 267, 274, 285, 426, 577, 728, 772, 785];
-        assert_eq!(most_even(&repaired, 89), Some([285, 426, 577, 728]));
+        assert_eq!(
+            most_even(&repaired, 89),
+            most_even(&candidates, 89),
+            "还原碎峰不该改变选出来的那 4 列"
+        );
     }
 
     // ── 行标签（左侧两位 0/1）──

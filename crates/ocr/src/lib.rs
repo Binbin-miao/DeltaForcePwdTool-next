@@ -246,6 +246,7 @@ mod tests {
 
     /// 可用性探测绝不能 panic —— 缺语言包的机器上必须安静地返回 false。
     #[test]
+    #[ignore = "真实 WinRT OCR 初始化；游戏运行期间禁止执行，须单独授权"]
     fn is_available_never_panics_and_is_cached() {
         let first = OcrEngine::is_available();
         let second = OcrEngine::is_available();
@@ -254,6 +255,7 @@ mod tests {
 
     /// 不存在的语言必须返回具名错误 `NoLanguage`，不得 panic 也不得静默成功。
     #[test]
+    #[ignore = "真实 WinRT OCR 初始化；游戏运行期间禁止执行，须单独授权"]
     fn unavailable_language_returns_named_error() {
         let error = OcrEngine::new_exact("zz-ZZ")
             .err()
@@ -266,6 +268,7 @@ mod tests {
 
     /// 换语言失败之后，默认引擎必须仍然可用（失败不得污染已有引擎）。
     #[test]
+    #[ignore = "真实 WinRT OCR 初始化；游戏运行期间禁止执行，须单独授权"]
     fn failed_switch_keeps_the_previous_engine_usable() {
         if !OcrEngine::is_available() {
             eprintln!("跳过：本机没有可用的 OCR 语言包");
@@ -289,6 +292,7 @@ mod tests {
     /// 因此这里只断言「跑通且不 panic」。字符级准确率需要真实游戏截图，属于 spec §4 的整体
     /// 验收门禁（t7/flow 层），不在 t6 的夹具能力范围内。
     #[test]
+    #[ignore = "真实 WinRT OCR 识别；游戏运行期间禁止执行，须单独授权"]
     fn recognizes_synthetic_frame_without_error() {
         if !OcrEngine::is_available() {
             eprintln!("跳过：本机没有可用的 OCR 语言包");
@@ -303,6 +307,7 @@ mod tests {
 
     /// 纯白帧必须能跑通而不报错（零字符也要正常返回空串）。
     #[test]
+    #[ignore = "真实 WinRT OCR 识别；游戏运行期间禁止执行，须单独授权"]
     fn blank_frame_returns_ok_when_engine_is_available() {
         if !OcrEngine::is_available() {
             eprintln!("跳过：本机没有可用的 OCR 语言包");

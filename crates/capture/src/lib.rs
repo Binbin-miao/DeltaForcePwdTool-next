@@ -255,6 +255,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "真实 DPI 系统集成；游戏运行期间禁止执行，须单独授权"]
     fn dpi_awareness_is_applied_once_and_stable() {
         let first = ensure_dpi_awareness();
         let second = ensure_dpi_awareness();

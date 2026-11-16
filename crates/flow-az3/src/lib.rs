@@ -572,7 +572,26 @@ mod tests {
 
     #[test]
     fn safe_timing_presses_once_per_pass_and_finishes_after_five_chars() {
-        // 游标每轮「先到最右格、再回中间格」→ 每轮恰好按一次，5 轮完成。
+        // 游标每轮「先到最右格、再回中间格」→ 每轮恰好按一次，5 轮完成；
+        // 末尾一帧整条带消失（面板关了）—— 这才是 `confirmed` 的证据。
+        let mut frames = Vec::new();
+        for _ in 0..5 {
+            frames.push(timing_frame(4));
+            frames.push(timing_frame(2));
+        }
+        frames.push(paint_frame(TARGET_W, TARGET_H, &[]));
+        let mut screen = ScriptScreen::new(frames);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::SafeTiming, &mut screen, &mut pointer);
+        assert!(outcome.is_done(), "{outcome:?}");
+        assert!(outcome.is_confirmed(), "面板已关闭 = 有终态证据：{outcome:?}");
+        assert_eq!(pointer.spaces, 5);
+    }
+
+    #[test]
+    fn safe_timing_five_presses_without_the_panel_closing_stay_unconfirmed() {
+        // 「我按了 5 下」不是证据：带子还在，就是没法确认（可能按错了、也可能没生效）。
+        // 反例：拿 hits 当完成 ⇒ 用户会看到一次假的「已解开」。
         let mut frames = Vec::new();
         for _ in 0..5 {
             frames.push(timing_frame(4));
@@ -581,7 +600,11 @@ mod tests {
         let mut screen = ScriptScreen::new(frames);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::SafeTiming, &mut screen, &mut pointer);
-        assert!(outcome.is_done(), "{outcome:?}");
+        assert!(outcome.is_done(), "按满 5 个仍然是「跑完了」，不是中断：{outcome:?}");
+        assert!(
+            !outcome.is_confirmed(),
+            "带子没消失就不能报确认完成：{outcome:?}"
+        );
         assert_eq!(pointer.spaces, 5);
     }
 
@@ -630,10 +653,11 @@ mod tests {
     }
 
     #[test]
-    fn safe_timing_stops_when_three_presses_never_move_the_cursor_off_center() {
-        // 误判界面：带是绿的、但「游标」每次都只在中格和读不到之间闪（游标提取在假带上必然抖）。
-        // 真面板每按一次游标必推进 ⇒ 从没见过「离开中间格」就是假带，连按 3 次后立刻停手。
-        // 反例：不判「离开」⇒ 会按满 5 次（空格 = 跳跃）才 Done ⇒ 红。
+    fn safe_timing_presses_at_most_once_when_the_cursor_only_ever_reads_as_center() {
+        // 误判界面：带是绿的，但「游标」只在中间格和读不到之间闪（游标提取在假带上必然抖）。
+        // 旧实现把「读不到」当成「离开中格」，于是同一个字连按 3 次才停手 —— 那 3 次全是
+        // 游戏里的**跳跃**。现在「读不清」既不算离开也不算进入 ⇒ 只可能按 1 次。
+        // 反例：拿 `None` 覆盖 `last_cell` ⇒ 这里会看到 3 次空格。
         let mut frames = Vec::new();
         for _ in 0..3 {
             frames.push(timing_frame(2)); // 中格
@@ -647,29 +671,93 @@ mod tests {
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::SafeTiming, &mut screen, &mut pointer);
         assert!(!outcome.is_done(), "{outcome:?}");
-        assert_eq!(pointer.spaces, 3, "第 3 次按键后必须停手：{outcome:?}");
+        assert_eq!(
+            pointer.spaces, 1,
+            "读不到游标不算「重新进入中格」，同一个字不许按第二次：{outcome:?}"
+        );
+        assert!(
+            abort_reason(&outcome).contains("已按 1/5"),
+            "收尾文案要写清只按了 1 次：{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn safe_timing_aborts_when_the_cursor_never_leaves_one_cell() {
+        // 假带（例如一条静态的绿条被当成了大保险）：游标读数一直卡在同一格、一动不扫。
+        // 真面板的游标逐格右移，绝不可能连续上百帧不换格 ⇒ 必须停手，而不是把空格当跳跃键按满。
+        let mut screen = ScriptScreen::new(vec![
+            timing_frame(2),
+            timing_frame(2),
+            timing_frame(2),
+        ]);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::SafeTiming, &mut screen, &mut pointer);
+        assert!(!outcome.is_done(), "{outcome:?}");
         assert!(
             abort_reason(&outcome).contains("疑似误判"),
             "文案要点明「疑似误判界面」：{outcome:?}"
         );
+        assert_eq!(pointer.spaces, 1, "只许按第一次：{outcome:?}");
     }
 
     // ── 任务保险（每帧量几何：轨道 + 目标方块 + 游标）──
 
+    /// 任务保险的开场：轨道先静止 3 帧（与 `pins.rs` 的 `PIN_STABLE_FRAMES` 同口径）。
+    ///
+    /// 真面板就是「镜头停下、板子定住」之后才开始对准的；测试照抄这个先后顺序，
+    /// 而不是把「已经稳住了」这件事偷偷当成默认前提。
+    fn settled_pins(offsets: &[i32], locked: usize) -> Vec<Frame> {
+        (0..3).map(|_| pins_frame(offsets, locked)).collect()
+    }
+
     #[test]
     fn safe_pins_presses_when_a_cursor_meets_its_target_and_finishes_all_locked() {
-        // 首帧 5 根游标都偏开 40px（预武装）→ 第二帧第 1 根压到目标上 ⇒ 按 1 次空格；
-        // 指示条随后 5 格全绿 ⇒ Done 且**有进度证据**。
-        let mut screen = ScriptScreen::new(vec![
-            pins_frame(&[40, 40, 40, 40, 40], 0),
-            pins_frame(&[0, 40, 40, 40, 40], 0),
-            pins_frame(&[0, 40, 40, 40, 40], 5),
-        ]);
+        // 轨道先静止 3 帧（镜头停稳）→ 5 根游标都偏开 40px（预武装）→ 第 1 根压到目标上
+        // ⇒ 按 1 次空格；指示条随后 5 格全绿 ⇒ Done 且**有进度证据**。
+        let mut frames = settled_pins(&[40; 5], 0);
+        frames.push(pins_frame(&[0, 40, 40, 40, 40], 0));
+        frames.push(pins_frame(&[0, 40, 40, 40, 40], 5));
+        let mut screen = ScriptScreen::new(frames);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
         assert!(outcome.is_done(), "{outcome:?}");
         assert!(outcome.is_confirmed(), "指示条 5 格全绿 = 有进度证据：{outcome:?}");
         assert_eq!(pointer.spaces, 1, "{outcome:?}");
+    }
+
+    #[test]
+    fn safe_pins_keeps_zero_input_while_the_frame_is_still_moving() {
+        // 跑图：镜头一直在推，整块场景（轨道 + 目标 + 游标）每帧横向滑 15px。
+        // 第 2 帧起第 1 根游标就「正好压在目标上」，但画面还在动 ⇒ 一格都不许按。
+        // 反例：只看「离开过容差区」⇒ 镜头推过去的那一下就会被当成对准，空格 = 跳跃。
+        let mut frames: Vec<Frame> = Vec::new();
+        for step in 0..10i32 {
+            let pan = step * 15;
+            let mut shapes = vec![(
+                PxRect {
+                    x: PINS_TRACK.x + pan,
+                    ..PINS_TRACK
+                },
+                TRACK_GREY,
+            )];
+            for (index, &center_x) in PIN_TARGET_XS.iter().enumerate() {
+                let x = center_x + pan;
+                shapes.push((rect(x - 5, 187, 10, 17), WHITE));
+                // 第 1 根游标先偏开 40px（预武装），之后每帧都压在目标上。
+                let offset = if index == 0 && step == 0 { 40 } else { 0 };
+                shapes.push((rect(x + offset - 2, 182, 5, 27), WHITE));
+            }
+            frames.push(paint_frame(PINS_W, PINS_H, &shapes));
+        }
+        let mut screen = ScriptScreen::new(frames);
+        let mut pointer = MockPointer::default();
+        let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
+        assert_eq!(
+            pointer.spaces, 0,
+            "画面还在推的时候一格都不许按：{outcome:?}"
+        );
+        assert_eq!(pointer.events, 0, "零输入：{outcome:?}");
+        assert!(!outcome.is_done(), "{outcome:?}");
     }
 
     #[test]
@@ -687,11 +775,10 @@ mod tests {
     fn safe_pins_judges_each_pair_independently() {
         // 只有第 1、4 根游标压在自己的目标上（其余仍偏开 40px）⇒ 同一帧只按这 2 对。
         // 反例：只盯「第一个未锁定槽」的旧实现会连按同一对，或对没对齐的也按。
-        let mut screen = ScriptScreen::new(vec![
-            pins_frame(&[40, 40, 40, 40, 40], 0),
-            pins_frame(&[0, 40, 40, 0, 40], 0),
-            pins_frame(&[0, 40, 40, 0, 40], 5),
-        ]);
+        let mut frames = settled_pins(&[40; 5], 0);
+        frames.push(pins_frame(&[0, 40, 40, 0, 40], 0));
+        frames.push(pins_frame(&[0, 40, 40, 0, 40], 5));
+        let mut screen = ScriptScreen::new(frames);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
         assert!(outcome.is_done(), "{outcome:?}");
@@ -701,10 +788,9 @@ mod tests {
     #[test]
     fn safe_pins_does_not_repeat_press_for_the_same_target() {
         // 预武装一次后游标一直压在目标上、指示条始终不亮 ⇒ 同一个目标只按一次。
-        let mut screen = ScriptScreen::new(vec![
-            pins_frame(&[40, 40, 40, 40, 40], 0),
-            pins_frame(&[0, 40, 40, 40, 40], 0),
-        ]);
+        let mut frames = settled_pins(&[40; 5], 0);
+        frames.push(pins_frame(&[0, 40, 40, 40, 40], 0));
+        let mut screen = ScriptScreen::new(frames);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
         assert_eq!(pointer.spaces, 1, "{outcome:?}");
@@ -758,15 +844,18 @@ mod tests {
         // 误判界面：每帧都有 1 对「对齐」，但指示条一格都不亮（真面板每按一次必然锁一格）。
         // 空格的游戏内语义是跳跃 —— 必须在第 5 次按键后**立刻**停手，而不是按到超时。
         // 反例：没有护栏一 ⇒ 一直按到 frame_budget（实测同款日志按了 17 / 48 次）⇒ 红。
-        let offsets: [&[i32]; 6] = [
-            &[40, 40, 40, 40, 40], // 全部先离开容差区（预武装）
+        // 轨道先静止 3 帧，之后每帧换一对「对齐」（真面板也是一路往下走，不会回头）。
+        let mut frames = settled_pins(&[40; 5], 0);
+        let steps: [&[i32]; 5] = [
             &[0, 40, 40, 40, 40],  // 第 1 次
             &[40, 0, 40, 40, 40],  // 第 2 次
             &[40, 40, 0, 40, 40],  // 第 3 次
             &[40, 40, 40, 0, 40],  // 第 4 次
             &[40, 40, 40, 40, 0],  // 第 5 次 → 立刻 Abort
         ];
-        let frames = offsets.iter().map(|offsets| pins_frame(offsets, 0)).collect();
+        for step in steps {
+            frames.push(pins_frame(step, 0));
+        }
         let mut screen = ScriptScreen::new(frames);
         let mut pointer = MockPointer::default();
         let outcome = run_with(Az3Kind::SafePins, &mut screen, &mut pointer);
@@ -784,7 +873,7 @@ mod tests {
         // 护栏二：指示条偶尔读到 1 格绿（护栏一因此不触发），按键次数仍必须被硬上限截断。
         // 5 根游标每轮全部对齐 ⇒ 一帧按 5 次；第 3 轮的第 1 次（第 11 次）越过上限就 Abort。
         // 反例：只写护栏一 ⇒ 这里会一直按到 frame_budget ⇒ 红。
-        let mut frames = vec![pins_frame(&[40, 40, 40, 40, 40], 1)];
+        let mut frames = settled_pins(&[40; 5], 1);
         for _ in 0..3 {
             frames.push(pins_frame(&[0, 0, 0, 0, 0], 1));
             frames.push(pins_frame(&[40, 40, 40, 40, 40], 1));

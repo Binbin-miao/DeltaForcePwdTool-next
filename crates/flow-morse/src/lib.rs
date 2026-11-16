@@ -43,9 +43,9 @@ pub const MORSE_CONFIRM_CLICK_INTERVAL_MS: u64 = 100;
 pub const MORSE_MAX_ATTEMPTS: u32 = 4;
 /// 错误态红像素下限（spec §0③：实测 1116~1121px，取 800 留余量）。
 const ERROR_RED_MIN_PX: u32 = 800;
-/// 敲一位之后先等这么久再看面板：红态实测持续 0.37s，等满 0.37s 还红才算错
-/// （单帧闪烁会被这一步筛掉，不需要连采两帧）。
-const KEY_SETTLE_MS: u64 = 370;
+// 这里原本有个 `KEY_SETTLE_MS = 370`：每敲一位都先硬等 0.37s 再看面板，
+// 三位就是 1.1s 的固定延迟（用户反馈「摩斯变慢了」的直接原因）。
+// 现在正常路径只用 `timings.key_interval_ms`（50ms），只有真的读到红态才进恢复流程。
 /// 等红态消退的上限（spec：≤400ms）。
 const RED_CLEAR_TIMEOUT_MS: u64 = 400;
 /// 等红态消退的轮询间隔。
@@ -91,8 +91,8 @@ pub fn is_error_state(panel: &Frame) -> bool {
 
 /// 已正确位的前缀长度 = 横条里**第一个「非绿」小格**的位置；全绿 = [`PANEL_SLOTS`]。
 ///
-/// 读不到（可辨小格 < 3）返回 `None` —— 调用方退回「按错误发生的那一位接力」，
-/// 绝不凭一个读不准的行去猜起点。
+/// 只要有一格读不准就返回 `None` —— 调用方据此**停手**，绝不拿「其余格都绿」
+/// 去推定一个满前缀（未知格跳过会让满前缀伪成立，进而误判成敲完了）。
 pub fn solved_prefix(panel: &Frame) -> Option<usize> {
     let slot_w = (panel.w as usize / PANEL_SLOTS).max(1) as i32;
     if slot_w < 2 || panel.h == 0 {
@@ -101,7 +101,7 @@ pub fn solved_prefix(panel: &Frame) -> Option<usize> {
     let states: Vec<Option<bool>> = (0..PANEL_SLOTS)
         .map(|index| slot_state(panel, index, slot_w))
         .collect();
-    if states.iter().filter(|state| state.is_some()).count() < PANEL_SLOTS - 2 {
+    if states.iter().any(|state| state.is_none()) {
         return None;
     }
     Some(
@@ -300,6 +300,10 @@ pub enum ConfirmSkipped {
     AutoClickDisabled,
     /// `confirm_clicks` 为空（spec 不变量 4）。
     NotConfigured,
+    /// 确认点击被输入层拒绝（UIPI 等）：点了但没生效。
+    Failed,
+    /// 确认点击过程中被取消。
+    Canceled,
 }
 
 impl ConfirmSkipped {
@@ -308,6 +312,8 @@ impl ConfirmSkipped {
             ConfirmSkipped::DigitsFailed => "存在识别失败的数字，跳过确认点击",
             ConfirmSkipped::AutoClickDisabled => "自动点击已禁用，请手动点击",
             ConfirmSkipped::NotConfigured => "未配置确认点击坐标",
+            ConfirmSkipped::Failed => "确认点击失败，可能未生效",
+            ConfirmSkipped::Canceled => "已取消，确认点击未完成",
         }
     }
 }
@@ -328,6 +334,8 @@ pub struct MorseOutcome {
     pub attempts: u32,
     /// 数字是否全部敲对（解码成功 ≠ 敲对：输错 4 次就停手）。
     pub input_complete: bool,
+    /// 确认点击是否真的失败过（点了但注入被拒/中途取消）。`true` 时不得算成功。
+    pub confirm_failed: bool,
 }
 
 impl MorseOutcome {
@@ -336,9 +344,12 @@ impl MorseOutcome {
         !self.cells.is_empty() && self.cells.iter().all(|cell| cell.digit.is_some())
     }
 
-    /// 这一轮是否真的成功（解码出全部数字 **且** 全部敲对）。
+    /// 这一轮是否真的成功（解码出全部数字 **且** 全部敲对 **且** 确认没失败）。
+    ///
+    /// 自动点击关掉时 `confirm_clicked` 本来就是 `false`，那是用户选择而非失败，
+    /// 所以这里看的是 `confirm_failed`（真的点过并且失败）。
     pub fn is_complete(&self) -> bool {
-        self.digits_complete() && self.input_complete
+        self.digits_complete() && self.input_complete && !self.confirm_failed
     }
 }
 
@@ -374,25 +385,31 @@ pub fn run<S: ScreenSource, I: InputSink>(
     };
     let mut resume = 0usize;
     let mut attempts = 0u32;
-    let mut cancelled = false;
+    let mut stopped = false;
     while resume < cells.len() && attempts < MORSE_MAX_ATTEMPTS {
         if cancel.load(Ordering::SeqCst) {
-            cancelled = true;
-            log.errors.push("已取消（接力中断）".to_owned());
+            log.errors.push("已取消（未开始输入）".to_owned());
+            stopped = true;
             break;
         }
         attempts += 1;
-        resume = press_relay(source, sink, job, &cells, resume, &mut log);
+        let relay = press_relay(source, sink, job, &cells, resume, &mut log, cancel);
+        resume = relay.resume;
+        if relay.stopped {
+            stopped = true;
+            break;
+        }
     }
     // 「敲完」不等于「敲对」：注入被拦截（UIPI）时也必须算没完成。
-    let input_complete = resume >= cells.len() && log.ok;
-    // 「还有位没补上」才是连续输错；注入被拦截是另一码事（已经逐条记进 errors）。
-    if resume < cells.len() && !cancelled {
+    let input_complete = !stopped && resume >= cells.len() && log.ok;
+    // 「还有位没补上」才是连续输错；停手/取消另有原因，不混成这一条。
+    if !stopped && resume < cells.len() {
         log.errors
             .push(format!("摩斯连续 {MORSE_MAX_ATTEMPTS} 次不正确，已停手"));
     }
 
-    let (confirm_clicked, skipped) = confirm(sink, job, &cells, input_complete, &mut log.errors);
+    let (confirm_clicked, skipped, confirm_failed) =
+        confirm(sink, job, &cells, input_complete, cancel, &mut log.errors);
     MorseOutcome {
         cells,
         password,
@@ -402,6 +419,7 @@ pub fn run<S: ScreenSource, I: InputSink>(
         errors: log.errors,
         attempts,
         input_complete,
+        confirm_failed,
     }
 }
 
@@ -435,7 +453,34 @@ struct PressLog {
     ok: bool,
 }
 
-/// 从 `resume` 起逐位敲，输错就等红态消退并算出新的起点（接力）。返回下一轮起点。
+/// 面板一次取样的结论。
+enum PanelView {
+    /// 正常（没转红）。
+    Clear,
+    /// 整片转红 = 刚敲的那一位被游戏判错。
+    Error,
+    /// 读不到（抓帧失败）—— 不算正常，也不算红态。
+    Unreadable,
+}
+
+fn look_panel<S: ScreenSource>(source: &mut S, job: &MorseRun<'_>) -> PanelView {
+    match grab_panel(source, job) {
+        Some(panel) if is_error_state(&panel) => PanelView::Error,
+        Some(_) => PanelView::Clear,
+        None => PanelView::Unreadable,
+    }
+}
+
+/// 一轮接力的结果。
+struct Relay {
+    /// 下一次从这里继续敲。
+    resume: usize,
+    /// 是否安全停手（取消 / 输入被拒 / 面板读不到 / 红态没退 / 前缀读不清）。
+    /// 停手后**不再**补敲任何位，也不猜位置。
+    stopped: bool,
+}
+
+/// 从 `resume` 起逐位敲，输错就等红态消退并算出新的起点（接力）。
 fn press_relay<S: ScreenSource, I: InputSink>(
     source: &mut S,
     sink: &mut I,
@@ -443,19 +488,29 @@ fn press_relay<S: ScreenSource, I: InputSink>(
     cells: &[CellDecode],
     resume: usize,
     log: &mut PressLog,
-) -> usize {
+    cancel: &AtomicBool,
+) -> Relay {
     let mut index = resume;
     while index < cells.len() {
+        if cancel.load(Ordering::SeqCst) {
+            log.errors.push("已取消（输入中断）".to_owned());
+            return Relay {
+                resume: index,
+                stopped: true,
+            };
+        }
         let Some(digit) = cells[index].digit else {
             // 没解出数字的位不敲（保持非对称副作用：能敲的照敲）。
             index += 1;
             continue;
         };
         if let Err(reason) = sink.press_digit(digit) {
-            log.errors.push(format!("按下 {digit} 失败：{reason}"));
+            log.errors.push(format!("按下 {digit} 失败：{reason}，已停手"));
             log.ok = false;
-            index += 1;
-            continue;
+            return Relay {
+                resume: index,
+                stopped: true,
+            };
         }
         log.pressed.push(digit);
         if !watches_panel(job) {
@@ -463,25 +518,53 @@ fn press_relay<S: ScreenSource, I: InputSink>(
             index += 1;
             continue;
         }
-        // 等满 0.37s 再看：单帧闪烁的红会被这一步筛掉。
-        sink.sleep_ms(KEY_SETTLE_MS);
-        let Some(panel) = grab_panel(source, job) else {
-            index += 1;
-            continue;
-        };
-        if !is_error_state(&panel) {
-            index += 1;
-            continue;
+        // 正常节奏 = 配置的数字间隔（50ms）；不再每位固定等 370ms 看红。
+        sink.sleep_ms(job.timings.key_interval_ms);
+        match look_panel(source, job) {
+            PanelView::Clear => {
+                index += 1;
+                continue;
+            }
+            PanelView::Unreadable => {
+                log.errors.push("按下后读不到输入面板，已停手".to_owned());
+                return Relay {
+                    resume: index,
+                    stopped: true,
+                };
+            }
+            PanelView::Error => {}
         }
         log.errors
             .push(format!("第 {} 位输错（面板转红），接力补位", index + 1));
-        wait_red_clear(source, sink, job);
-        // 接力起点 = 重读面板得到的「第一个非绿小格」；读不到就按「这一位错了」算。
+        if !wait_red_clear(source, sink, job) {
+            log.errors
+                .push("红态未消退或读不到面板，已停手（不猜、不重打）".to_owned());
+            return Relay {
+                resume: index,
+                stopped: true,
+            };
+        }
+        // 接力起点 = 重读面板得到的「第一个非绿小格」；读不清就停手。
         // 视觉只能**往前**推，绝不能退回到已经敲对的位（退了就会重复追加数字）。
-        let seen = grab_panel(source, job).and_then(|panel| solved_prefix(&panel));
-        return seen.map_or(index, |prefix| index.max(prefix).min(cells.len()));
+        let Some(prefix) = grab_panel(source, job).and_then(|panel| solved_prefix(&panel)) else {
+            log.errors
+                .push("已正确位读不清，已停手（不猜、不重打）".to_owned());
+            return Relay {
+                resume: index,
+                stopped: true,
+            };
+        };
+        index = index.max(prefix).min(cells.len());
+        // 一次输错 = 一轮接力的结束（`attempts` 就是这么数的）。
+        return Relay {
+            resume: index,
+            stopped: false,
+        };
     }
-    index
+    Relay {
+        resume: index,
+        stopped: false,
+    }
 }
 
 /// 是否观察面板（未标定 ROI 时保持旧行为，不做错误态判断）。
@@ -493,47 +576,64 @@ fn grab_panel<S: ScreenSource>(source: &mut S, job: &MorseRun<'_>) -> Option<Fra
     watches_panel(job).then(|| source.grab(job.panel).ok()).flatten()
 }
 
-/// 等红态消退：最多 [`RED_CLEAR_TIMEOUT_MS`]；读不到面板也算消退（不无限等）。
-fn wait_red_clear<S: ScreenSource, I: InputSink>(source: &mut S, sink: &mut I, job: &MorseRun<'_>) {
+/// 等红态消退：最多 [`RED_CLEAR_TIMEOUT_MS`]。
+///
+/// 返回 `false` 的两种都算「没恢复」：超时仍红、或中途读不到面板。
+/// 读不到**不等于**消退（旧实现把它当消退，等于拿失败当成功）。
+fn wait_red_clear<S: ScreenSource, I: InputSink>(
+    source: &mut S,
+    sink: &mut I,
+    job: &MorseRun<'_>,
+) -> bool {
     let mut waited = 0u64;
     while waited < RED_CLEAR_TIMEOUT_MS {
         sink.sleep_ms(RED_POLL_MS);
         waited += RED_POLL_MS;
-        match grab_panel(source, job) {
-            Some(panel) if is_error_state(&panel) => continue,
-            _ => return,
+        match look_panel(source, job) {
+            PanelView::Error => continue,
+            PanelView::Clear => return true,
+            PanelView::Unreadable => return false,
         }
     }
+    false
 }
 
 /// 确认点击（spec 不变量 4/5 原样保留：只有「数字全解出 + 全部敲对」才点）。
+///
+/// 返回值第三项 `failed`：真的点了但被拒绝 / 中途取消 —— 这种情况**不能**算确认成功。
 fn confirm<I: InputSink>(
     sink: &mut I,
     job: &MorseRun<'_>,
     cells: &[CellDecode],
     input_complete: bool,
+    cancel: &AtomicBool,
     errors: &mut Vec<String>,
-) -> (bool, Option<ConfirmSkipped>) {
+) -> (bool, Option<ConfirmSkipped>, bool) {
     let all_pressed = input_complete && !cells.is_empty();
     if !job.auto_click {
-        return (false, Some(ConfirmSkipped::AutoClickDisabled));
+        return (false, Some(ConfirmSkipped::AutoClickDisabled), false);
     }
     if !(all_pressed && cells.iter().all(|cell| cell.digit.is_some())) {
-        return (false, Some(ConfirmSkipped::DigitsFailed));
+        return (false, Some(ConfirmSkipped::DigitsFailed), false);
     }
     if job.view.confirm_clicks.is_empty() {
-        return (false, Some(ConfirmSkipped::NotConfigured));
+        return (false, Some(ConfirmSkipped::NotConfigured), false);
     }
     sink.sleep_ms(job.timings.morse_after_input_ms);
     for (index, point) in job.view.confirm_clicks.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            errors.push("已取消（确认点击中断）".to_owned());
+            return (false, Some(ConfirmSkipped::Canceled), true);
+        }
         if index > 0 {
             sink.sleep_ms(MORSE_CONFIRM_CLICK_INTERVAL_MS);
         }
         if let Err(reason) = sink.click(*point) {
             errors.push(format!("确认点击失败：{reason}"));
+            return (false, Some(ConfirmSkipped::Failed), true);
         }
     }
-    (true, None)
+    (true, None, false)
 }
 
 impl fmt::Display for MorseOutcome {
@@ -554,6 +654,7 @@ mod tests {
     use delta_geom::{MonitorInfo, PxRect};
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use std::time::Instant;
 
     const W: u32 = 400;
@@ -669,6 +770,9 @@ mod tests {
     struct Recorder {
         events: Vec<Event>,
         fail_press: bool,
+        fail_click: bool,
+        /// 敲下第一个数字时把 cancel 置位（模拟用户中途取消）。
+        cancel_on_press: Option<Arc<AtomicBool>>,
     }
 
     impl Recorder {
@@ -676,6 +780,8 @@ mod tests {
             Self {
                 events: Vec::new(),
                 fail_press: false,
+                fail_click: false,
+                cancel_on_press: None,
             }
         }
     }
@@ -686,10 +792,16 @@ mod tests {
                 return Err("UIPI 拦截".to_string());
             }
             self.events.push(Event::Press(digit));
+            if let Some(flag) = &self.cancel_on_press {
+                flag.store(true, Ordering::SeqCst);
+            }
             Ok(())
         }
 
         fn click(&mut self, at: PxPoint) -> Result<(), String> {
+            if self.fail_click {
+                return Err("UIPI 拦截".to_string());
+            }
             self.events.push(Event::Click(at));
             Ok(())
         }
@@ -1050,7 +1162,12 @@ mod tests {
         );
 
         assert!(outcome.pressed.is_empty());
-        assert_eq!(outcome.errors.len(), 3, "{:?}", outcome.errors);
+        assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+        assert!(
+            outcome.errors[0].contains("已停手"),
+            "输入被拒必须立即停手，不再继续敲后面的位：{:?}",
+            outcome.errors
+        );
         assert!(!outcome.confirm_clicked, "敲键失败时不得再点确认");
         assert_eq!(outcome.skipped, Some(ConfirmSkipped::DigitsFailed));
     }
@@ -1219,9 +1336,16 @@ mod tests {
 
     #[test]
     fn relay_stops_after_four_failed_attempts() {
-        // 面板一直红：4 次之后必须停手，不许无限重试。
+        // 每轮：敲 4 → 面板转红 → 红消退 → 前缀仍是 0 绿 ⇒ 重敲这一位。
+        // 四轮之后必须停手，不许无限重试。
+        let mut script = Vec::new();
+        for _ in 0..MORSE_MAX_ATTEMPTS {
+            script.push(panel_image(0, true)); // 敲完就读到红
+            script.push(panel_image(0, false)); // 红消退
+            script.push(panel_image(0, false)); // 重读前缀：0 绿 ⇒ 这一位重敲
+        }
         let view = view_with(CELLS, vec![PxPoint { x: 300, y: 240 }]);
-        let mut screen = RelayScreen::new(vec![panel_image(0, true)])
+        let mut screen = RelayScreen::new(script)
             .with_cell(20, 80, morse_frame("....-"))
             .with_cell(20, 140, morse_frame("..---"))
             .with_cell(20, 200, morse_frame("--..."));
@@ -1245,7 +1369,7 @@ mod tests {
 
     #[test]
     fn relay_is_skipped_entirely_without_a_panel_roi() {
-        // 未标定面板 ⇒ 保持旧行为：一次敲完、一次尝试。
+        // 未标定面板（零面积 ROI）⇒ 保持旧行为：一次敲完、一次尝试。
         let view = view_with(CELLS, vec![PxPoint { x: 300, y: 240 }]);
         let mut screen = FakeScreen::new()
             .with(20, 80, morse_frame("....-"))
@@ -1253,10 +1377,190 @@ mod tests {
             .with(20, 200, morse_frame("--..."));
         let mut sink = Recorder::new();
         let timings = timings();
-        let job = relay_job(&view, &timings, true);
+        let job = MorseRun {
+            view: &view,
+            timings: &timings,
+            auto_click: true,
+            panel: PxRect::ZERO,
+        };
         let outcome = exec(&mut screen, &mut sink, &job);
         assert_eq!(outcome.attempts, 1);
         assert_eq!(outcome.pressed, vec![4, 2, 7]);
         assert!(outcome.is_complete());
+    }
+
+    // ── 速度 / 停手边界（spec §5.2 第 3 条）──
+
+    /// 第 `bad` 格涂成亮灰：既不绿也不暗 ⇒ `slot_state` 读不准（`None`）。
+    fn panel_with_unreadable_slot(bad: usize, green_slots: usize) -> Frame {
+        let (w, h) = (PANEL_ROI.w as u32, PANEL_ROI.h as u32);
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        let slot_w = w / PANEL_SLOTS as u32;
+        for slot in 0..PANEL_SLOTS {
+            let s = slot as u32;
+            let rgb = if slot == bad {
+                [150u8, 150, 150]
+            } else if slot < green_slots {
+                [60u8, 210, 80]
+            } else {
+                [40u8, 42, 44]
+            };
+            for y in 0..h {
+                for x in (s * slot_w + 2)..((s + 1) * slot_w - 2) {
+                    let index = ((y * w + x) * 4) as usize;
+                    data[index] = rgb[2];
+                    data[index + 1] = rgb[1];
+                    data[index + 2] = rgb[0];
+                    data[index + 3] = 255;
+                }
+            }
+        }
+        Frame::new(w, h, data, Instant::now()).expect("合成面板帧")
+    }
+
+    #[test]
+    fn one_unreadable_slot_does_not_count_as_a_full_prefix() {
+        // 4 格全绿、只有第 4 格读不准：绝不能因此推定「5 格都绿 = 敲完了」。
+        assert_eq!(solved_prefix(&panel_with_unreadable_slot(3, 4)), None);
+    }
+
+    #[test]
+    fn normal_path_keeps_the_fifty_ms_cadence() {
+        let view = view_with(
+            CELLS,
+            vec![PxPoint { x: 300, y: 240 }, PxPoint { x: 320, y: 240 }],
+        );
+        let mut screen = RelayScreen::new(vec![
+            panel_image(0, false),
+            panel_image(1, false),
+            panel_image(2, false),
+        ])
+        .with_cell(20, 80, morse_frame("....-"))
+        .with_cell(20, 140, morse_frame("..---"))
+        .with_cell(20, 200, morse_frame("--..."));
+        let mut sink = Recorder::new();
+        let timings = timings();
+        let job = relay_job(&view, &timings, true);
+
+        let outcome = run(&mut screen, &mut sink, &job, &AtomicBool::new(false));
+
+        assert!(outcome.is_complete(), "{:?}", outcome.errors);
+        let sleeps: Vec<u64> = sink
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Sleep(ms) => Some(*ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sleeps,
+            vec![7, 7, 7, 11, MORSE_CONFIRM_CLICK_INTERVAL_MS],
+            "正常路径只有数字间隔（测试配成 7ms），不许再出现每位 370ms 硬等"
+        );
+    }
+
+    #[test]
+    fn red_that_never_clears_stops_immediately() {
+        let view = view_with(CELLS, vec![PxPoint { x: 300, y: 240 }]);
+        let mut screen = RelayScreen::new(vec![panel_image(0, true)])
+            .with_cell(20, 80, morse_frame("....-"))
+            .with_cell(20, 140, morse_frame("..---"))
+            .with_cell(20, 200, morse_frame("--..."));
+        let mut sink = Recorder::new();
+        let timings = timings();
+        let job = relay_job(&view, &timings, true);
+
+        let outcome = run(&mut screen, &mut sink, &job, &AtomicBool::new(false));
+
+        assert_eq!(outcome.attempts, 1, "红态 400ms 没消退就该停手，不再补敲");
+        assert_eq!(outcome.pressed, vec![4]);
+        assert!(!outcome.input_complete);
+        assert!(outcome
+            .errors
+            .iter()
+            .any(|error| error.contains("红态未消退")));
+        assert!(clicks(&sink.events).is_empty());
+    }
+
+    #[test]
+    fn unreadable_prefix_stops_instead_of_blind_retry() {
+        let uniform = Frame::new(
+            PANEL_ROI.w as u32,
+            PANEL_ROI.h as u32,
+            vec![128u8; (PANEL_ROI.w * PANEL_ROI.h * 4) as usize],
+            Instant::now(),
+        )
+        .expect("合成帧");
+        let view = view_with(CELLS, vec![PxPoint { x: 300, y: 240 }]);
+        let mut screen = RelayScreen::new(vec![
+            panel_image(0, true),  // 敲完读到红
+            panel_image(0, false), // 红消退
+            uniform,               // 前缀读不清
+        ])
+        .with_cell(20, 80, morse_frame("....-"))
+        .with_cell(20, 140, morse_frame("..---"))
+        .with_cell(20, 200, morse_frame("--..."));
+        let mut sink = Recorder::new();
+        let timings = timings();
+        let job = relay_job(&view, &timings, true);
+
+        let outcome = run(&mut screen, &mut sink, &job, &AtomicBool::new(false));
+
+        assert_eq!(outcome.attempts, 1);
+        assert_eq!(outcome.pressed, vec![4], "读不清就不许再敲，也不许退回重打 4");
+        assert!(outcome.errors.iter().any(|error| error.contains("读不清")));
+        assert!(clicks(&sink.events).is_empty());
+    }
+
+    #[test]
+    fn cancel_during_input_stops_further_digits() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let view = view_with(CELLS, vec![PxPoint { x: 300, y: 240 }]);
+        let mut screen = RelayScreen::new(vec![panel_image(0, false)])
+            .with_cell(20, 80, morse_frame("....-"))
+            .with_cell(20, 140, morse_frame("..---"))
+            .with_cell(20, 200, morse_frame("--..."));
+        let mut sink = Recorder::new();
+        sink.cancel_on_press = Some(Arc::clone(&flag));
+        let timings = timings();
+        let job = relay_job(&view, &timings, true);
+
+        let outcome = run(&mut screen, &mut sink, &job, &flag);
+
+        assert_eq!(outcome.pressed, vec![4], "取消之后不许再敲 2 和 7");
+        assert!(!outcome.input_complete);
+        assert!(outcome.errors.iter().any(|error| error.contains("已取消")));
+        assert!(clicks(&sink.events).is_empty());
+    }
+
+    #[test]
+    fn confirm_click_failure_is_not_reported_as_success() {
+        let view = view_with(CELLS, vec![PxPoint { x: 300, y: 240 }]);
+        let mut screen = FakeScreen::new()
+            .with(20, 80, morse_frame("....-"))
+            .with(20, 140, morse_frame("..---"))
+            .with(20, 200, morse_frame("--..."));
+        let mut sink = Recorder::new();
+        sink.fail_click = true;
+        let timings = timings();
+        let job = MorseRun {
+            view: &view,
+            timings: &timings,
+            auto_click: true,
+            panel: PxRect::ZERO,
+        };
+
+        let outcome = exec(&mut screen, &mut sink, &job);
+
+        assert!(outcome.input_complete, "数字本身是敲对的");
+        assert!(!outcome.confirm_clicked, "点击被拒不能算点过");
+        assert_eq!(outcome.skipped, Some(ConfirmSkipped::Failed));
+        assert!(outcome.confirm_failed);
+        assert!(!outcome.is_complete(), "确认失败不得显示成功");
+        assert!(outcome
+            .errors
+            .iter()
+            .any(|error| error.contains("确认点击失败")));
     }
 }

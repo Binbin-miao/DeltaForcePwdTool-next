@@ -81,7 +81,20 @@ impl DeltaApp {
         let state = initial_state(&config, monitor);
         let config = Arc::new(Mutex::new(config));
         let worker = Worker::spawn(config.clone(), monitor);
-        let mut app = Self {
+        let mut app = Self::assemble(monitor, config, config_path, state, worker);
+        // 配置说开着就当场装上（装不上只留痕，绝不因为钩子失败而不给启动）。
+        app.sync_key_hook();
+        app
+    }
+
+    fn assemble(
+        monitor: MonitorInfo,
+        config: Arc<Mutex<Config>>,
+        config_path: PathBuf,
+        state: UiState,
+        worker: Worker,
+    ) -> Self {
+        Self {
             state,
             wizard: None,
             settings_open: false,
@@ -97,10 +110,7 @@ impl DeltaApp {
             key_hook: None,
             applied_theme: None,
             wake_handed: false,
-        };
-        // 配置说开着就当场装上（装不上只留痕，绝不因为钩子失败而不给启动）。
-        app.sync_key_hook();
-        app
+        }
     }
 
     /// 当前配置快照。
@@ -1296,15 +1306,39 @@ mod tests {
 
     /// 只为本文件用例准备一个临时配置文件的 app（默认不装 F 键钩子：
     /// 全局钩子会监听真实按键，与"开关落盘"这个用例无关）。
+    fn task_scratch_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        assert!(tag.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-'));
+        let parent = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/astra-recovery");
+        let metadata = std::fs::symlink_metadata(&parent).expect("受控 .scratch 必须存在");
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("任务时间戳")
+            .as_nanos();
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = parent.join(format!("astra-offline-app-{tag}-{}-{stamp}-{id}", std::process::id()));
+        std::fs::create_dir(&dir).expect("任务专有目录必须新建成功，禁止复用既有目录");
+        dir
+    }
+
     fn app_with_temp_config(tag: &str) -> DeltaApp {
-        let dir = std::env::temp_dir().join(format!("delta-app-{tag}-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = task_scratch_dir(tag);
         let config = Config {
             monitor: monitor(1920, 1080),
             f_key_hook_enabled: false,
             ..Config::default()
         };
-        DeltaApp::new(config.monitor, config, dir.join("settings.json"))
+        let state = initial_state(&config, config.monitor);
+        DeltaApp::assemble(
+            config.monitor,
+            Arc::new(Mutex::new(config)),
+            dir.join("settings.json"),
+            state,
+            Worker::offline(),
+        )
     }
 
     #[test]
@@ -1383,11 +1417,25 @@ mod tests {
         assert!(saved.flows.get(delta_config::Flow::Az3Line), "重新打开必须写回");
     }
 
+    #[test]
+    fn all_seven_flow_switches_persist_independently_without_workers() {
+        for off in delta_ui::FlowId::ALL {
+            let mut app = app_with_temp_config(&format!("seven-flows-{}", off.index()));
+            assert!(app.key_hook.is_none());
+            app.state.toggles.toggle_flow(off);
+            app.sync_flows();
+            let saved = delta_config::load(&app.config_path).expect("临时配置").config;
+            for flow in delta_config::Flow::ALL {
+                assert_eq!(saved.flows.get(flow), flow.index() != off.index());
+            }
+        }
+    }
+
     /// 没有差异时不许写盘：主视图每帧都会调 `sync_flows`，它不能变成「每帧写一次配置」。
     #[test]
     fn syncing_flows_without_a_change_never_touches_the_disk() {
         let mut app = app_with_temp_config("flow-noop");
-        let _ = std::fs::remove_file(&app.config_path);
+        assert!(!app.config_path.exists(), "新任务目录不应含既有配置");
         app.sync_flows();
         assert!(
             !app.config_path.exists(),
@@ -1462,6 +1510,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "真实窗口抓屏探针；游戏运行期间禁止执行，须单独授权"]
     fn capture_probe_grabs_one_frame_or_reports_a_readable_error() {
         // 真机探针（spec D5 验收：点一次 → 一帧 → 宽×高 + 缩略图）。
         // 没有可用 D3D11 适配器时只要求错误可读，绝不静默回退。
@@ -1558,13 +1607,7 @@ mod tests {
 
     /// 落盘测试专用临时目录。
     fn cells_scratch_dir(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "delta-pwd-cells-{tag}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("临时目录可建");
-        root
+        task_scratch_dir(tag)
     }
 
     /// 九格样本：每格尺寸与像素值都不同，读回时才能分辨「串格」与「整片同值」。
@@ -1615,7 +1658,6 @@ mod tests {
             write_cell_png(&root.join("no-such-dir/2.png"), &gray).is_err(),
             "父目录不存在时必须返回错误，不能静默吞掉"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1649,7 +1691,6 @@ mod tests {
                 "失败清场必须删掉本次写的 .tmp"
             );
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1683,7 +1724,8 @@ mod tests {
     }
 
     #[test]
-    fn template_cells_share_one_capture_session() {
+    #[ignore = "真实 WGC 会话；游戏运行期间禁止执行，须单独授权"]
+    fn live_template_cells_share_one_capture_session() {
         // 跑**产品默认后端**（Wgc），不是兼容档：真机上九格如果各建一次会话，
         // `frames_taken()` 只会是 1；一个会话抓满九格才等于九 —— 这就是
         // 「只初始化一次 D3D11」的可观测证据。
@@ -1717,6 +1759,27 @@ mod tests {
         );
         for (_, frame) in &captured.frames {
             assert_eq!(frame.luma().as_slice().len(), (frame.w * frame.h) as usize);
+        }
+    }
+
+    #[test]
+    fn template_cells_share_one_capture_session() {
+        let boxes = delta_config::builtin::candidate_boxes();
+        let mut captures = 0;
+        let captured = capture_cells(&boxes, monitor(2560, 1440), |rect| {
+            captures += 1;
+            delta_capture::Frame::new(
+                rect.w as u32,
+                rect.h as u32,
+                vec![captures as u8; (rect.w * rect.h * 4) as usize],
+                Instant::now(),
+            ).map_err(|error| error.to_string())
+        });
+        assert_eq!(captures, 9);
+        assert_eq!(captured.frames.len(), 9);
+        assert_eq!(captured.failed, Vec::<usize>::new());
+        for (index, frame) in captured.frames {
+            assert_eq!(frame.data[0], (index + 1) as u8);
         }
     }
 

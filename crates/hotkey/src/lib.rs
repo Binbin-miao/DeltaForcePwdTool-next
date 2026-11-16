@@ -118,11 +118,20 @@ enum Command {
     },
 }
 
+enum Endpoint {
+    Thread(u32),
+    #[cfg(test)]
+    Offline {
+        occupied: Arc<Mutex<BTreeMap<Hotkey, u32>>>,
+        events: Sender<HotkeyEvent>,
+    },
+}
+
 /// 热键注册器。`Drop` 会自动注销全部热键并结束消息泵线程。
 pub struct Hotkeys {
     pending: Arc<Mutex<Vec<Command>>>,
     events: Receiver<HotkeyEvent>,
-    thread_id: u32,
+    endpoint: Endpoint,
     registered: Arc<Mutex<BTreeMap<u32, Hotkey>>>,
     join: Option<JoinHandle<()>>,
 }
@@ -148,7 +157,7 @@ impl Hotkeys {
         Ok(Self {
             pending,
             events,
-            thread_id,
+            endpoint: Endpoint::Thread(thread_id),
             registered,
             join: Some(join),
         })
@@ -226,9 +235,18 @@ impl Hotkeys {
     /// 这是给自动化测试用的通道：真实热键需要人按键盘，无法在 CI 里复现，
     /// 而消息泵本身的行为（查找 + 派发）与真实触发完全一致。
     pub fn simulate_trigger(&self, id: u32) -> Result<(), HotkeyError> {
+        #[cfg(test)]
+        if let Endpoint::Offline { events, .. } = &self.endpoint {
+            return dispatch_hotkey(&self.registered, events, id);
+        }
+        let thread_id = match &self.endpoint {
+            Endpoint::Thread(id) => *id,
+            #[cfg(test)]
+            Endpoint::Offline { .. } => unreachable!("offline endpoint handled above"),
+        };
         // SAFETY: 线程 id 由消息泵线程自己上报，投递失败会返回错误。
         unsafe {
-            PostThreadMessageW(self.thread_id, WM_HOTKEY, WPARAM(id as usize), LPARAM(0))
+            PostThreadMessageW(thread_id, WM_HOTKEY, WPARAM(id as usize), LPARAM(0))
         }
         .map_err(|error| HotkeyError::RegisterFailed {
             vk: 0,
@@ -237,12 +255,36 @@ impl Hotkeys {
     }
 
     fn enqueue(&self, command: Command) -> Result<(), HotkeyError> {
+        #[cfg(test)]
+        if let Endpoint::Offline { occupied, .. } = &self.endpoint {
+            serve_command(command, &self.registered, |id, hotkey| {
+                let mut slots = occupied.lock().unwrap_or_else(|poison| poison.into_inner());
+                if slots.contains_key(&hotkey) {
+                    return Err(HotkeyError::RegisterFailed { vk: hotkey.vk, code: 1409 });
+                }
+                slots.insert(hotkey, id);
+                Ok(())
+            }, |id| {
+                let hotkey = self.registered.lock().unwrap_or_else(|poison| poison.into_inner())
+                    .get(&id).copied();
+                if let Some(hotkey) = hotkey {
+                    occupied.lock().unwrap_or_else(|poison| poison.into_inner()).remove(&hotkey);
+                }
+                Ok(())
+            });
+            return Ok(());
+        }
+        let thread_id = match &self.endpoint {
+            Endpoint::Thread(id) => *id,
+            #[cfg(test)]
+            Endpoint::Offline { .. } => unreachable!("offline endpoint handled above"),
+        };
         self.pending
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .push(command);
         // SAFETY: 线程 id 有效；投递失败代表消息泵已退出。
-        unsafe { PostThreadMessageW(self.thread_id, WM_APP_WAKE, WPARAM(0), LPARAM(0)) }.map_err(
+        unsafe { PostThreadMessageW(thread_id, WM_APP_WAKE, WPARAM(0), LPARAM(0)) }.map_err(
             |error| HotkeyError::RegisterFailed {
                 vk: 0,
                 code: error.code().0 as u32,
@@ -261,12 +303,26 @@ impl Drop for Hotkeys {
             .keys()
             .copied()
             .collect();
+        #[cfg(test)]
+        if let Endpoint::Offline { occupied, .. } = &self.endpoint {
+            let keys = self.registered();
+            let mut slots = occupied.lock().unwrap_or_else(|poison| poison.into_inner());
+            for (_, hotkey) in keys {
+                slots.remove(&hotkey);
+            }
+            return;
+        }
+        let thread_id = match &self.endpoint {
+            Endpoint::Thread(id) => *id,
+            #[cfg(test)]
+            Endpoint::Offline { .. } => unreachable!("offline endpoint handled above"),
+        };
         for id in ids {
             // SAFETY: 句柄来自本进程，id 是本模块分配的。
             let _ = unsafe { UnregisterHotKey(HWND(std::ptr::null_mut()), id as i32) };
         }
         // SAFETY: 线程 id 有效。
-        let _ = unsafe { PostThreadMessageW(self.thread_id, 0x0012, WPARAM(0), LPARAM(0)) }; // WM_QUIT
+        let _ = unsafe { PostThreadMessageW(thread_id, 0x0012, WPARAM(0), LPARAM(0)) }; // WM_QUIT
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -302,12 +358,7 @@ fn message_loop(
         match message.message {
             WM_HOTKEY => {
                 let id = message.wParam.0 as u32;
-                let vk = registered
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .get(&id)
-                    .map_or(0, |hotkey| hotkey.vk);
-                if events.send(HotkeyEvent { id, vk }).is_err() {
+                if dispatch_hotkey(&registered, &events, id).is_err() {
                     break;
                 }
             }
@@ -325,52 +376,52 @@ fn serve_pending(pending: &Mutex<Vec<Command>>, registered: &Mutex<BTreeMap<u32,
         std::mem::take(&mut *queue)
     };
     for command in commands {
-        match command {
-            Command::Register { hotkey, id, reply } => {
-                // SAFETY: 句柄为空 = 绑定到本线程消息队列。
-                let outcome = unsafe {
-                    RegisterHotKey(
-                        HWND(std::ptr::null_mut()),
-                        id as i32,
-                        hotkey.modifiers_with_norepeat(),
-                        hotkey.vk,
-                    )
-                };
-                let result = match outcome {
-                    Ok(()) => {
-                        registered
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner())
-                            .insert(id, hotkey);
-                        Ok(())
-                    }
-                    Err(_) => Err(HotkeyError::RegisterFailed {
-                        vk: hotkey.vk,
-                        code: unsafe { GetLastError() }.0,
-                    }),
-                };
-                let _ = reply.send(result);
-            }
-            Command::Unregister { id, reply } => {
-                // SAFETY: 句柄与 id 来自本进程。
-                let outcome = unsafe { UnregisterHotKey(HWND(std::ptr::null_mut()), id as i32) };
-                let result = match outcome {
-                    Ok(()) => {
-                        registered
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner())
-                            .remove(&id);
-                        Ok(())
-                    }
-                    Err(_) => Err(HotkeyError::UnregisterFailed {
-                        id,
-                        code: unsafe { GetLastError() }.0,
-                    }),
-                };
-                let _ = reply.send(result);
-            }
+        serve_command(command, registered, |id, hotkey| {
+            // SAFETY: 绑定本线程消息队列，与消息泵同线程。
+            unsafe { RegisterHotKey(HWND(std::ptr::null_mut()), id as i32,
+                hotkey.modifiers_with_norepeat(), hotkey.vk) }
+                .map_err(|_| HotkeyError::RegisterFailed {
+                    vk: hotkey.vk, code: unsafe { GetLastError() }.0,
+                })
+        }, |id| {
+            unsafe { UnregisterHotKey(HWND(std::ptr::null_mut()), id as i32) }
+                .map_err(|_| HotkeyError::UnregisterFailed {
+                    id, code: unsafe { GetLastError() }.0,
+                })
+        });
+    }
+}
+
+fn serve_command(
+    command: Command,
+    registered: &Mutex<BTreeMap<u32, Hotkey>>,
+    register: impl FnOnce(u32, Hotkey) -> Result<(), HotkeyError>,
+    unregister: impl FnOnce(u32) -> Result<(), HotkeyError>,
+) {
+    match command {
+        Command::Register { hotkey, id, reply } => {
+            let result = register(id, hotkey).map(|()| {
+                registered.lock().unwrap_or_else(|poison| poison.into_inner()).insert(id, hotkey);
+            });
+            let _ = reply.send(result);
+        }
+        Command::Unregister { id, reply } => {
+            let result = unregister(id).map(|()| {
+                registered.lock().unwrap_or_else(|poison| poison.into_inner()).remove(&id);
+            });
+            let _ = reply.send(result);
         }
     }
+}
+
+fn dispatch_hotkey(
+    registered: &Mutex<BTreeMap<u32, Hotkey>>,
+    events: &Sender<HotkeyEvent>,
+    id: u32,
+) -> Result<(), HotkeyError> {
+    let vk = registered.lock().unwrap_or_else(|poison| poison.into_inner())
+        .get(&id).map_or(0, |hotkey| hotkey.vk);
+    events.send(HotkeyEvent { id, vk }).map_err(|_| HotkeyError::ThreadGone)
 }
 
 #[cfg(test)]
@@ -386,7 +437,8 @@ mod tests {
     }
 
     #[test]
-    fn register_then_simulated_post_delivers_event() {
+    #[ignore = "真实系统热键注册；游戏运行期间禁止执行，须单独授权"]
+    fn live_register_then_simulated_post_delivers_event() {
         let _serial = serial();
         let hotkeys = Hotkeys::new().expect("启动热键线程");
         let id = hotkeys
@@ -403,7 +455,8 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_registration_is_rejected_with_a_named_error() {
+    #[ignore = "真实系统热键注册；游戏运行期间禁止执行，须单独授权"]
+    fn live_duplicate_registration_is_rejected_with_a_named_error() {
         let _serial = serial();
         let hotkeys = Hotkeys::new().expect("启动热键线程");
         // 用备用键 F23：真实程序在跑时占着 F8（生产默认键），断言会撞成 RegisterFailed。
@@ -422,7 +475,8 @@ mod tests {
     }
 
     #[test]
-    fn multiple_keys_can_be_registered_and_addressed_independently() {
+    #[ignore = "真实系统热键注册；游戏运行期间禁止执行，须单独授权"]
+    fn live_multiple_keys_can_be_registered_and_addressed_independently() {
         let _serial = serial();
         let hotkeys = Hotkeys::new().expect("启动热键线程");
         let first = hotkeys.register(Hotkey::plain(vk::F23)).expect("注册 F23");
@@ -436,7 +490,8 @@ mod tests {
     }
 
     #[test]
-    fn try_recv_is_non_blocking_when_nothing_happened() {
+    #[ignore = "真实系统热键注册；游戏运行期间禁止执行，须单独授权"]
+    fn live_try_recv_is_non_blocking_when_nothing_happened() {
         let _serial = serial();
         let hotkeys = Hotkeys::new().expect("启动热键线程");
         let _ = hotkeys.register(Hotkey::plain(vk::F23)).expect("注册");
@@ -444,7 +499,8 @@ mod tests {
     }
 
     #[test]
-    fn drop_releases_hotkeys_so_they_can_be_registered_again() {
+    #[ignore = "真实系统热键注册；游戏运行期间禁止执行，须单独授权"]
+    fn live_drop_releases_hotkeys_so_they_can_be_registered_again() {
         let _serial = serial();
         {
             let hotkeys = Hotkeys::new().expect("启动热键线程");
@@ -455,6 +511,65 @@ mod tests {
         hotkeys
             .register(Hotkey::plain(vk::F24))
             .expect("Drop 后必须能重新注册同一热键");
+    }
+
+    fn offline(occupied: Arc<Mutex<BTreeMap<Hotkey, u32>>>) -> Hotkeys {
+        let (event_tx, events) = channel();
+        Hotkeys {
+            pending: Arc::new(Mutex::new(Vec::new())),
+            events,
+            endpoint: Endpoint::Offline { occupied, events: event_tx },
+            registered: Arc::new(Mutex::new(BTreeMap::new())),
+            join: None,
+        }
+    }
+
+    #[test]
+    fn register_then_simulated_post_delivers_event() {
+        let hotkeys = offline(Arc::default());
+        let id = hotkeys.register(Hotkey::plain(vk::F24)).expect("注册 fake");
+        hotkeys.simulate_trigger(id).expect("fake 消息");
+        assert_eq!(hotkeys.try_recv(), Some(HotkeyEvent { id, vk: vk::F24 }));
+    }
+
+    #[test]
+    fn duplicate_registration_is_rejected_with_a_named_error() {
+        let hotkeys = offline(Arc::default());
+        let first = hotkeys.register(Hotkey::plain(vk::F23)).expect("首次");
+        assert_eq!(hotkeys.register(Hotkey::plain(vk::F23)),
+            Err(HotkeyError::AlreadyRegistered { vk: vk::F23 }));
+        assert_eq!(hotkeys.registered(), vec![(first, Hotkey::plain(vk::F23))]);
+        hotkeys.unregister(first).expect("注销");
+        assert_eq!(hotkeys.registered(), Vec::new());
+    }
+
+    #[test]
+    fn multiple_keys_can_be_registered_and_addressed_independently() {
+        let hotkeys = offline(Arc::default());
+        let first = hotkeys.register(Hotkey::plain(vk::F23)).expect("首次");
+        let second = hotkeys.register(Hotkey::plain(vk::F24)).expect("其次");
+        assert_ne!(first, second);
+        hotkeys.simulate_trigger(second).expect("fake 消息");
+        assert_eq!(hotkeys.try_recv(), Some(HotkeyEvent { id: second, vk: vk::F24 }));
+    }
+
+    #[test]
+    fn try_recv_is_non_blocking_when_nothing_happened() {
+        let hotkeys = offline(Arc::default());
+        hotkeys.register(Hotkey::plain(vk::F23)).expect("注册");
+        assert_eq!(hotkeys.try_recv(), None);
+    }
+
+    #[test]
+    fn drop_releases_hotkeys_so_they_can_be_registered_again() {
+        let occupied = Arc::default();
+        let first = offline(Arc::clone(&occupied));
+        first.register(Hotkey::plain(vk::F24)).expect("注册");
+        let second = offline(Arc::clone(&occupied));
+        assert!(matches!(second.register(Hotkey::plain(vk::F24)),
+            Err(HotkeyError::RegisterFailed { vk: vk::F24, code: 1409 })));
+        drop(first);
+        assert_eq!(second.register(Hotkey::plain(vk::F24)), Ok(1));
     }
 
     #[test]

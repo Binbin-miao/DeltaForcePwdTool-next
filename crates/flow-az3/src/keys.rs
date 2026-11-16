@@ -62,8 +62,8 @@ const MIN_GLOW_PIXELS: u32 = 40;
 /// - `11.40~11.65s` 5 个勾在 **0.25 秒**内全出（5 个全点，成功）。
 ///
 /// 同一帧批量注入 4~5 次点击、间隔 ≈ 0 时，游戏会把「同一瞬间的多击」当成一次或干脆错过
-/// 已改亮的下一块。留 100ms 让游戏先把黄块推上来，再点下一颗。
-const KEY_CLICK_GAP_MS: u64 = 100;
+/// 已改亮的下一块。留 50ms 让游戏先把黄块推上来，再点下一颗（用户实测后要求 0.05s）。
+const KEY_CLICK_GAP_MS: u64 = 50;
 /// 单格进度勾选的绿色像素数下限（实测 ✓ 约 100~170px，留余量）。
 const MIN_CHECK_PIXELS: u32 = 30;
 /// 单颗键「已变绿勾」的像素数下限（与 `delta_scene::locate` 的 `SLOT_CHECK_PIXELS` 同源同值）。
@@ -88,6 +88,12 @@ const CLICK_ACK_TIMEOUT_MS: u64 = 700;
 /// 那一局会先撞安全阀报「疑似误判」，把一局**合法但没解开**的收尾说成「多半不是键台」。
 /// 160 仍远低于实测误判乱点（344 / 330 / 370）：真跑飞时远远越过它。
 pub(crate) const DEAD_STRIKES: u8 = 4;
+
+/// 面板出现后「一颗亮键都还没见到」时最多等多久（毫秒）。
+///
+/// 实测面板是渐显的：头 13 帧（≈650ms）键块还不到亮度阈值。旧实现一帧没看到就收尾，
+/// 用户看到的就是「首次开启漏掉右上角的键 / 直接报没识别到」。
+const FIRST_KEY_WAIT_MS: u64 = 2_000;
 /// 连续多少帧定位失败才放弃（`Az3Config::poll_interval_ms` 默认 50ms ⇒ 20 帧 ≈1.0s 轮询，
 /// 加上每帧抓帧 + 判定的开销，墙钟约 1.2~1.4s）。
 ///
@@ -294,6 +300,8 @@ struct State {
     /// 本次收尾前为了等静默期而**继续等待**的帧数（报告口径，日志要能区分
     /// 「预算耗尽」与「静默期没等到就超时」）。
     quiet_wait_frames: u32,
+    /// 首键出现前等了多少帧（报告口径：区分「面板还没渐显」与「真的没有键」）。
+    first_key_wait_frames: u32,
     /// 本任务一共推进了几帧（只数 `step` 真正处理过的帧）。
     frames: u32,
     /// 首帧的时刻与收尾前最后一帧的时刻（墙钟毫秒，来自 [`Clock`]）。
@@ -384,6 +392,20 @@ impl State {
                 return None;
             }
             let reset_candidate = has_unspent_yellow(&yellow_lit, &located, &self.dead);
+            // **首键前窗口**：一次都没见过亮键、也一下都没点过，说明面板可能还在渐显。
+            // 这时收尾就是把「还没亮出来」判成「已经点完了」——用户实机里正是漏了右上角那颗。
+            if self.lit_once_count() == 0 && self.clicks == 0 {
+                let started = self.first_ms.unwrap_or(now);
+                let waited = now.saturating_sub(started);
+                if waited < FIRST_KEY_WAIT_MS {
+                    self.first_key_wait_frames = self.first_key_wait_frames.saturating_add(1);
+                    return None;
+                }
+                return Some(aborted(
+                    pointer.event_count(),
+                    format!("首键前等待了 {FIRST_KEY_WAIT_MS}ms 仍未见到亮块（实际等待 {waited}ms）"),
+                ));
+            }
             return self.on_no_target(checked, reset_candidate, pointer.event_count());
         }
 
@@ -494,15 +516,29 @@ impl State {
         if self.pending.is_empty() {
             return false;
         }
-        // 判据一（最可靠，能读到进度格时）：进度推进就算这一轮吃下了。
-        if checked.is_some_and(|checked| checked > self.baseline) {
-            self.pending.clear();
-            return false;
+        // 判据一（逐键证据，最可靠）：绿勾只销**它自己那几颗**。
+        // 旧实现只要有一格变绿就 `pending.clear()`，等于把同一批里没生效的键一起记成成功，
+        // 那颗键再也不会被重试 —— 用户实测「第一次点击漏了一个」就是这么来的。
+        let before = self.pending.len();
+        self.pending.retain(|index| !acked_green.contains(index));
+        let acked = before - self.pending.len();
+        if acked > 0 {
+            if let Some(checked) = checked {
+                self.baseline = self.baseline.max(checked);
+            }
+            return self.still_waiting(now);
         }
-        // 判据二：pending 里有格**变绿勾** ⇒ 游戏确认了这一下（不记 strike、不判死）。
-        if self.pending.iter().any(|index| acked_green.contains(index)) {
-            self.pending.clear();
-            return false;
+        // 判据二（间接证据）：进度涨了，但读不到是哪几颗变绿。
+        // 只能按「先点的先被吃下」销掉最多这么多只，**剩下的继续挂着等自己的证据**；
+        // 绝不因为总进度涨了就整批清掉（4/5 无法指认缺的是哪一颗）。
+        if let Some(checked) = checked {
+            if checked > self.baseline {
+                let advanced = checked - self.baseline;
+                let drop = advanced.min(self.pending.len());
+                self.pending.drain(..drop);
+                self.baseline = checked;
+                return self.still_waiting(now);
+            }
         }
         if now.saturating_sub(self.click_ms) < CLICK_ACK_TIMEOUT_MS {
             return true;
@@ -519,6 +555,11 @@ impl State {
             }
         }
         false
+    }
+
+    /// 还剩没确认的键时：确认窗口内继续等，窗口过了就交回主循环去判罚/重试。
+    fn still_waiting(&self, now: u64) -> bool {
+        !self.pending.is_empty() && now.saturating_sub(self.click_ms) < CLICK_ACK_TIMEOUT_MS
     }
 
     /// 这局盘面里**曾经发过黄光**的格数（文案口径：只数在册的键，不是 16 格）。
@@ -1509,10 +1550,12 @@ mod tests {
         );
         assert_eq!(state.clicks, 3, "三颗亮键本帧全点");
         assert_eq!(state.pending, vec![0, 5, 10], "账本与已发点击必须一致");
+        // 字面量而非常量：常量一改断言就自动跟着变绿，等于没钉住（LESSON-005）。
+        // 用户实测后把口径从 100ms 改成 50ms（原话「点击间隔可以缩小到 0.05s」）。
         assert_eq!(
             clock.sleeps,
-            vec![KEY_CLICK_GAP_MS, KEY_CLICK_GAP_MS],
-            "第 1→2、2→3 之间各睡一次；最后一个目标后不睡（早点进下一帧看进度）"
+            vec![50, 50],
+            "第 1→2、2→3 之间各睡一次 50ms；最后一个目标后不睡（早点进下一帧看进度）"
         );
     }
 
@@ -1774,15 +1817,17 @@ mod tests {
 
     #[test]
     fn a_board_that_never_lit_does_not_enter_the_quiet_window() {
-        // ③ 一次都没见过亮键 ⇒ 静默期不适用，行为与改动前一致（靠预算兜底，不许白等）。
+        // ③ 一次都没见过亮键 ⇒ 静默期不适用（那是「点完等下一个」的闸）。
+        // 改由首键前窗口兜底：窗口内继续等，窗口满给明确结论，不空转到帧预算。
         let frame = panel_frame(&[], false);
         let mut state = State::default();
         let mut clock = StepClock { now: 0 };
         assert!(step_board(&mut state, &frame, &mut clock).is_none());
-        clock.now = 60_000;
+        clock.now = FIRST_KEY_WAIT_MS;
+        let outcome = step_board(&mut state, &frame, &mut clock).expect("窗口满必须给结论");
         assert!(
-            step_board(&mut state, &frame, &mut clock).is_none(),
-            "没见过亮键时也不该收尾（旧行为：继续等）"
+            matches!(&outcome, Az3Outcome::Aborted { reason, .. } if reason.contains("首键前等待了")),
+            "{outcome:?}"
         );
         assert_eq!(
             state.quiet_wait_frames, 0,
@@ -1916,5 +1961,155 @@ mod tests {
                 if reason.contains("疑似误判") && reason.contains(&degraded.to_string())),
             "退化档必须在 {degraded} 处收手：{outcome:?}"
         );
+    }
+
+    // ── K1：点击间隔按用户原话降到 0.05s ──
+
+    #[test]
+    fn the_click_gap_is_fifty_milliseconds() {
+        // 用户原话：「点击间隔可以缩小到 0.05s」。钉字面量，不钉常量（LESSON-005）。
+        assert_eq!(KEY_CLICK_GAP_MS, 50, "用户实测后要求 0.05s，旧值 100");
+    }
+
+    // ── K2：点击取证（格位）──
+    // 待做：把「实际点击像素 + 网格原点/间距」并进生产日志同一行（WIP 想加的 `@(x,y)` 与
+    // `网格: x0=…`）。它只影响排障可读性、不影响点击行为，本轮先不扩这一层。
+
+    /// 「第R行第C列」列表；有坐标就带上 `@(x,y)`，"无" = 一个都没有。
+    fn list_cells_with_points(
+        touched: &[bool; CELLS],
+        points: &[Option<PxPoint>; CELLS],
+    ) -> String {
+        let cells: Vec<String> = (0..CELLS)
+            .filter(|index| touched[*index])
+            .map(|index| {
+                let name = format!("第{}行第{}列", index / GRID_SIDE + 1, index % GRID_SIDE + 1);
+                match points[index] {
+                    Some(point) => format!("{name}@({},{})", point.x, point.y),
+                    None => name,
+                }
+            })
+            .collect();
+        if cells.is_empty() {
+            "无".to_owned()
+        } else {
+            cells.join("、")
+        }
+    }
+
+    #[test]
+    fn the_click_list_carries_the_pixel_it_actually_hit() {
+        // 「第1行第2列」看不出点偏了多少；把真实点击坐标并进同一行才谈得上核对。
+        let mut touched = [false; CELLS];
+        touched[1] = true;
+        let mut points = [None; CELLS];
+        points[1] = Some(PxPoint { x: 726, y: 208 });
+
+        assert_eq!(
+            list_cells_with_points(&touched, &points),
+            "第1行第2列@(726,208)",
+            "日志里的格位必须能对上真实像素"
+        );
+        // 反例：没有坐标时只写格位，绝不编造 (0,0)。
+        assert_eq!(list_cells_with_points(&touched, &[None; CELLS]), "第1行第2列");
+        assert_eq!(list_cells_with_points(&[false; CELLS], &points), "无");
+    }
+
+    // ── K3：首键前窗口（面板渐显时键块还没到亮度阈值，13 帧 ≈650ms 太短）──
+
+    #[test]
+    fn the_first_key_window_tolerates_thirteen_quiet_frames_but_expires_at_two_seconds() {
+        let frame = panel_frame(&[], false);
+        let mut state = State::default();
+        let mut clock = StepClock { now: 0 };
+
+        for frame_no in 0..13u64 {
+            clock.now = frame_no * 50;
+            assert!(
+                step_board(&mut state, &frame, &mut clock).is_none(),
+                "首键前第 {frame_no} 帧（{}ms）就收尾 = 面板还没渐显出来就被判死",
+                clock.now
+            );
+        }
+        assert_eq!(state.first_key_wait_frames, 13, "首键前等待帧数必须记账");
+        assert_eq!(state.clicks, 0, "首键前必须零注入");
+
+        clock.now = FIRST_KEY_WAIT_MS - 1;
+        assert!(
+            step_board(&mut state, &frame, &mut clock).is_none(),
+            "差 1ms 就收尾说明窗口没生效"
+        );
+
+        clock.now = FIRST_KEY_WAIT_MS;
+        let outcome = step_board(&mut state, &frame, &mut clock).expect("窗口满必须收尾");
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert!(
+            matches!(&outcome, Az3Outcome::Aborted { reason, .. }
+                if reason.contains(&format!("首键前等待了 {FIRST_KEY_WAIT_MS}ms 仍未见到亮块"))),
+            "结论必须写明首键前等了多久：{outcome:?}"
+        );
+    }
+
+    // ── 逐键确认：只销有证据的键（spec §5.2 第 4 条）──
+
+    #[test]
+    fn a_single_green_mark_does_not_clear_the_whole_pending_batch() {
+        // 同一帧点了两颗，只有第 1 颗变绿：第 4 颗必须继续挂着等自己的证据。
+        let mut clicked = [false; CELLS];
+        clicked[0] = true;
+        clicked[3] = true;
+        let mut state = State {
+            pending: vec![0, 3],
+            clicked,
+            click_ms: 0,
+            ..State::default()
+        };
+
+        let waiting = state.waiting(None, &[0], 100);
+
+        assert_eq!(state.pending, vec![3], "只销变绿的那一颗，不许整批清");
+        assert!(waiting, "另一颗还在确认窗口里，本帧不该再点新键");
+        assert!(state.clicked[3], "没拿到证据前不许当成点成功了");
+    }
+
+    #[test]
+    fn progress_advance_only_confirms_as_many_clicks_as_it_reports() {
+        // 进度 4/5、点了 5 颗、读不到绿勾：只能销 4 只，剩下那只继续等证据；
+        // 既不整批清，也不「挑第一颗去补点」（4/5 指认不出缺的是哪一颗）。
+        let mut clicked = [false; CELLS];
+        for flag in clicked.iter_mut().take(5) {
+            *flag = true;
+        }
+        let mut state = State {
+            pending: vec![0, 1, 2, 3, 4],
+            clicked,
+            click_ms: 0,
+            ..State::default()
+        };
+
+        let waiting = state.waiting(Some(4), &[], 100);
+
+        assert_eq!(state.pending, vec![4], "只销与进度增量相等的 4 只");
+        assert!(waiting);
+        assert!(state.clicked[0], "已经确认吃下的键不许被重试");
+    }
+
+    #[test]
+    fn only_the_unconfirmed_key_takes_a_strike_after_the_ack_window() {
+        let mut clicked = [false; CELLS];
+        clicked[3] = true;
+        let mut state = State {
+            pending: vec![3],
+            clicked,
+            click_ms: 0,
+            ..State::default()
+        };
+
+        let waiting = state.waiting(None, &[], CLICK_ACK_TIMEOUT_MS);
+
+        assert!(!waiting);
+        assert_eq!(state.strikes[3], 1, "只有没确认的那一颗记无效轮");
+        assert!(!state.clicked[3], "没吃下就放回可点池，下一帧重试");
+        assert_eq!(state.strikes[0], 0, "别的键不该被连坐");
     }
 }

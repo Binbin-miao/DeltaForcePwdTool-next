@@ -111,6 +111,21 @@ pub struct Worker {
 }
 
 impl Worker {
+    #[cfg(test)]
+    pub(crate) fn offline() -> Self {
+        let (_event_tx, events) = mpsc::channel();
+        let (commands, _command_rx) = mpsc::channel();
+        let (hotkey_tx, _hotkey_rx) = mpsc::channel();
+        Self {
+            events,
+            commands,
+            hotkey_tx,
+            waker: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// 热更新全局热键：改完立即生效，无需重启。
     ///
     /// 返回 `false` 表示热键线程已经退出（例如 `Hotkeys::new()` 失败），本次改键不可能生效。
@@ -150,6 +165,11 @@ impl Worker {
         let (commands, command_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
+        // 忙时门：执行器一开工就关上，热键泵据此把重复按键**在按下那一刻**丢掉。
+        // 只在执行器里判断是不够的 —— 执行器是单线程顺序消费的，忙时进队的按键会
+        // 一直躺在队列里，这一轮结束（成功/失败/取消）后立刻又被跑一遍，
+        // 用户看到的就是「按了三下，跑三次」。
+        let busy = Arc::new(AtomicBool::new(false));
         let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
 
         // 七个热键：一键识别（自动判别）+ 五个强制键（F5 摩斯 / F6 指纹 / F7 操作台
@@ -172,6 +192,7 @@ impl Worker {
             let stop = shutdown.clone();
             let notify = event_tx.clone();
             let cancel = cancel.clone();
+            let busy = busy.clone();
             let config = config.clone();
             let waker = waker.clone();
             std::thread::Builder::new()
@@ -253,6 +274,16 @@ impl Worker {
                                 if *cmd == Cmd::ToggleMaster {
                                     toggle_master(&config, &notify, &cancel);
                                     wake(&waker);
+                                } else if *cmd == Cmd::Cancel {
+                                    // 取消同理就地生效：排进队列要等这一轮跑完（最多 15 秒），
+                                    // 而「按住 F 想立刻停」等不起。
+                                    cancel.store(true, Ordering::SeqCst);
+                                    wake(&waker);
+                                } else if busy.load(Ordering::SeqCst) {
+                                    // 忙时重复按 F / 功能热键：这里直接忽略，不排队、不延后。
+                                    // 用户要的是「一次只跑一件事」，不是「按三次就跑三次」。
+                                    // 注意丢的是按键本身，而不是「先排队再丢」——后者照样会在
+                                    // 这一轮结束后触发一次，等于没丢。
                                 } else if trigger.send(*cmd).is_err() {
                                     break;
                                 }
@@ -266,6 +297,7 @@ impl Worker {
             let stop = shutdown.clone();
             let cancel = cancel.clone();
             let waker = waker.clone();
+            let gate = busy.clone();
             std::thread::Builder::new()
                 .name("delta-executor".to_owned())
                 .spawn(move || {
@@ -286,14 +318,27 @@ impl Worker {
                                 probe(&config, monitor, &event_tx);
                             }
                             Cmd::Trigger => {
+                                if gate.swap(true, Ordering::SeqCst) {
+                                    // 忙时重复触发直接丢掉：不排队、不延后执行。
+                                    continue;
+                                }
+                                let _gate = BusyGate(&gate);
                                 cancel.store(false, Ordering::SeqCst);
                                 run_once(&config, monitor, &event_tx, &cancel, None, None);
                             }
                             Cmd::Force(kind) => {
+                                if gate.swap(true, Ordering::SeqCst) {
+                                    continue;
+                                }
+                                let _gate = BusyGate(&gate);
                                 cancel.store(false, Ordering::SeqCst);
                                 run_once(&config, monitor, &event_tx, &cancel, Some(kind), None);
                             }
                             Cmd::ForceAz3(kind) => {
+                                if gate.swap(true, Ordering::SeqCst) {
+                                    continue;
+                                }
+                                let _gate = BusyGate(&gate);
                                 cancel.store(false, Ordering::SeqCst);
                                 // AZ3 变体都住在「操作台」这个场景下：强制场景 = Console，
                                 // 强制变体藏在第二个参数里（跳过 `az3_variant` 投票）。
@@ -325,6 +370,16 @@ impl Worker {
     /// 请求取消（流程边界生效；单次流程内部不可抢占，见 `run_once` 注释）。
     pub fn request_cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+/// 忙时门的放行凭据：`run_once` 正常结束、提前取消、超时返回，甚至 panic 展开，
+/// 都必须把门重新打开 —— 手写 `store(false)` 漏一条出口，之后所有热键就永久失灵了。
+struct BusyGate<'a>(&'a AtomicBool);
+
+impl Drop for BusyGate<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -638,26 +693,6 @@ enum ReadyOutcome {
 ///
 /// 「已知」= 常规判别命中、AZ3 二级判别命中任一玩法、**或** UI 模板确认是某个解锁界面。
 /// 三条判据共享同一帧、同一轮预算：不存在「先抓一帧判模板，再抓一帧判结构」。
-fn wait_scene_ready(
-    session: &mut CaptureSession,
-    full: PxRect,
-    view: &PxView,
-    guard: &ui_guard::UiGuard,
-    cancel: &AtomicBool,
-    tx: &mpsc::Sender<UiEvent>,
-) -> ReadyOutcome {
-    let mut clock = delta_flow_az3::SystemClock::new();
-    match poll_scene_ready(&mut clock, cancel, guard, view, READY_BUDGET_MS, || {
-        session.grab(full).map_err(grab_note)
-    }) {
-        Ok(outcome) => outcome,
-        Err(reason) => {
-            let _ = tx.send(UiEvent::Failed(reason));
-            ReadyOutcome::Stopped
-        }
-    }
-}
-
 /// 轮询主体：**抓帧与判定分离**，判定（就绪 / 拒绝 / 耗尽）可以零真实等待地跑。
 ///
 /// `budget_ms` 必须大于拒绝时限 [`QUICK_REJECT_MS`]：预算先到就直接 `Exhausted`，
@@ -756,8 +791,8 @@ struct Evidence {
 ///
 /// 这七样东西永远一起走（会话 / 整屏矩形 / 视图 / 模板库 / 取消位 / 留证 / 事件口），
 /// 拆成裸参数既超 clippy 的 7 参上限，也让调用点读不出「它们在描述同一件事」。
-struct ReadyContext<'a> {
-    session: &'a mut CaptureSession,
+struct ReadyContext<'a, S> {
+    session: &'a mut S,
     full: PxRect,
     view: &'a PxView,
     guard: &'a ui_guard::UiGuard,
@@ -778,7 +813,11 @@ struct ReadyFrame {
 /// 1. 等面板长起来并确认界面（Q3/Q5：模板与结构判别在同一轮里出结论）；
 /// 2. 明确不是解锁界面 ⇒ 立刻按模板文案拒绝（[`QUICK_REJECT_MS`] 之后）；
 /// 3. 取消位在同一轮里生效（用户关掉总开关不该还干等）。
-fn await_frame(ctx: ReadyContext<'_>, basis: ReadyBasis) -> Option<ReadyFrame> {
+fn await_frame<D: TaskDesktop>(
+    ctx: ReadyContext<'_, D::Session>,
+    basis: ReadyBasis,
+    desktop: &mut D,
+) -> Option<ReadyFrame> {
     let ReadyContext {
         session,
         full,
@@ -790,49 +829,38 @@ fn await_frame(ctx: ReadyContext<'_>, basis: ReadyBasis) -> Option<ReadyFrame> {
     } = ctx;
     // 强制模式：用户按键就是命令，不进轮询、不看模板、不拒绝。
     if basis.skips_detect() {
-        return grab_now(session, full, tx).map(|frame| ReadyFrame { frame, hint: None });
+        return match D::ready_grab(session, full) {
+            Ok(frame) => Some(ReadyFrame { frame, hint: None }),
+            Err(reason) => {
+                let _ = tx.send(UiEvent::Failed(reason));
+                None
+            }
+        };
     }
-    match wait_scene_ready(session, full, view, guard, cancel, tx) {
+    let outcome = match poll_scene_ready(desktop.clock(), cancel, guard, view, READY_BUDGET_MS, || {
+        D::ready_grab(session, full)
+    }) {
+        Ok(outcome) => outcome,
+        Err(reason) => {
+            let _ = tx.send(UiEvent::Failed(reason));
+            ReadyOutcome::Stopped
+        }
+    };
+    match outcome {
         ReadyOutcome::Ready { frame, hint } => Some(ReadyFrame { frame, hint }),
         ReadyOutcome::Rejected(reason) => {
-            save_evidence(
-                "reject",
-                reason,
-                evidence.monitor,
-                evidence.backend,
-                "Q5 快速拒绝（模板未命中任何解锁界面）",
-            );
+            desktop.evidence("reject", reason,
+                "Q5 快速拒绝（模板未命中任何解锁界面）", evidence);
             let _ = tx.send(UiEvent::Rejected(reason.to_owned()));
             None
         }
         ReadyOutcome::Exhausted => {
             let reason = format!("{READY_BUDGET_MS}ms / {SCENE_UNKNOWN_FRAMES} 帧内没认出界面");
-            save_evidence(
-                "reject",
-                &reason,
-                evidence.monitor,
-                evidence.backend,
-                "场景判别失败",
-            );
+            desktop.evidence("reject", &reason, "场景判别失败", evidence);
             let _ = tx.send(UiEvent::Rejected("未检测到游戏界面".to_owned()));
             None
         }
         ReadyOutcome::Stopped => None,
-    }
-}
-
-/// 补抓一帧；失败即报错。
-fn grab_now(
-    session: &mut CaptureSession,
-    full: PxRect,
-    tx: &mpsc::Sender<UiEvent>,
-) -> Option<Frame> {
-    match session.grab(full) {
-        Ok(frame) => Some(frame),
-        Err(error) => {
-            let _ = tx.send(UiEvent::Failed(grab_note(error)));
-            None
-        }
     }
 }
 
@@ -907,7 +935,7 @@ fn probe(config: &Arc<Mutex<Config>>, monitor: MonitorInfo, tx: &mpsc::Sender<Ui
                 delta_scene::Az3Kind::None
             };
             let sequence = if scene == SceneKind::Console && reads_led_sequence(az3) {
-                read_sequence(&mut session, led_region_for(&view, az3))
+                read_sequence(&mut delta_flow_morse::LiveScreen::new(&mut session), led_region_for(&view, az3))
                     .ok()
                     .map(|raw| delta_ui::format_sequence(&raw))
             } else {
@@ -996,12 +1024,153 @@ fn run_once(
     tx: &mpsc::Sender<UiEvent>,
     cancel: &AtomicBool,
     forced: Option<SceneKind>,
-    // F10/F11 的强制 AZ3 变体：与 `forced = Some(Console)` 成对出现。有值时**不再投票**
-    // （`az3_variant`）也不做变体复核 —— 用户已明确站在哪个台子前，模板/投票是给
-    // 「盲按 F」用的，不是给强制键用的。
     forced_az3: Option<delta_scene::Az3Kind>,
 ) {
+    let mut desktop = LiveDesktop {
+        clock: delta_flow_az3::SystemClock::new(),
+        input: delta_flow_morse::LiveInput,
+    };
+    run_once_with(config, TaskRequest { monitor, tx, cancel, forced, forced_az3 }, &mut desktop);
+}
+
+#[derive(Clone, Copy)]
+struct TaskRequest<'a> {
+    monitor: MonitorInfo,
+    tx: &'a mpsc::Sender<UiEvent>,
+    cancel: &'a AtomicBool,
+    forced: Option<SceneKind>,
+    forced_az3: Option<delta_scene::Az3Kind>,
+}
+
+struct FlowContext<'a, S> {
+    config: &'a Config,
+    view: &'a PxView,
+    session: S,
+    frame: Frame,
+    scene: SceneKind,
+    az3_kind: delta_scene::Az3Kind,
+    request: TaskRequest<'a>,
+}
+
+trait TaskDesktop {
+    type Session: delta_flow_morse::ScreenSource;
+    type Input: delta_flow_morse::InputSink;
+    type Clock: Clock;
+
+    fn load_guard(&mut self) -> ui_guard::UiGuard;
+    fn focus(&mut self) -> Result<(), String>;
+    fn open(&mut self, config: &Config, tx: &mpsc::Sender<UiEvent>) -> Option<Self::Session>;
+    fn ready_grab(session: &mut Self::Session, rect: PxRect) -> Result<Frame, String>;
+    fn clock(&mut self) -> &mut Self::Clock;
+    fn input(&mut self) -> &mut Self::Input;
+    fn budget(&self, session: &Self::Session) -> (u32, u32);
+    fn evidence(&mut self, tag: &str, reason: &str, detail: &str, context: Evidence);
+    fn prepare_az3(&mut self, flow: &mut FlowContext<'_, Self::Session>) -> bool;
+    fn fingerprint(&mut self, flow: FlowContext<'_, Self::Session>);
+    fn console(&mut self, flow: FlowContext<'_, Self::Session>);
+    fn az3(&mut self, flow: FlowContext<'_, Self::Session>);
+}
+
+struct LiveDesktop {
+    clock: delta_flow_az3::SystemClock,
+    input: delta_flow_morse::LiveInput,
+}
+
+struct TaskCapture(CaptureSession);
+
+impl delta_flow_morse::ScreenSource for TaskCapture {
+    fn grab(&mut self, rect: PxRect) -> Result<Frame, String> {
+        self.0.grab(rect).map_err(|error| error.to_string())
+    }
+}
+
+impl TaskDesktop for LiveDesktop {
+    type Session = TaskCapture;
+    type Input = delta_flow_morse::LiveInput;
+    type Clock = delta_flow_az3::SystemClock;
+
+    fn load_guard(&mut self) -> ui_guard::UiGuard {
+        ui_guard::UiGuard::load(&crate::ui_images_dir())
+    }
+
+    fn focus(&mut self) -> Result<(), String> {
+        platform::focus_game_window().map(|_| ())
+    }
+
+    fn open(&mut self, config: &Config, tx: &mpsc::Sender<UiEvent>) -> Option<Self::Session> {
+        open_session(config, tx).map(TaskCapture)
+    }
+
+    fn ready_grab(session: &mut Self::Session, rect: PxRect) -> Result<Frame, String> {
+        session.0.grab(rect).map_err(grab_note)
+    }
+
+    fn clock(&mut self) -> &mut Self::Clock {
+        &mut self.clock
+    }
+
+    fn input(&mut self) -> &mut Self::Input {
+        &mut self.input
+    }
+
+    fn budget(&self, session: &Self::Session) -> (u32, u32) {
+        (session.0.frames_taken(), session.0.budget())
+    }
+
+    fn evidence(&mut self, tag: &str, reason: &str, detail: &str, context: Evidence) {
+        save_evidence(tag, reason, context.monitor, context.backend, detail);
+    }
+
+    fn prepare_az3(&mut self, flow: &mut FlowContext<'_, Self::Session>) -> bool {
+        let session = &mut flow.session.0;
+        let request = flow.request;
+        let full = full_rect(request.monitor);
+        if request.forced_az3.is_some() {
+            if flow.az3_kind == delta_scene::Az3Kind::ModuleKeys {
+                if let Locate::Found(ready) = wait_keys_ready(session, full, request.cancel, request.tx) {
+                    flow.frame = ready;
+                }
+            }
+            return true;
+        }
+        let verdict = if flow.az3_kind == delta_scene::Az3Kind::ModuleKeys {
+            wait_keys_ready(session, full, request.cancel, request.tx)
+        } else {
+            Locate::Found(flow.frame.clone())
+        };
+        if let Err(reason) = confirm_az3(verdict, flow.view, flow.az3_kind, flow.config, request.monitor) {
+            let _ = request.tx.send(UiEvent::Rejected(reason));
+            return false;
+        }
+        true
+    }
+
+    fn fingerprint(&mut self, mut flow: FlowContext<'_, Self::Session>) {
+        run_fingerprint(flow.config, flow.view, &mut flow.session.0, flow.request.tx);
+    }
+
+    fn console(&mut self, mut flow: FlowContext<'_, Self::Session>) {
+        run_console(flow.config, flow.view, &mut flow.session.0, flow.request.monitor, flow.request.tx);
+    }
+
+    fn az3(&mut self, flow: FlowContext<'_, Self::Session>) {
+        drop(flow.session);
+        run_az3(flow.config, flow.view, flow.az3_kind, flow.request.monitor,
+            flow.request.cancel, flow.request.tx, Some(&flow.frame));
+    }
+}
+
+fn run_once_with(
+    config: &Arc<Mutex<Config>>,
+    request: TaskRequest<'_>,
+    desktop: &mut impl TaskDesktop,
+) {
+    let TaskRequest { monitor, tx, cancel, forced, forced_az3 } = request;
     let _ = tx.send(UiEvent::Started);
+    if cancel.load(Ordering::SeqCst) {
+        let _ = tx.send(UiEvent::Failed("已取消".to_owned()));
+        return;
+    }
     let snapshot = snapshot(config);
 
     // 总开关闸门必须排在**所有**副作用之前：不激活游戏窗口、不建采集会话、不抓帧、不注入。
@@ -1035,7 +1204,7 @@ fn run_once(
     // shortcut: 模板 ≤ ~20 张时直读；超过就该加「目录 mtime 命中即复用」的缓存。
     let guard = match forced {
         Some(_) => ui_guard::UiGuard::default(),
-        None => ui_guard::UiGuard::load(&crate::ui_images_dir()),
+        None => desktop.load_guard(),
     };
     let basis = if forced.is_some() {
         ReadyBasis::Forced
@@ -1048,7 +1217,7 @@ fn run_once(
         eprintln!("[ui] 模板库为空，退化到结构判别");
     }
 
-    if let Err(reason) = platform::focus_game_window() {
+    if let Err(reason) = desktop.focus() {
         let _ = tx.send(UiEvent::Rejected(reason));
         return;
     }
@@ -1056,9 +1225,9 @@ fn run_once(
         let _ = tx.send(UiEvent::Rejected("请先校准".to_owned()));
         return;
     };
-    // spec D3：任务开始建会话；函数任何出口（成功 / 失败 / 取消 / 超时）都会 `drop` 它，
+    // spec D3:任务开始建会话；函数任何出口（成功 / 失败 / 取消 / 超时）都会 `drop` 它，
     // 因此程序空闲时不可能持有 D3D11 设备或采集会话。
-    let Some(mut session) = open_session(&snapshot, tx) else {
+    let Some(mut session) = desktop.open(&snapshot, tx) else {
         return;
     };
     let full = full_rect(monitor);
@@ -1067,7 +1236,7 @@ fn run_once(
     // 这就是「第一次按 F 没用、要按两次」的根因。这里等画面真的长起来再判，
     // 模板判定在同一轮里完成（拒绝也从这里出去，不再是「先聚焦再白等」）。
     let Some(ReadyFrame {
-        mut frame,
+        frame,
         hint,
     }) = await_frame(
         ReadyContext {
@@ -1083,6 +1252,7 @@ fn run_once(
             tx,
         },
         basis,
+        desktop,
     ) else {
         return;
     };
@@ -1124,13 +1294,9 @@ fn run_once(
         // spec D6 硬约束：拒绝执行，不产生任何输入。
         // 自测期把「按了热键但没认出界面」也留一份证：否则用户只能说「按了没用」，
         // 没法区分是钩子压根没触发、还是判成了 Unknown（两种情况修法完全不同）。
-        save_evidence(
-            "reject",
-            &format!("未识别：{reason}"),
-            monitor,
-            snapshot.capture_backend,
+        desktop.evidence("reject", &format!("未识别：{reason}"),
             &format!("场景: {scene:?}, AZ3: {az3_kind:?}"),
-        );
+            Evidence { monitor, backend: snapshot.capture_backend });
         let _ = tx.send(UiEvent::Rejected(reason.to_owned()));
         return;
     }
@@ -1145,44 +1311,30 @@ fn run_once(
     // - 强制模式（F10/F11）**不复核、不拒绝**：用户已明确站在哪个台子前。但黄键台仍要等面板
     //   量得出来 —— 面板刚打开是 1% 进度、零亮键，单帧必然定位失败；等不到就用手上这一帧
     //   交给 flow 自己容错（强制语义下宁可让流程兜底，也不在这里把用户拦下来）。
-    if scene == SceneKind::Console && az3_kind.is_known() {
-        if forced_az3.is_some() {
-            // 强制：不投票、不复核、不拒绝。黄键台仍等「面板量得出来」再开跑，等不到就用手上
-            // 这一帧交给 flow 自己容错（`Locate` 没有 frame 时不留副本：1080p 一帧 8.3MB）。
-            if az3_kind == delta_scene::Az3Kind::ModuleKeys {
-                if let Locate::Found(ready) = wait_keys_ready(&mut session, full, cancel, tx) {
-                    frame = ready;
-                }
-            }
-        } else {
-            let verdict = if az3_kind == delta_scene::Az3Kind::ModuleKeys {
-                wait_keys_ready(&mut session, full, cancel, tx)
-            } else {
-                // 其余 AZ3 玩法没有「面板量不全」这条就绪判据，复核用的就是刚判别过的那一帧。
-                Locate::Found(frame.clone())
-            };
-            if let Err(reason) = confirm_az3(verdict, &view, az3_kind, &snapshot, monitor) {
-                let _ = tx.send(UiEvent::Rejected(reason));
-                return;
-            }
-        }
+    let mut flow = FlowContext {
+        config: &snapshot, view: &view, session, frame, scene, az3_kind, request,
+    };
+    if scene == SceneKind::Console && az3_kind.is_known() && !desktop.prepare_az3(&mut flow) {
+        return;
     }
 
-    match scene {
-        SceneKind::Morse => run_morse(&snapshot, &view, &mut session, cancel, tx),
-        SceneKind::Fingerprint => run_fingerprint(&snapshot, &view, &mut session, tx),
-        SceneKind::Console => {
-            if az3_kind.is_known() {
-                // AZ3 实时抓帧上限 300 帧 / 15s（仅任务期存在，结束即 Drop；空闲期零抓帧）。
-                // `frame` 就是就绪等待确认的那一帧 —— 黄键台要把它已看到的黄键带进流程。
-                drop(session);
-                run_az3(&snapshot, &view, az3_kind, monitor, cancel, tx, Some(&frame));
-            } else {
-                // 旧操作台复用当前会话（配额与留证逻辑都在 `run_console` 内），
-                // 会话随本函数出口 Drop。
-                run_console(&snapshot, &view, &mut session, monitor, tx);
+    match flow.scene {
+        SceneKind::Morse => {
+            let outcome = run_morse_with(flow.config, flow.view, &mut flow.session,
+                desktop.input(), cancel);
+            let (used, limit) = desktop.budget(&flow.session);
+            if budget_exhausted(used, limit) {
+                let reason = budget_reason(used, limit);
+                desktop.evidence("fail", &reason, &format!("已抓帧数: {used}（上限 {limit}）"),
+                    Evidence { monitor: view.monitor, backend: snapshot.capture_backend });
+                let _ = tx.send(UiEvent::Failed(reason));
+                return;
             }
+            publish_morse_outcome(flow.config, &outcome, tx);
         }
+        SceneKind::Fingerprint => desktop.fingerprint(flow),
+        SceneKind::Console if az3_kind.is_known() => desktop.az3(flow),
+        SceneKind::Console => desktop.console(flow),
         SceneKind::Unknown => {
             let _ = tx.send(UiEvent::Rejected("检查游戏".to_owned()));
         }
@@ -1266,22 +1418,19 @@ fn led_region_for(view: &PxView, az3: delta_scene::Az3Kind) -> PxRect {
 }
 
 /// 读操作台 LED 目标序列（只读，不发输入）；走任务会话，因此计入配额。
-fn read_sequence(session: &mut CaptureSession, led_region: PxRect) -> Result<String, String> {
-    let frame = session
-        .grab(led_region)
-        .map_err(|error| error.to_string())?;
+fn read_sequence(session: &mut impl delta_flow_morse::ScreenSource, led_region: PxRect) -> Result<String, String> {
+    let frame = session.grab(led_region)?;
     delta_vision::read_glyph_string(&frame.luma()).map_err(|error| error.to_string())
 }
 
-/// 摩斯流程（薄适配：`LiveScreen` / `LiveInput` 由 flow crate 提供）。
-fn run_morse(
+/// 生产和离线宿主共用 job 构造与公开摩斯流程，不改变玩法。
+fn run_morse_with<S: delta_flow_morse::ScreenSource, I: delta_flow_morse::InputSink>(
     config: &Config,
     view: &PxView,
-    session: &mut CaptureSession,
+    source: &mut S,
+    input: &mut I,
     cancel: &AtomicBool,
-    tx: &mpsc::Sender<UiEvent>,
-) {
-    let mut input = delta_flow_morse::LiveInput;
+) -> delta_flow_morse::MorseOutcome {
     let job = delta_flow_morse::MorseRun {
         view,
         timings: &config.timings,
@@ -1290,14 +1439,14 @@ fn run_morse(
         // 输入横条 ROI：输错接力的观察窗口（未标定 ⇒ 零面积 ⇒ 不做错误态观察）。
         panel: delta_flow_morse::panel_roi(view),
     };
-    // 适配层只借用会话：跑完即释放借用，才能读 `frames_taken` 判配额。
-    let outcome = {
-        let mut screen = delta_flow_morse::LiveScreen::new(session);
-        delta_flow_morse::run(&mut screen, &mut input, &job, cancel)
-    };
-    if over_budget(session, tx, view.monitor, config.capture_backend) {
-        return;
-    }
+    delta_flow_morse::run(source, input, &job, cancel)
+}
+
+fn publish_morse_outcome(
+    config: &Config,
+    outcome: &delta_flow_morse::MorseOutcome,
+    tx: &mpsc::Sender<UiEvent>,
+) {
     let total = outcome.cells.len();
     let _ = tx.send(UiEvent::Progress {
         done: outcome.cells.iter().filter(|cell| cell.digit.is_some()).count(),
@@ -1769,6 +1918,39 @@ mod tests {
         assert_eq!(map_scene(delta_scene::Scene::Unknown), SceneKind::Unknown);
     }
 
+    /// 忙时门：空门放行第一个任务，重入必须被拒，凭据一落地门就重新打开。
+    #[test]
+    fn busy_gate_admits_the_first_task_and_reopens_when_it_drops() {
+        let busy = AtomicBool::new(false);
+
+        assert!(!busy.swap(true, Ordering::SeqCst), "空门必须放行第一个任务");
+        {
+            let _gate = BusyGate(&busy);
+            // 忙时重复按 F / 功能热键：热键泵读的就是这个值（读 true 就不入队）。
+            assert!(busy.load(Ordering::SeqCst), "跑着的时候门必须是关的");
+            assert!(
+                busy.swap(true, Ordering::SeqCst),
+                "门关着时第二个任务必须被拒"
+            );
+        }
+        assert!(!busy.load(Ordering::SeqCst), "凭据落地必须把门重新打开");
+    }
+
+    /// panic 展开也必须放行：`run_once` 里任何一处炸了，都不能让所有热键永久失灵。
+    #[test]
+    fn busy_gate_reopens_after_a_panic() {
+        let busy = AtomicBool::new(false);
+        assert!(!busy.swap(true, Ordering::SeqCst));
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _gate = BusyGate(&busy);
+            panic!("识别线程里炸了");
+        }));
+
+        assert!(crashed.is_err(), "这个用例本来就要让它炸");
+        assert!(!busy.load(Ordering::SeqCst), "panic 之后必须放行下一个任务");
+    }
+
     #[test]
     fn uncalibrated_config_has_missing_areas() {
         // 未校准时 `run_once` 必须走「请先校准」分支，而非拿零矩形去截图。
@@ -1813,8 +1995,7 @@ mod tests {
 
     /// 总开关关掉后，**真实识别入口**也必须一个输入事件都不产生（spec §5.3 t1 / B3 真实路径）。
     ///
-    /// 只断言那一条 `NOTICE_MASTER_PAUSED`：它只能由闸门在 `focus_game_window()` 与
-    /// `try_px_view()` **之前**发出，所以文案对上即证明没激活游戏窗口、没建采集会话、没抓帧。
+    /// 通过共用 dispatch 的四 fake 计数证明零依赖调用，并保留原闸门文案断言。
     #[test]
     fn paused_master_makes_run_once_stop_before_touching_the_game_window() {
         use std::sync::mpsc::channel;
@@ -1824,14 +2005,12 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let (tx, rx) = channel();
 
-        run_once(
-            &config,
-            MonitorInfo::new(1280, 720).expect("合法显示器"),
-            &tx,
-            &cancel,
-            None,
-            None,
-        );
+        let mut desktop = OfflineDesktop::default();
+        run_once_with(&config, TaskRequest {
+            monitor: MonitorInfo::new(1280, 720).expect("合成几何"),
+            tx: &tx, cancel: &cancel, forced: None, forced_az3: None,
+        }, &mut desktop);
+        assert_eq!(desktop.effects(), [0, 0, 0, 0]);
 
         let events: Vec<UiEvent> = rx.try_iter().collect();
         assert_eq!(
@@ -2849,8 +3028,7 @@ mod tests {
 
     /// W-T5（真实路径）：关掉的功能，强制热键也必须在**激活窗口 / 建会话之前**退出。
     ///
-    /// 只断言事件表恰好是「开始 + 开关已关闭」：那条文案只能由闸门发出，而闸门排在
-    /// `focus_game_window()` 与 `open_session()` 之前 —— 对上文案即证明零激活、零抓帧、零注入。
+    /// 同一生产 dispatch 注入四 fake，同时钉住事件文案与零依赖调用，不能只靠文案证明隔离。
     #[test]
     fn a_disabled_flow_stops_forced_hotkeys_before_any_side_effect() {
         use std::sync::mpsc::channel;
@@ -2877,14 +3055,12 @@ mod tests {
             let cancel = AtomicBool::new(false);
             let (tx, rx) = channel();
 
-            run_once(
-                &config,
-                MonitorInfo::new(1280, 720).expect("合法显示器"),
-                &tx,
-                &cancel,
-                forced,
-                forced_az3,
-            );
+            let mut desktop = OfflineDesktop::default();
+            run_once_with(&config, TaskRequest {
+                monitor: MonitorInfo::new(1280, 720).expect("合成几何"),
+                tx: &tx, cancel: &cancel, forced, forced_az3,
+            }, &mut desktop);
+            assert_eq!(desktop.effects(), [0, 0, 0, 0]);
 
             let events: Vec<UiEvent> = rx.try_iter().collect();
             assert_eq!(
@@ -2910,12 +3086,404 @@ mod tests {
         }
     }
 
+    /// 合成摩斯三区。
+    ///
+    /// **百分比是 0..1 的比例，不是 0..100 的百分数**（`PctRect` 的约定，见 `delta_geom`）。
+    /// 旧写法把三个区写成 `x: 10.0 / 35.0 / 60.0`、`y: 20.0`、`w: 20.0`、`h: 12.0`，
+    /// `PctRect::to_px` 直接 `PctOutOfRange` ⇒ `try_px_view()` 失败 ⇒ `run_once_with`
+    /// 在「请先校准」那一行就收手，采集会话一次都没建（`session.opens == 0`）。
+    /// 两条 dispatch 用例（`enabled_…` / `offscene_…`）红的根因就在这里，与业务代码无关。
+    fn offline_task_config() -> Arc<Mutex<Config>> {
+        Arc::new(Mutex::new(Config {
+            monitor: MonitorInfo::new(1280, 720).expect("合成几何"),
+            regions: [0.10_f32, 0.35, 0.60].into_iter().enumerate().map(|(index, x)| {
+                delta_config::RegionEntry {
+                    name: format!("synthetic-cell-{index}"),
+                    rect: delta_geom::PctRect { x, y: 0.20, w: 0.20, h: 0.12 },
+                }
+            }).collect(),
+            auto_confirm: false,
+            f_key_hook_enabled: false,
+            ocr_enabled: false,
+            ..Config::default()
+        }))
+    }
+
+    #[derive(Clone, Default)]
+    struct OfflineClock(std::rc::Rc<std::cell::Cell<u64>>);
+
+    impl Clock for OfflineClock {
+        fn now_ms(&self) -> u64 {
+            self.0.get()
+        }
+
+        fn sleep_ms(&mut self, ms: u64) {
+            self.0.set(self.0.get() + ms);
+        }
+    }
+
+    #[derive(Default)]
+    struct OfflineWindow {
+        calls: usize,
+        guard_reads: usize,
+    }
+
+    #[derive(Default)]
+    struct OfflineCaptureLog {
+        opens: usize,
+        requested: Vec<PxRect>,
+    }
+
+    struct OfflineCapture {
+        log: std::rc::Rc<std::cell::RefCell<OfflineCaptureLog>>,
+        frames: Vec<(PxRect, Frame)>,
+        full: PxRect,
+        blank: Frame,
+        panel: PxRect,
+        panel_frame: Frame,
+        replay: Option<Frame>,
+        used: u32,
+        limit: u32,
+    }
+
+    impl delta_flow_morse::ScreenSource for OfflineCapture {
+        fn grab(&mut self, rect: PxRect) -> Result<Frame, String> {
+            assert!(self.used < self.limit, "脚本配额不足，不允许退回 Live");
+            self.used += 1;
+            self.log.borrow_mut().requested.push(rect);
+            if let Some(frame) = &self.replay {
+                return replay_crop(frame, rect);
+            }
+            if rect == self.full {
+                return Ok(self.blank.clone());
+            }
+            if rect == self.panel {
+                return Ok(self.panel_frame.clone());
+            }
+            self.frames.iter().find(|(region, _)| *region == rect)
+                .map(|(_, frame)| frame.clone())
+                .ok_or_else(|| format!("未登记脚本矩形: {rect:?}"))
+        }
+    }
+
+    fn replay_png(path: &std::path::Path) -> Frame {
+        let decoder = png::Decoder::new(std::io::BufReader::new(
+            std::fs::File::open(path).expect("真实录像PNG必须存在"),
+        ));
+        let mut reader = decoder.read_info().expect("真实录像PNG头");
+        let mut buffer = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buffer).expect("真实录像PNG像素");
+        assert_eq!(info.bit_depth, png::BitDepth::Eight);
+        let channels = match info.color_type {
+            png::ColorType::Rgb => 3,
+            png::ColorType::Rgba => 4,
+            other => panic!("真实录像必须是RGB/RGBA，实际{other:?}"),
+        };
+        let mut bgra = Vec::with_capacity(Frame::buffer_len(info.width, info.height));
+        for pixel in buffer[..info.buffer_size()].chunks_exact(channels) {
+            bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+        }
+        Frame::new(info.width, info.height, bgra, std::time::Instant::now())
+            .expect("真实录像BGRA长度")
+    }
+
+    fn replay_crop(frame: &Frame, rect: PxRect) -> Result<Frame, String> {
+        if rect.x < 0 || rect.y < 0 || rect.w <= 0 || rect.h <= 0
+            || rect.right() > frame.w as i32 || rect.bottom() > frame.h as i32
+        {
+            return Err(format!("原帧{}x{}无法裁切{rect:?}", frame.w, frame.h));
+        }
+        let mut data = Vec::with_capacity(Frame::buffer_len(rect.w as u32, rect.h as u32));
+        for y in rect.y..rect.bottom() {
+            let start = (y as usize * frame.stride as usize) + rect.x as usize * 4;
+            data.extend_from_slice(&frame.data[start..start + rect.w as usize * 4]);
+        }
+        Frame::new(rect.w as u32, rect.h as u32, data, frame.captured_at)
+            .map_err(|error| error.to_string())
+    }
+
+    #[derive(Default)]
+    struct OfflineInput {
+        clock: OfflineClock,
+        digits: Vec<u8>,
+        digit_times: Vec<u64>,
+        clicks: Vec<PxPoint>,
+        waits: Vec<u64>,
+    }
+
+    impl delta_flow_morse::InputSink for OfflineInput {
+        fn press_digit(&mut self, digit: u8) -> Result<(), String> {
+            self.digits.push(digit);
+            self.digit_times.push(self.clock.now_ms());
+            Ok(())
+        }
+
+        fn click(&mut self, at: PxPoint) -> Result<(), String> {
+            self.clicks.push(at);
+            Ok(())
+        }
+
+        fn sleep_ms(&mut self, ms: u64) {
+            self.waits.push(ms);
+            self.clock.sleep_ms(ms);
+        }
+    }
+
+    #[derive(Default)]
+    struct OfflineEvidence {
+        notes: Vec<String>,
+    }
+
+    struct OfflineDesktop {
+        window: OfflineWindow,
+        session: std::rc::Rc<std::cell::RefCell<OfflineCaptureLog>>,
+        input: OfflineInput,
+        clock: OfflineClock,
+        evidence: OfflineEvidence,
+        replay: Option<Frame>,
+    }
+
+    impl Default for OfflineDesktop {
+        fn default() -> Self {
+            let clock = OfflineClock::default();
+            Self {
+                window: OfflineWindow::default(),
+                session: std::rc::Rc::default(),
+                input: OfflineInput { clock: clock.clone(), ..OfflineInput::default() },
+                clock,
+                evidence: OfflineEvidence::default(),
+                replay: None,
+            }
+        }
+    }
+
+    impl OfflineDesktop {
+        fn effects(&self) -> [usize; 4] {
+            let session = self.session.borrow();
+            [self.window.calls + self.window.guard_reads, session.opens + session.requested.len(),
+                self.input.digits.len() + self.input.clicks.len() + self.input.waits.len(),
+                self.evidence.notes.len()]
+        }
+    }
+
+    fn offline_frame(rect: PxRect, dots: bool) -> Frame {
+        let (w, h) = (rect.w as u32, rect.h as u32);
+        let mut data = vec![0; (w * h * 4) as usize];
+        if dots {
+            for y in 0..h {
+                for x in 0..w {
+                    if (25..37).contains(&y)
+                        && (0..5).any(|dot| (16 + dot * 40..28 + dot * 40).contains(&x))
+                    {
+                        let start = ((y * w + x) * 4) as usize;
+                        data[start..start + 4].fill(255);
+                    }
+                }
+            }
+        }
+        Frame::new(w, h, data, std::time::Instant::now()).expect("合成 BGRA 长度")
+    }
+
+    impl TaskDesktop for OfflineDesktop {
+        type Session = OfflineCapture;
+        type Input = OfflineInput;
+        type Clock = OfflineClock;
+
+        fn load_guard(&mut self) -> ui_guard::UiGuard {
+            self.window.guard_reads += 1;
+            if self.replay.is_some() {
+                ui_guard::UiGuard::load(&ui_templates_dir())
+            } else {
+                ui_guard::UiGuard::default()
+            }
+        }
+
+        fn focus(&mut self) -> Result<(), String> {
+            self.window.calls += 1;
+            Ok(())
+        }
+
+        fn open(&mut self, config: &Config, _tx: &mpsc::Sender<UiEvent>) -> Option<Self::Session> {
+            self.session.borrow_mut().opens += 1;
+            let view = config.try_px_view().expect("合成配置可解析");
+            let full = full_rect(view.monitor);
+            let panel = delta_flow_morse::panel_roi(&view);
+            Some(OfflineCapture {
+                log: self.session.clone(),
+                frames: view.regions.iter().map(|region| {
+                    (region.rect, offline_frame(region.rect, true))
+                }).collect(),
+                full,
+                blank: offline_frame(full, false),
+                panel,
+                panel_frame: offline_frame(panel, false),
+                replay: self.replay.clone(),
+                used: 0,
+                // 就绪轮询脚本容量，不冒称生产 FRAME_BUDGET/WGC 构造验证。
+                limit: 128,
+            })
+        }
+
+        fn ready_grab(session: &mut Self::Session, rect: PxRect) -> Result<Frame, String> {
+            delta_flow_morse::ScreenSource::grab(session, rect)
+        }
+
+        fn clock(&mut self) -> &mut Self::Clock {
+            &mut self.clock
+        }
+
+        fn input(&mut self) -> &mut Self::Input {
+            &mut self.input
+        }
+
+        fn budget(&self, session: &Self::Session) -> (u32, u32) {
+            (session.used, session.limit)
+        }
+
+        fn evidence(&mut self, tag: &str, reason: &str, detail: &str, _context: Evidence) {
+            self.evidence.notes.push(format!("{tag}: {reason}; {detail}"));
+        }
+
+        fn prepare_az3(&mut self, _flow: &mut FlowContext<'_, Self::Session>) -> bool {
+            panic!("本 S0 fake 未支持 AZ3 准备，不允许 fallback Live")
+        }
+
+        fn fingerprint(&mut self, _flow: FlowContext<'_, Self::Session>) {
+            panic!("本 S0 fake 未支持指纹公开 run，不允许 fallback Live")
+        }
+
+        fn console(&mut self, _flow: FlowContext<'_, Self::Session>) {
+            panic!("本 S0 fake 未支持旧操作台公开 run，不允许 fallback Live")
+        }
+
+        fn az3(&mut self, _flow: FlowContext<'_, Self::Session>) {
+            panic!("本 S0 fake 未支持 AZ3 公开 run，不允许 fallback Live")
+        }
+    }
+
+    #[test]
+    fn enabled_dispatch_runs_morse_through_four_offline_dependencies() {
+        let config = offline_task_config();
+        let cancel = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel();
+        let mut desktop = OfflineDesktop::default();
+        run_once_with(&config, TaskRequest {
+            monitor: MonitorInfo::new(1280, 720).expect("合成几何"),
+            tx: &tx, cancel: &cancel, forced: Some(SceneKind::Morse), forced_az3: None,
+        }, &mut desktop);
+        assert_eq!(desktop.window.calls, 1);
+        let session = desktop.session.borrow();
+        assert_eq!(session.opens, 1);
+        assert_eq!(desktop.input.digits, vec![5, 5, 5]);
+        assert_eq!(desktop.input.clicks, Vec::<PxPoint>::new());
+        assert_eq!(desktop.evidence.notes, Vec::<String>::new());
+        let view = config.lock().expect("合成配置锁").try_px_view().expect("合成视图");
+        let panel = delta_flow_morse::panel_roi(&view);
+        assert!(panel.w > 0 && panel.h > 0);
+        let expected: Vec<_> = std::iter::once(full_rect(view.monitor))
+            .chain(view.regions.iter().map(|region| region.rect))
+            .chain([panel; 3]).collect();
+        assert_eq!(session.requested, expected, "首帧、三格解码、三次真实非零 panel 观察");
+        // 只记录按压时刻，不在这一层断言节奏：正常路径的 50ms 由 `flow-morse` 自己的用例钉住。
+        assert_eq!(desktop.input.digit_times.len(), 3);
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(events.iter().any(|event| matches!(event, UiEvent::Progress { done: 3, total: 3, .. })));
+        assert!(events.iter().any(|event| matches!(event, UiEvent::Result(_))));
+        assert!(events.iter().any(|event| matches!(event, UiEvent::Succeeded(reason) if reason == "已输入数字 555")));
+        assert!(!events.iter().any(|event| matches!(event, UiEvent::Failed(_) | UiEvent::Rejected(_))));
+    }
+
+    fn replay_real_morse_dispatch(forced: Option<SceneKind>) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source = root.join(".scratch/astra-recovery/media-research-20261117-astra-a1/record20261117-020241_f0008640.png");
+        let frame = replay_png(&source);
+        assert_eq!((frame.w, frame.h), (1920, 1080));
+        let monitor = MonitorInfo::new(1920, 1080).expect("原录像几何");
+        let loaded = delta_config::load(&root.join("dist/delta-pwd-tool.config.json"))
+            .expect("只读旧dist配置");
+        assert!(loaded.config.confirm_clicks.is_empty(), "不填自定义确认点绕问题");
+        assert!(loaded.config.auto_confirm);
+        let config = Arc::new(Mutex::new(loaded.config.with_runtime_monitor(monitor)));
+        let view = config.lock().expect("配置锁").try_px_view().expect("真实分辨率视图");
+        let decoded: Vec<_> = view.regions.iter().map(|region| {
+            let cell = replay_crop(&frame, region.rect).expect("原ROI裁切");
+            (region.rect, delta_flow_morse::decode_gray(&cell.luma()))
+        }).collect();
+        eprintln!("[real-replay] source={} 原ROI={decoded:?} panel={:?} confirm={:?}",
+            source.display(), delta_flow_morse::panel_roi(&view), view.confirm_clicks);
+        let cancel = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel();
+        let mut desktop = OfflineDesktop { replay: Some(frame), ..OfflineDesktop::default() };
+        run_once_with(&config, TaskRequest {
+            monitor, tx: &tx, cancel: &cancel, forced, forced_az3: None,
+        }, &mut desktop);
+        let events: Vec<_> = rx.try_iter().collect();
+        eprintln!("[real-replay] digits={:?} clicks={:?} requests={:?} events={events:?}",
+            desktop.input.digits, desktop.input.clicks, desktop.session.borrow().requested);
+        assert!(events.iter().any(|event| matches!(event,
+            UiEvent::Progress { done: 3, total: 3, .. })),
+            "原录像三个可见点划组必须全部解码；实际{events:?}");
+        assert_eq!(desktop.input.digits.len(), 3, "三个可见数字必须实际输入");
+        assert!(!desktop.input.clicks.is_empty(), "auto_confirm开且有当帧按钮必须实际确认");
+    }
+
+    #[test]
+    fn real_morse_forced_dispatch_reads_all_three_recorded_cells() {
+        replay_real_morse_dispatch(Some(SceneKind::Morse));
+    }
+
+    #[test]
+    fn real_morse_auto_dispatch_reads_all_three_recorded_cells() {
+        replay_real_morse_dispatch(None);
+    }
+
+    #[test]
+    fn pre_cancel_dispatch_calls_no_dependency() {
+        let config = offline_task_config();
+        let cancel = AtomicBool::new(true);
+        let (tx, rx) = mpsc::channel();
+        let mut desktop = OfflineDesktop::default();
+        run_once_with(&config, TaskRequest {
+            monitor: MonitorInfo::new(1280, 720).expect("合成几何"),
+            tx: &tx, cancel: &cancel, forced: Some(SceneKind::Morse), forced_az3: None,
+        }, &mut desktop);
+        assert_eq!(desktop.effects(), [0, 0, 0, 0]);
+        assert!(rx.try_iter().any(|event| matches!(event, UiEvent::Failed(reason) if reason == "已取消")));
+    }
+
+    #[test]
+    fn offscene_dispatch_never_calls_input() {
+        let config = offline_task_config();
+        let cancel = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel();
+        let mut desktop = OfflineDesktop::default();
+        run_once_with(&config, TaskRequest {
+            monitor: MonitorInfo::new(1280, 720).expect("合成几何"),
+            tx: &tx, cancel: &cancel, forced: None, forced_az3: None,
+        }, &mut desktop);
+        assert_eq!(desktop.window.calls, 1);
+        assert_eq!(desktop.window.guard_reads, 1);
+        let session = desktop.session.borrow();
+        assert_eq!(session.opens, 1);
+        assert!(session.requested.len() > 1);
+        assert!(session.requested.iter().all(|rect| *rect == full_rect(MonitorInfo { w: 1280, h: 720 })));
+        assert_eq!(desktop.input.digits, Vec::<u8>::new());
+        assert_eq!(desktop.input.clicks, Vec::<PxPoint>::new());
+        assert_eq!(desktop.input.waits, Vec::<u64>::new());
+        assert!(desktop.clock.now_ms() >= READY_BUDGET_MS);
+        assert_eq!(desktop.evidence.notes.len(), 1);
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(events.iter().any(|event| matches!(event, UiEvent::Rejected(reason) if reason == "未检测到游戏界面")));
+        assert!(!events.iter().any(|event| matches!(event, UiEvent::Succeeded(_))));
+    }
+
     /// 同一个功能开着时，强制键不会被闸门拦下（否则上面那条用例可能只是「什么都拦」）。
     ///
     /// 断言到「不是开关文案」为止：真跑下去会去打游戏窗口，测试环境里不该发生，
     /// 这里只要证明闸门放行了 —— 后面的失败来自窗口/采集，与开关无关。
     #[test]
-    fn an_enabled_flow_is_not_stopped_by_the_flow_gate() {
+    #[ignore = "旧 enabled 例可达真实窗口/采集；四 fake dispatch 接通前禁止执行"]
+    fn live_an_enabled_flow_is_not_stopped_by_the_flow_gate() {
         use std::sync::mpsc::channel;
 
         let config = Arc::new(Mutex::new(Config {

@@ -202,6 +202,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "真实 GDI 抓屏；游戏运行期间禁止执行，须单独授权"]
     fn every_grab_returns_a_fresh_buffer_without_resident_state() {
         let rect = PxRect {
             x: 0,
@@ -239,6 +240,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "真实 GDI 抓屏；游戏运行期间禁止执行，须单独授权"]
     fn fifty_grabs_do_not_leak_gdi_objects() {
         let rect = PxRect {
             x: 0,
@@ -260,13 +262,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "真实显示器查询；游戏运行期间禁止执行，须单独授权"]
     fn primary_monitor_size_is_positive() {
         let monitor = primary_monitor_size().expect("主显示器尺寸可读");
         assert!(monitor.is_calibrated(), "{monitor:?}");
     }
 
     #[test]
-    #[ignore = "手动运行：抓 100x100 区域 100 次，断言均值 <2ms（每次新建 GDI 资源，比常驻略慢）"]
+    #[ignore = "真实 GDI 抓屏性能集成；游戏运行期间禁止执行，须单独授权"]
     fn grab_100x100_benchmark() {
         let rect = PxRect {
             x: 0,

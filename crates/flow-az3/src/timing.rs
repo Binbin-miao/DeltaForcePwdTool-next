@@ -6,10 +6,15 @@
 //! 2. **按错识别**：带内红色占比 ≥ [`RED_ABORT_RATIO`] → 立即 Abort（整条变红是唯一失败信号）。
 //! 3. **找游标**：带内最大绿色连通域（面积 ≥ [`MIN_CURSOR_PIXELS`]），只取它的 `cx`；
 //!    用全带质心会被整条绿底拉偏，这是旧实现的根因。
-//! 4. **按空格**：格宽 = 带宽 / 5，`idx == 2` 即中间格；只有「上一帧不在中间格」时才按一次，
-//!    同一格停留绝不重复按。按满 [`TOTAL_CHARS`] 次即完成（大保险固定 5 个字符）。
-//! 5. **按键止损**：真面板每按一次游标必推进。若连按 [`STUCK_LIMIT`] 次都从没观测到
-//!    「游标离开中间格」⇒ Abort（空格在游戏里是移动/跳跃键，误判时乱按会让角色自己动）。
+//! 4. **按空格**：格宽 = 带宽 / 5，`idx == 2` 即中间格；**必须真的读到过游标不在中间格**
+//!    之后才允许按一次 —— 读不清的帧既不算「离开」也不算「进入」。旧实现拿 `None` 覆盖
+//!    `last_cell`，面板抖一下就会对同一个字符按两次，整条直接变红（用户反馈的「大保险怎么
+//!    按都不对」）。同一格重复进入绝不重复按。
+//! 5. **五次输入 ≠ 完成**：按满 [`TOTAL_CHARS`] 次只是我们自己的计数，不是面板给的证据。
+//!    终态证据只有一条 —— 高亮带消失（面板关了）。等不到就按未确认完成收尾
+//!    （`confirmed = false`），绝不把「我按了 5 下」当成解开。
+//! 6. **按键止损**：按下过一次之后，连续 [`STILL_FRAMES`] 个可读帧都停在同一格 ⇒ 游标根本
+//!    没在扫（真面板的游标一定在换格），这条带是假的，立刻 Abort（空格在游戏里是**跳跃**）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -31,12 +36,16 @@ const RED_ABORT_RATIO: f32 = 0.30;
 const TOTAL_CHARS: i32 = 5;
 /// 中间格的格序号（0 起）。
 const CENTER_CELL: i32 = 2;
-/// 连续多少次「按下之后压根没观测到游标离开中间格」才判定这条带是假的。
+/// 按满 5 个字符之后等终态证据（高亮带消失）的窗口。
 ///
-/// 真面板每按一次，游标必然跳到下一格或整条推进 —— 「离开过中间格」是必然观测得到的事实。
-/// 若连按 3 次都只有「中格 / 读不到游标」两种状态在闪，那这条带不是大保险的带
-/// （空格在游戏里是**跳跃**，误判时乱按就是在让角色自己跳）。
-const STUCK_LIMIT: u32 = 3;
+/// 面板关闭有动画，给足一秒半；等不到就按「未确认完成」收尾，而不是假装成功。
+const CONFIRM_WAIT_MS: u64 = 1_500;
+/// 连续多少个「读到了格序号」的帧都停在同一格，就判定这条带的游标不在扫。
+///
+/// 真面板的游标逐格右移，按完必换格。这里刻意给得很宽（100 帧 ≈ 5s）：这道护栏的用处
+/// 只是**给一句准话**（「游标没在扫」比「超时」有用得多），不是省时间；
+/// 宁可晚一点报，也绝不能把扫得慢的真面板误杀。
+const STILL_FRAMES: u32 = 100;
 
 fn is_highlight(color: [u8; 3]) -> bool {
     geom::is_green_glow(color) || geom::is_red_glow(color)
@@ -130,11 +139,12 @@ pub fn run(
     let start_ms = clock.now_ms();
     let mut hits = 0usize;
     let mut band_misses = 0u32;
+    // 上一次**确实读到**的格序号。读不清的帧不动它 —— 见 `cell` 那段注释。
     let mut last_cell: Option<i32> = None;
-    // 上次按下之后，是否观测到过游标离开中间格。
-    let mut left_center = false;
-    // 连续多少次「按下后从没离开过中间格」。
-    let mut stuck_hits = 0u32;
+    // 连续多少个可读帧停在同一格（游标扫动监视）。
+    let mut still_frames = 0u32;
+    // 按满 5 个字符的时刻；`Some` = 已进入「等终态证据」阶段，此后一个键都不再按。
+    let mut typed_all_at: Option<u64> = None;
 
     for _ in 0..az3.frame_budget {
         if cancel.load(Ordering::SeqCst) {
@@ -161,6 +171,16 @@ pub fn run(
 
         let detected = detect_band(&frame);
         let Some(actual) = detected else {
+            // 按满 5 个字符之后高亮带消失 = 面板真关了。这是唯一能拿到的终态证据。
+            if typed_all_at.is_some() {
+                return Az3Outcome::Done {
+                    kind: Az3Kind::SafeTiming,
+                    steps: hits,
+                    events: pointer.event_count(),
+                    summary: format!("大保险已输入 {TOTAL_CHARS} 个字符，面板已关闭"),
+                    confirmed: true,
+                };
+            }
             band_misses += 1;
             if band_misses >= BAND_MISS_LIMIT {
                 return Az3Outcome::Aborted {
@@ -169,7 +189,7 @@ pub fn run(
                     events: pointer.event_count(),
                 };
             }
-            // 刻意保留 `last_cell`：单帧检测抖动不代表游标离开了中间格，
+            // 刻意保留 `last_cell` / `still_frames`：单帧检测抖动不代表游标离开了中间格，
             // 清掉它就会把「还在中格」当成「重新进入中格」，同一字符按两次 → 整条变红。
             clock.sleep_ms(az3.poll_interval_ms);
             continue;
@@ -184,10 +204,47 @@ pub fn run(
             };
         }
 
-        let cell = cursor_cell(&frame, actual);
-        if cell.is_some_and(|cell| cell != CENTER_CELL) {
-            left_center = true;
+        // 已经按满 5 个：不再按任何键，只等带子消失（面板关闭）。
+        if let Some(started) = typed_all_at {
+            if clock.now_ms().saturating_sub(started) >= CONFIRM_WAIT_MS {
+                return Az3Outcome::Done {
+                    kind: Az3Kind::SafeTiming,
+                    steps: hits,
+                    events: pointer.event_count(),
+                    // 「我按了 5 下」不是证据：面板还在，就是没法确认。
+                    summary: format!(
+                        "大保险已输入 {TOTAL_CHARS} 个字符，但高亮带仍在（未确认完成）"
+                    ),
+                    confirmed: false,
+                };
+            }
+            clock.sleep_ms(az3.poll_interval_ms);
+            continue;
         }
+
+        let cell = cursor_cell(&frame, actual);
+
+        // 游标扫动监视：按下过一次之后，连续 `STILL_FRAMES` 个可读帧都停在同一格 ⇒ 游标没在扫。
+        // 只数「读到了格序号」的帧：读不清不算证据，否则闪一下就重置，护栏永远不响。
+        if hits > 0 {
+            if cell.is_some() && cell == last_cell {
+                still_frames += 1;
+            } else if cell.is_some() {
+                still_frames = 0;
+            }
+            if still_frames >= STILL_FRAMES {
+                return Az3Outcome::Aborted {
+                    kind: Az3Kind::SafeTiming,
+                    reason: format!(
+                        "大保险：连续 {still_frames} 帧游标都没换过格，疑似误判界面，已停手"
+                    ),
+                    events: pointer.event_count(),
+                };
+            }
+        }
+
+        // 只有「上一次确实读到的是非中间格」才算重新进入中间格。
+        // `None`（读不清）既不是离开也不是进入 —— 拿它当离开就是同一个字符按两次。
         if cell == Some(CENTER_CELL) && last_cell != Some(CENTER_CELL) {
             if let Err(error) = pointer.key_space() {
                 return Az3Outcome::Aborted {
@@ -197,36 +254,28 @@ pub fn run(
                 };
             }
             hits += 1;
-            // 护栏：按下去了，但上一次按下之后的全部帧里游标一次都没离开过中间格 ——
-            // 真面板按完必然推进（游标跳到下一格或整条前移）。连着 3 次都是这样 ⇒ 这条带是假的。
-            if left_center {
-                stuck_hits = 0;
-            } else {
-                stuck_hits += 1;
-            }
-            left_center = false;
-            if stuck_hits >= STUCK_LIMIT {
-                return Az3Outcome::Aborted {
-                    kind: Az3Kind::SafeTiming,
-                    reason: format!(
-                        "大保险：连按 {stuck_hits} 次后游标位置都没变，疑似误判界面，已停手"
-                    ),
-                    events: pointer.event_count(),
-                };
-            }
             if hits >= TOTAL_CHARS as usize {
-                return Az3Outcome::Done {
-                    kind: Az3Kind::SafeTiming,
-                    steps: hits,
-                    events: pointer.event_count(),
-                    summary: format!("大保险已按满 {TOTAL_CHARS} 个字符"),
-                    confirmed: true,
-                };
+                // 不在这里报完成：等带子消失才是证据（见上面那段）。
+                typed_all_at = Some(clock.now_ms());
             }
         }
-        last_cell = cell;
+        // 读不清就不覆盖：写进 `None` 等于伪造一次「离开中格」。
+        if cell.is_some() {
+            last_cell = cell;
+        }
 
         clock.sleep_ms(az3.poll_interval_ms);
+    }
+
+    // 帧预算 / 总时长用完了还没等到终态证据：仍然是「未确认完成」，不是失败也不是成功。
+    if typed_all_at.is_some() {
+        return Az3Outcome::Done {
+            kind: Az3Kind::SafeTiming,
+            steps: hits,
+            events: pointer.event_count(),
+            summary: format!("大保险已输入 {TOTAL_CHARS} 个字符，但没等到面板关闭（未确认完成）"),
+            confirmed: false,
+        };
     }
 
     Az3Outcome::Aborted {

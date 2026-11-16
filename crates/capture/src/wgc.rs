@@ -409,6 +409,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "真实 WGC 系统集成；游戏运行期间禁止执行，须单独授权"]
     fn wgc_session_either_starts_or_reports_an_hresult() {
         match WgcSession::new() {
             Ok(_session) => {}

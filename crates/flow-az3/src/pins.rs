@@ -7,6 +7,8 @@
 //! 判据链（每帧一次整帧抓取，几何全部现场量，见 [`delta_scene::locate::locate_pins`]）：
 //! 1. 量出轨道 + 目标白块 + 游标细竖线，并把每个目标配一个最近的游标；
 //! 2. 逐对判水平距离：**离开过容差区之后**再回到容差内才按一次空格（防连按）；
+//!    而且**轨道必须连续 [`PIN_STABLE_FRAMES`] 帧几乎不动**才允许按 —— 跑图时画面在推，
+//!    那时出现的「对齐」只是镜头推过去的巧合，一格都不许按（空格 = 跳跃）。
 //! 3. 完成证据：底部指示条绿条数达到 [`INDICATOR_SLOTS`] 格 ⇒ `Done{confirmed:true}`；
 //!    一格绿条都读不到（指示条不在画面里 / 阈值不符）⇒ 退化为「所有见过的目标都按过一遍」
 //!    收尾，且 `confirmed:false`（照 `keys.rs` 的退化范式：**绝不假装成功**）。
@@ -36,6 +38,14 @@ const LOCK_BAR_MIN: (u32, u32) = (12, 6);
 const LOCK_BAR_MIN_AREA: u32 = 64;
 /// 连续多少帧量不出轨道才放弃（50ms 轮询 ⇒ 20 帧 ≈1s，留给镜头微调）。
 const LOCATE_FAIL_LIMIT: u32 = 20;
+/// 允许按空格的前置条件：轨道连续这么多帧几乎不动。
+///
+/// 真面板是模态的，轨道钉在屏幕同一个位置；正常跑图时整个画面在推，轨道每帧都会滑走。
+/// 少了这一条，任何「像轨道的横条 + 会抖的白点」都可能在跑图时被当成任务保险按下空格 ——
+/// 而空格在游戏里是**跳跃**，误按一次角色自己就跳了（用户实测的「跑图时自己按空格」）。
+const PIN_STABLE_FRAMES: u32 = 3;
+/// 判定「轨道没动」的像素容差（720p 口径，按屏幕倍数放大）。
+const PIN_TRACK_DRIFT: i32 = 6;
 
 /// 目标位的记账：**按目标中心 x 记账，不按 pair 下标**。
 ///
@@ -114,6 +124,10 @@ pub fn run(
     // 连续多少帧「轨道在、但一对都配不上」—— 只进超时文案，不单独 Abort：
     // 开局游标还没出来时配不上是正常的（[`locate_pins`] 的零值边界），早退会把真面板当成错界面。
     let mut unpaired = 0u32;
+    // 轨道稳定度：只有连续 `PIN_STABLE_FRAMES` 帧轨道几乎不动，才允许按第一个空格。
+    let drift = crate::scaled_len(PIN_TRACK_DRIFT, scale).max(1);
+    let mut last_track: Option<(i32, i32)> = None;
+    let mut stable_frames = 0u32;
 
     for _ in 0..az3.frame_budget.max(1) {
         if cancel.load(Ordering::SeqCst) {
@@ -141,6 +155,17 @@ pub fn run(
             }
         };
         misses = 0;
+
+        // 轨道稳定度：真面板钉在屏幕上，跑图时整个画面在推 —— 见 `PIN_STABLE_FRAMES`。
+        match last_track {
+            Some((x, y))
+                if (pins.track.x - x).abs() <= drift && (pins.track.y - y).abs() <= drift =>
+            {
+                stable_frames = stable_frames.saturating_add(1);
+            }
+            _ => stable_frames = 0,
+        }
+        last_track = Some((pins.track.x, pins.track.y));
 
         locked = locked_bars(&frame, az3.indicator_band, scale);
         if locked >= INDICATOR_SLOTS {
@@ -172,6 +197,10 @@ pub fn run(
             }
             if !slot.1 {
                 // 从来没离开过容差区（首帧就对齐）⇒ 不许按：那会按在早一格的时机上。
+                continue;
+            }
+            if stable_frames < PIN_STABLE_FRAMES {
+                // 画面还在动：这次「对齐」可能只是镜头推过去的巧合，不按。
                 continue;
             }
             if let Err(error) = pointer.key_space() {
