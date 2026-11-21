@@ -1,0 +1,93 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/geom",
+  "crates/config",
+  "crates/capture",
+  "crates/vision",
+  "crates/templates",
+  "crates/input",
+  "crates/hotkey",
+  "crates/ocr",
+  "crates/scene",
+  "crates/flow-morse",
+  "crates/flow-fingerprint",
+  "crates/flow-console",
+  "crates/flow-az3",
+  "crates/ui",
+  "crates/app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+delta-geom = { path = "crates/geom" }
+delta-vision = { path = "crates/vision" }
+delta-config = { path = "crates/config" }
+delta-capture = { path = "crates/capture" }
+delta-templates = { path = "crates/templates" }
+delta-input = { path = "crates/input" }
+delta-hotkey = { path = "crates/hotkey" }
+delta-ocr = { path = "crates/ocr" }
+# t4：纯 Rust PNG 解码（模板素材 105x105 真彩），rayon 并行 612 次匹配。
+png = "0.17"
+rayon = "1"
+# t2 依赖预算：仅 GDI / 窗口消息 / DLL 装载，不引入 HiDpi feature，
+# DPI 感知通过 LoadLibrary+GetProcAddress 动态解析（见 crates/capture/src/dpi.rs）。
+# t5 追加 SendInput / RegisterHotKey；t6 追加 WinRT OCR（零模型，用系统组件）。
+windows = { version = "0.58", default-features = false, features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_System_Com",
+  "Win32_System_Threading",
+  "Win32_System_WinRT",
+  "Foundation",
+  "Foundation_Collections",
+  "Globalization",
+  "Graphics_Imaging",
+  "Media_Ocr",
+  "Storage_Streams",
+] }
+
+# spec D1：单 exe ≤12MB，体积/启动优先（浮光结论）。
+# 实测：fat LTO + codegen-units=1 在本机（R7 9700X / 31G）链接阶段死锁 39 分钟无产出，
+# 故降级为 thin LTO + cgu=16：编译快 5~10 倍，体积预计多 5~10%（仍在 12MB 预算内）。
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+strip = true
+
+# 热路径豁免：体积优化(z)会让「612 次 NCC 匹配」从 40ms 劣化到 ~100ms，
+# 且 egui 每帧重排也会掉帧。这几个包单独开 O3，总体积只增几百 KB，远在 12MB 预算内。
+[profile.release.package.delta-vision]
+opt-level = 3
+
+[profile.release.package.delta-templates]
+opt-level = 3
+
+[profile.release.package.delta-ui]
+opt-level = 3
+
+[profile.release.package.delta-app]
+opt-level = 3
+
+[profile.release.package.egui]
+opt-level = 3
+
+[profile.release.package.epaint]
+opt-level = 3
+
+[profile.release.package.eframe]
+opt-level = 3

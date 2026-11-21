@@ -1,0 +1,46 @@
+[package]
+name = "delta-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "delta-pwd-tool"
+path = "src/main.rs"
+
+[build-dependencies]
+# 把 icon.rc 编进 exe 资源段（文件图标）。它自己会找 Windows Kits 里的 rc.exe。
+embed-resource = "3"
+
+[dependencies]
+thiserror = { workspace = true }
+delta-ui = { path = "../ui" }
+delta-config = { path = "../config" }
+delta-geom = { path = "../geom" }
+delta-capture = { path = "../capture" }
+delta-vision = { path = "../vision" }
+delta-templates = { path = "../templates" }
+delta-hotkey = { path = "../hotkey" }
+delta-ocr = { path = "../ocr" }
+delta-scene = { path = "../scene" }
+delta-flow-morse = { path = "../flow-morse" }
+delta-flow-fingerprint = { path = "../flow-fingerprint" }
+delta-flow-console = { path = "../flow-console" }
+delta-flow-az3 = { path = "../flow-az3" }
+# 补录指纹模板要把九格写成 PNG（与模板库解码同一套 png 0.17）。
+png = { workspace = true }
+# spec D1：glow 后端（禁 wgpu）。
+eframe = { version = "0.37", default-features = false, features = ["glow"] }
+egui = "0.37"
+# 单实例（`CreateMutexW`）与找窗激活（`EnumWindows`）需要额外打开 Security 特性。
+windows = { version = "0.58", default-features = false, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_System_Threading",
+  "Win32_System_Com",
+  "Win32_System_Registry",
+] }

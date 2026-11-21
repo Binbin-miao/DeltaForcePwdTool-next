@@ -1,0 +1,264 @@
+{
+  "monitor": {
+    "w": 0,
+    "h": 0
+  },
+  "regions": [
+    {
+      "name": "morse_cell_1",
+      "rect": {
+        "x": 0.273047,
+        "y": 0.356944,
+        "w": 0.078125,
+        "h": 0.034722
+      }
+    },
+    {
+      "name": "morse_cell_2",
+      "rect": {
+        "x": 0.377734,
+        "y": 0.356944,
+        "w": 0.078125,
+        "h": 0.034722
+      }
+    },
+    {
+      "name": "morse_cell_3",
+      "rect": {
+        "x": 0.482031,
+        "y": 0.356944,
+        "w": 0.078125,
+        "h": 0.034722
+      }
+    }
+  ],
+  "fingerprint": {
+    "name_region": {
+      "x": 0.275781,
+      "y": 0.45625,
+      "w": 0.0625,
+      "h": 0.022222
+    },
+    "number_region": {
+      "x": 0.402344,
+      "y": 0.368056,
+      "w": 0.130859,
+      "h": 0.277778
+    },
+    "candidate_boxes": [
+      {
+        "x": 0.594531,
+        "y": 0.388889,
+        "w": 0.041016,
+        "h": 0.072917
+      },
+      {
+        "x": 0.644531,
+        "y": 0.388889,
+        "w": 0.041016,
+        "h": 0.072917
+      },
+      {
+        "x": 0.694531,
+        "y": 0.388889,
+        "w": 0.041016,
+        "h": 0.072917
+      },
+      {
+        "x": 0.594531,
+        "y": 0.477083,
+        "w": 0.041016,
+        "h": 0.072917
+      },
+      {
+        "x": 0.644531,
+        "y": 0.477083,
+        "w": 0.041016,
+        "h": 0.072917
+      },
+      {
+        "x": 0.694531,
+        "y": 0.477083,
+        "w": 0.041016,
+        "h": 0.072917
+      },
+      {
+        "x": 0.594531,
+        "y": 0.565972,
+        "w": 0.041016,
+        "h": 0.072917
+      },
+      {
+        "x": 0.644531,
+        "y": 0.565972,
+        "w": 0.041016,
+        "h": 0.072917
+      },
+      {
+        "x": 0.694531,
+        "y": 0.565972,
+        "w": 0.041016,
+        "h": 0.072917
+      }
+    ]
+  },
+  "console": {
+    "led_region": {
+      "x": 0.678906,
+      "y": 0.156944,
+      "w": 0.295313,
+      "h": 0.065278
+    },
+    "panel_region": {
+      "x": 0.051563,
+      "y": 0.119444,
+      "w": 0.479688,
+      "h": 0.638889
+    },
+    "col_x": [
+      0.111524,
+      0.231446,
+      0.351368,
+      0.47129
+    ],
+    "row_y": [
+      0.283333,
+      0.384722,
+      0.486111,
+      0.588889
+    ],
+    "knob_center": {
+      "x": 0.561719,
+      "y": 0.459722
+    }
+  },
+  "az3": {
+    "grid_region": {
+      "x": 0.215,
+      "y": 0.33,
+      "w": 0.31,
+      "h": 0.3
+    },
+    "target_band": {
+      "x": 0.215,
+      "y": 0.44,
+      "w": 0.31,
+      "h": 0.12
+    },
+    "crack_button": {
+      "x": 0.6,
+      "y": 0.33,
+      "w": 0.14,
+      "h": 0.24
+    },
+    "timing_window_pct": 0.018,
+    "track_band": {
+      "x": 0.285,
+      "y": 0.215,
+      "w": 0.415,
+      "h": 0.105
+    },
+    "indicator_band": {
+      "x": 0.285,
+      "y": 0.3,
+      "w": 0.415,
+      "h": 0.12
+    },
+    "pin_center_x": [
+      0.325,
+      0.412,
+      0.495,
+      0.577,
+      0.66
+    ],
+    "pin_tolerance_pct": 0.012,
+    "button_grid_region": {
+      "x": 0.5,
+      "y": 0.27,
+      "w": 0.21,
+      "h": 0.325
+    },
+    "progress_region": {
+      "x": 0.275,
+      "y": 0.453,
+      "w": 0.219,
+      "h": 0.075
+    },
+    "line_led_region": {
+      "x": 0.632,
+      "y": 0.243,
+      "w": 0.225,
+      "h": 0.075
+    },
+    "line_panel_region": {
+      "x": 0.163,
+      "y": 0.255,
+      "w": 0.44,
+      "h": 0.44
+    },
+    "line_col_x": [
+      0.265,
+      0.363,
+      0.468,
+      0.545
+    ],
+    "line_row_y": [
+      0.345,
+      0.405,
+      0.472,
+      0.54
+    ],
+    "line_knob_center": {
+      "x": 0.735,
+      "y": 0.565
+    },
+    "max_duration_ms": 15000,
+    "frame_budget": 300,
+    "poll_interval_ms": 50
+  },
+  "confirm_clicks": [],
+  "hotkeys": {
+    "scene": "F8",
+    "morse": "F5",
+    "fingerprint": "F6",
+    "console": "F7",
+    "keys": "F10",
+    "line": "F11",
+    "master": "/"
+  },
+  "timings": {
+    "morse_after_input_ms": 600,
+    "fingerprint_after_click_ms": 1700,
+    "key_interval_ms": 50,
+    "click_interval_ms": 50,
+    "console_dwell_ms": 900,
+    "console_parse_timeout_ms": 3000,
+    "console_column_timeout_ms": 12000,
+    "console_global_timeout_ms": 90000,
+    "morse_recognize_delay_ms": 20,
+    "keys_recognize_delay_ms": 100,
+    "first_key_extra_delay_ms": 50
+  },
+  "ocr_enabled": true,
+  "auto_confirm": true,
+  "fingerprint_auto_click": true,
+  "capture_backend": "wgc",
+  "always_on_top": false,
+  "f_key_hook_enabled": true,
+  "master_enabled": true,
+  "flows": {
+    "morse": true,
+    "fingerprint": true,
+    "console": true,
+    "az3_timing": true,
+    "az3_pins": true,
+    "az3_keys": true,
+    "az3_line": true
+  },
+  "game_title_keywords": [
+    "三角洲",
+    "Delta Force"
+  ],
+  "theme_id": "frost",
+  "accent_override": null
+}

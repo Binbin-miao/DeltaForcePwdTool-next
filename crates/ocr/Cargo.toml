@@ -1,0 +1,11 @@
+[package]
+name = "delta-ocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+delta-capture.workspace = true
+thiserror.workspace = true
+windows.workspace = true

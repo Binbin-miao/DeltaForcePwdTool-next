@@ -1,0 +1,1566 @@
+//! AZ3 信号线台（横线台）：**每帧自适应定位 + 只上下拖动 + 列自动推进**。
+//!
+//! 实机机制（录像实测，见 `.scratch/az3/line-geometry.md`）：
+//! - 屏幕里有 4 列、每列 4 个档位，**左侧有 4 个两位行标签**（`0`/`1` 组成，如 `10 11 01 00`）；
+//!   用户实测：**行标签与右上 LED 的数字每局都会变**，所以「第几行是哪个值」必须每帧读，
+//!   见 [`resolve_target_rows`]；
+//! - 右上 LED 给出 4 组目标序列，如 `10-11-01-10`；
+//! - **操作 = 在屏幕里按住左键上下拖动**（等价于「旋转旋钮」），把**当前列**的档位拖到目标行；
+//! - 一列到位后游戏自动推进到下一列；4 列全对 → 黄黑斜纹「信息已校准」。
+//!
+//! 所以这里只做三件事：定位（[`locate`]）、读 LED、纵拖。**不横拖、不点屏幕以外的地方、
+//! 看不出档位就零输入退出** —— 旧实现拿固定坐标去猜，在摩斯面板上发过 64 个乱拖事件。
+//!
+//! **目标行必须查标签表**：旧实现把 LED 的 4 组值直接当行索引（写死 `10/11/01/00`），
+//! 一局标签顺序变一次就会把线拖到错行。读不出标签 ⇒ 一列也不许动（fail-closed）。
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use delta_capture::Frame;
+use delta_config::PxAz3;
+use delta_flow_console::{parse_led_sequence, TargetSequence};
+use delta_geom::{PxPoint, PxRect};
+use delta_scene::locate::{locate_line, LocatedLine, LINE_COLUMNS, LINE_ROWS};
+use delta_vision::{detect_yellow_hatch, external_contours, BinaryImage, DiagonalStripeParams, GrayImage, Region};
+use thiserror::Error;
+
+use crate::{Az3Outcome, Clock, Pointer, Screen};
+
+/// LED 读数缝：生产实现是 [`read_led_sequence`]，测试直接给固定序列。
+///
+/// 用 `fn` 指针（不捕获环境）而不是闭包 trait：调用点能直接把函数名传进来。
+pub type LedReader = fn(&Frame, PxRect) -> Result<TargetSequence, String>;
+
+/// 连续多少帧定位失败才放弃（50ms 轮询下 ≈0.3s 容错）。
+const LOCATE_FAIL_LIMIT: u32 = 20;
+/// 连续多少帧读不出 LED 才放弃。
+const LED_FAIL_LIMIT: u32 = 12;
+/// 连续多少帧看不出当前列档位才放弃。
+const SELECT_FAIL_LIMIT: u32 = 8;
+/// 「这一列停住了」的判据：档位落在目标行后要连续停这么久才算校准完成
+/// （松手后画面还会滑一点，立刻判定会误收）。
+const STABLE_MS: u64 = 600;
+/// 一次拖动之后留给游戏反应的观察窗。
+const SETTLE_MS: u64 = 500;
+/// 一次拖动的分步数（任务要求 6~10 步，取 8）。
+const DRAG_STEPS: i32 = 8;
+/// 单列最多拖几次（合成档位模式）；到次数仍未到位就记 `dead`，不再碰它。
+const MAX_ATTEMPTS: u32 = 3;
+/// 实机信号线连续拖动模式：单列最多允许的分段拉动次数（按住上下拖 → 松开 → 复测再拖）。
+const MAX_WIRE_ATTEMPTS: u32 = 10;
+/// 实机鼠标拖动幅度与横线位移的换算倍率（由 202611171230.mp4 实测 6 次拉动标定：Δy_mouse / Δy_wire ≈ 5.15）。
+const WIRE_DRAG_GAIN: f32 = 5.15;
+/// 实机单次按住拖动后的复测等待时间（毫秒）。
+const WIRE_SETTLE_MS: u64 = 180;
+/// 拖完复读后允许**补拖**的次数（spec B20：最多 1 次，仍偏就记 failed）。
+const MAX_CORRECTIONS: u32 = 1;
+/// 定位失败时给用户的下一步动作。
+const POSE_HINT: &str = "（请正对操作台、让屏幕和红旋钮都进入画面）";
+/// 目标行映射不出来（左侧标签读不出 / 目标值不唯一）时，最多容忍几帧再收尾。
+///
+/// 标签是**静态 UI**，一帧读不出多半下一帧也读不出；4 帧（50ms 轮询 ≈0.2s）足够滤掉
+/// 偶发的抖动帧，又不会让人干等。
+const TARGET_FAIL_LIMIT: u32 = 12;
+
+/// 目标行映射失败的原因。文案直接进 Abort 提示，必须说清「为什么一列都没动」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum TargetMapError {
+    #[error("左侧行标签读不出（4 行里有 {missing} 行没读到），无法把 LED 目标值对应到档位行")]
+    LabelsUnreadable { missing: usize },
+    #[error("第 {column} 列的目标标签 {label:?} 不是两位 0/1，无法对应到档位行")]
+    BadLabel { column: usize, label: &'static str },
+    #[error("第 {column} 列的目标标签 {label:?} 在左侧标签里出现 {hits} 次（必须恰好 1 次），无法确定目标行")]
+    Ambiguous {
+        column: usize,
+        label: &'static str,
+        hits: usize,
+    },
+}
+
+/// 行标签 → 值（`10`=2、`11`=3、`01`=1、`00`=0）：两位 0/1 当二进制读。
+///
+/// 编码必须与 [`delta_scene::locate::LocatedLine::row_labels`] 完全一致 ——
+/// 那边按「十位 ×2 + 个位」产出，这里按同一规则解析标签文本。
+fn label_value(label: &str) -> Option<u8> {
+    let mut value = 0u8;
+    let mut digits = 0usize;
+    for character in label.chars() {
+        value = value * 2
+            + match character {
+                '0' => 0,
+                '1' => 1,
+                _ => return None,
+            };
+        digits += 1;
+    }
+    (digits == 2).then_some(value)
+}
+
+/// **把 LED 的目标值查成档位行索引**：`labels` 是左侧 4 行标签（自上而下，`None` = 读不出）。
+///
+/// 这就是本轮的核心：行与值的对应关系每局都会变，所以只能「LED 目标值 → 在标签表里
+/// 找它出现在第几行」。**任何不确定都不许猜**：
+/// - 4 行标签有一行没读出 ⇒ 整块不可信（那个值可能就藏在读不出的那一行）；
+/// - 某目标值在标签里出现 0 次或 2 次以上 ⇒ 这一列的目标行不唯一。
+pub fn resolve_target_rows(
+    labels: &[Option<u8>; LINE_ROWS],
+    sequence: &TargetSequence,
+) -> Result<[usize; LINE_COLUMNS], TargetMapError> {
+    let missing = labels.iter().filter(|label| label.is_none()).count();
+    if missing > 0 {
+        return Err(TargetMapError::LabelsUnreadable { missing });
+    }
+    let mut rows = [0usize; LINE_COLUMNS];
+    for (column, slot) in rows.iter_mut().enumerate() {
+        let label = sequence.label_for(column);
+        let value = label_value(label).ok_or(TargetMapError::BadLabel { column, label })?;
+        let mut hits = 0usize;
+        for (row, candidate) in labels.iter().enumerate() {
+            if *candidate == Some(value) {
+                hits += 1;
+                *slot = row;
+            }
+        }
+        if hits != 1 {
+            return Err(TargetMapError::Ambiguous {
+                column,
+                label,
+                hits,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// 一次任务的进度账本：把「数到第几帧 / 哪列死掉」从主循环里挪出来。
+#[derive(Default)]
+struct Progress {
+    frames: u32,
+    locate_misses: u32,
+    led_misses: u32,
+    select_misses: [u32; LINE_COLUMNS],
+    /// 这一列**历史上**是否读到过档位（决定读不出时能否安全走归零兜底）。
+    evidence: [bool; LINE_COLUMNS],
+    attempts: [u32; LINE_COLUMNS],
+    /// 已经补拖过几次（每列最多 [`MAX_CORRECTIONS`] 次）。
+    corrections: [u32; LINE_COLUMNS],
+    dead: [bool; LINE_COLUMNS],
+    calibrated: [bool; LINE_COLUMNS],
+    aligned_since: [Option<u64>; LINE_COLUMNS],
+    targets: [usize; LINE_COLUMNS],
+    /// 目标行映射连续失败的帧数（左侧标签读不出 / 目标值不唯一）。
+    target_misses: u32,
+    drags: u32,
+}
+
+/// 控制信号线台的闭环入口。
+///
+/// 每帧最多抓一次屏；`read_led` 由调用方注入（生产传 [`read_led_sequence`]）。
+pub fn run(
+    screen: &mut impl Screen,
+    pointer: &mut impl Pointer,
+    clock: &mut impl Clock,
+    read_led: LedReader,
+    az3: &PxAz3,
+    cancel: &AtomicBool,
+) -> Az3Outcome {
+    let budget = az3.frame_budget.max(1);
+    let poll = az3.poll_interval_ms.max(1);
+    let begun = clock.now_ms();
+    let mut progress = Progress::default();
+
+    while progress.frames < budget {
+        if cancel.load(Ordering::SeqCst) {
+            return aborted(pointer.event_count(), "已取消".to_owned());
+        }
+        if clock.now_ms().saturating_sub(begun) >= az3.max_duration_ms.max(25_000) {
+            return aborted(pointer.event_count(), "超时".to_owned());
+        }
+        progress.frames += 1;
+        let rect = screen.frame_rect();
+        let frame = match screen.grab(rect) {
+            Ok(frame) => frame,
+            Err(error) => return aborted(pointer.event_count(), error),
+        };
+        // `locate_line` 内部归一到 720p 判定、坐标已乘回原图，所以拖动坐标直接就是
+        // 真实屏幕坐标，无需再换算（相对位移也是原图尺度）。
+        if let Some(outcome) = progress.step(&frame, pointer, clock, read_led, cancel) {
+            return outcome;
+        }
+        clock.sleep_ms(poll);
+    }
+    aborted(pointer.event_count(), "抓帧配额已用尽".to_owned())
+}
+
+/// 生产用 LED 读数：裁出字条 → **按拓扑读 0/1** → 拼成 4 组 2 位目标序列。
+///
+/// 不再走字形模板：实机 LED 是点阵风格的 `11-10-00-11`（白字黑底 + 光晕），
+/// 内置模板的 NCC 实测只有 **-0.03**（完全不相关），不是调阈值能救的 —— 字体根本不是同一套。
+///
+/// 而 0 和 1 的区别是**拓扑**：`0` 中间有洞，`1` 是没有洞的细竖条。
+/// 拓扑判据与字体、字号、缩放、光晕全都无关。
+///
+/// `led` 是定位层给的**粗略**框（实测常偏小或偏移几十像素），这里先向外扩一圈，
+/// 再自己在扩后的区域里找「数字所在的那一行带」。
+pub fn read_led_sequence(frame: &Frame, led: PxRect) -> Result<TargetSequence, String> {
+    let region = widen(led, frame);
+    let strip = delta_scene::crop(&frame.luma(), region).ok_or_else(|| "LED 区域越界".to_owned())?;
+    let digits = read_led_digits(&strip)?;
+    if digits.len() != LED_DIGITS {
+        return Err(format!(
+            "LED 读出 {} 个字符（应为 {LED_DIGITS} 个 0/1）：{digits}",
+            digits.len()
+        ));
+    }
+    let text = format!(
+        "{}-{}-{}-{}",
+        &digits[0..2],
+        &digits[2..4],
+        &digits[4..6],
+        &digits[6..8]
+    );
+    parse_led_sequence(&text).map_err(|error| error.to_string())
+}
+
+/// LED 的 0/1 位数（4 组 × 2 位）。
+const LED_DIGITS: usize = 8;
+/// LED 数字亮度的下限（压掉数字外面的淡绿光晕）。
+const LED_DIGIT_LUMA: u8 = 178;
+
+/// 把定位层给的框向外扩：左右各 35% 宽、上下各 60% 高（都不超过帧边界）。
+fn widen(led: PxRect, frame: &Frame) -> PxRect {
+    // 只外扩一点点：定位给的框实测已经盖住数字（`1287,110 554x149` vs 数字 1298..1832/115..200）。
+    // 扩太多会把 LED 面板的黑框、旁边的按钮、顶部 HUD 全带进来，`tallest` 一旦被大块污染，
+    // 数字就全被「同高」过滤器扫掉（实测只剩 1 个连通域）。
+    let pad_x = (led.w as f32 * 0.06) as i32;
+    let pad_y = (led.h as f32 * 0.15) as i32;
+    let x = (led.x - pad_x).max(0);
+    let y = (led.y - pad_y).max(0);
+    let right = (led.right() + pad_x).min(frame.w as i32);
+    let bottom = (led.bottom() + pad_y).min(frame.h as i32);
+    PxRect {
+        x,
+        y,
+        w: (right - x).max(1),
+        h: (bottom - y).max(1),
+    }
+}
+
+/// 在灰度条里按拓扑读出 0/1 串（自左向右）。
+fn read_led_digits_at(strip: &GrayImage, threshold: u8, band: Region) -> Result<String, String> {
+    let binary = BinaryImage::from_gray_threshold(strip, threshold);
+    let max_w = (strip.w / 4).max(8);
+    let max_h = (band.h * 3 / 2).max(8);
+    let glyphs: Vec<Region> = external_contours(&binary)
+        .into_iter()
+        .map(|contour| contour.region)
+        .filter(|region| region.w >= 2 && region.h >= 6)
+        .filter(|region| {
+            region.y.saturating_add(4) >= band.y
+                && region.y + region.h <= band.y + band.h + 4
+        })
+        .filter(|region| region.w <= max_w && region.h <= max_h)
+        .collect();
+    let tallest = glyphs.iter().map(|region| region.h).max().unwrap_or(0);
+    if tallest == 0 {
+        return Err("LED 区域里没有字符".to_owned());
+    }
+    let digits: Vec<Region> = glyphs
+        .into_iter()
+        .filter(|region| region.h * 3 >= tallest * 2)
+        .collect();
+    if digits.len() != LED_DIGITS {
+        return Err(format!(
+            "LED 找到 {} 个数字（应为 {LED_DIGITS} 个）",
+            digits.len()
+        ));
+    }
+    let mut sorted = digits;
+    sorted.sort_by_key(|region| region.x);
+    Ok(sorted
+        .iter()
+        .map(|region| if has_hole(&binary, *region) { '0' } else { '1' })
+        .collect())
+}
+
+fn read_led_digits(strip: &GrayImage) -> Result<String, String> {
+    let primary = strip.otsu().threshold.max(LED_DIGIT_LUMA);
+    let band = digit_band(strip)?;
+    match read_led_digits_at(strip, primary, band) {
+        Ok(digits) => Ok(digits),
+        Err(first_err) => {
+            for candidate in [165u8, 150, 195, 210, 135] {
+                if candidate != primary {
+                    if let Ok(digits) = read_led_digits_at(strip, candidate, band) {
+                        return Ok(digits);
+                    }
+                }
+            }
+            Err(first_err)
+        }
+    }
+}
+
+/// 数字所在的水平带：亮像素最密集的那一段连续行。
+///
+/// LED 条带里除了数字还有面板黑框、底板、旁边的小按钮 —— 它们的亮像素远少于数字行，
+/// 用「行亮像素数」一筛就只剩数字那一带。
+fn digit_band(strip: &GrayImage) -> Result<Region, String> {
+    let mut counts = Vec::with_capacity(strip.h as usize);
+    for y in 0..strip.h {
+        let count = strip
+            .row(y)
+            .iter()
+            .filter(|&&value| value > LED_DIGIT_LUMA)
+            .count();
+        counts.push(count as u32);
+    }
+    let peak = counts.iter().copied().max().unwrap_or(0);
+    if peak == 0 {
+        return Err("LED 区域里没有亮字".to_owned());
+    }
+    // 峰值 30% 以上算「数字行」；取最长的一段连续行。
+    let threshold = (peak * 3 / 10).max(2);
+    let mut best: Option<(u32, u32)> = None;
+    let mut start: Option<u32> = None;
+    for (y, &count) in counts.iter().enumerate() {
+        let live = count >= threshold;
+        match (live, start) {
+            (true, None) => start = Some(y as u32),
+            (false, Some(begin)) => {
+                let span = (y as u32) - begin;
+                if best.is_none_or(|(_, best_span)| span > best_span) {
+                    best = Some((begin, span));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        let span = strip.h - begin;
+        if best.is_none_or(|(_, best_span)| span > best_span) {
+            best = Some((begin, span));
+        }
+    }
+    let (y, h) = best.ok_or_else(|| "LED 区域里没有连续的数字行".to_owned())?;
+    Ok(Region {
+        x: 0,
+        y,
+        w: strip.w,
+        h: h.max(1),
+    })
+}
+
+/// 字符外接框里是否包着一个**不与边界连通**的暗区（数字 `0` 的洞）。
+///
+/// `1` 是一条竖线，暗区全部连着外边界；`0` 中间那圈暗区被亮字围住。
+fn has_hole(binary: &BinaryImage, region: Region) -> bool {
+    let (w, h) = (region.w, region.h);
+    if w < 5 || h < 5 {
+        return false;
+    }
+    let index = |x: u32, y: u32| (y * w + x) as usize;
+    let mut seen = vec![false; (w * h) as usize];
+    let mut stack: Vec<(u32, u32)> = Vec::new();
+    for x in 0..w {
+        stack.push((x, 0));
+        stack.push((x, h - 1));
+    }
+    for y in 0..h {
+        stack.push((0, y));
+        stack.push((w - 1, y));
+    }
+    while let Some((x, y)) = stack.pop() {
+        let slot = index(x, y);
+        if seen[slot] {
+            continue;
+        }
+        seen[slot] = true;
+        if binary.get(region.x + x, region.y + y) {
+            continue;
+        }
+        for (nx, ny) in [
+            (x.wrapping_sub(1), y),
+            (x, y.wrapping_sub(1)),
+            (x + 1, y),
+            (x, y + 1),
+        ] {
+            if nx < w && ny < h {
+                stack.push((nx, ny));
+            }
+        }
+    }
+    let mut enclosed = 0u32;
+    for y in 0..h {
+        for x in 0..w {
+            if !seen[index(x, y)] && !binary.get(region.x + x, region.y + y) {
+                enclosed += 1;
+            }
+        }
+    }
+    // 洞要够大：抗锯齿边缘会留下几个孤立暗点，那不是洞；120 FOV 下字符较小，按面积自适应下限。
+    let min_hole = ((w * h) / 35).clamp(4, 10);
+    enclosed >= min_hole
+}
+
+impl Progress {
+    /// 推进一帧；返回 `Some` 表示这一帧就该收尾。
+    fn step(
+        &mut self,
+        frame: &Frame,
+        pointer: &mut impl Pointer,
+        clock: &mut impl Clock,
+        read_led: LedReader,
+        cancel: &AtomicBool,
+    ) -> Option<Az3Outcome> {
+        let line = match locate_line(frame) {
+            Ok(line) => line,
+            Err(error) => return self.on_locate_miss(frame, pointer.event_count(), error),
+        };
+        self.locate_misses = 0;
+
+        // 「信息已校准」是游戏自己给的完成信号：出现就收工。
+        // 不能只依赖 `track` 的 4 列全部读到档位 —— 实测第 4 列容易被屏幕右缘裁掉
+        // 或完成时不显示黄色定位框，那样 4 列永远凑不齐，会白等到超时。
+        if hatch_visible(frame) {
+            let summary = format!("信息已校准（共拖 {} 次）", self.drags);
+            return Some(done(pointer.event_count(), &summary));
+        }
+
+        let sequence = match read_led(frame, line.led) {
+            Ok(sequence) => sequence,
+            Err(error) => return self.on_led_miss(pointer.event_count(), &error),
+        };
+        self.led_misses = 0;
+        // LED 的 4 组值是**标签值**，不是行索引：每局行标签顺序会变，必须现查。
+        // 实机白线模式下若个别标签被遮挡（如仅 1~2 行未读出），用未出现的标准标签补齐。
+        let effective_labels = if line.wire_y.iter().any(|y| y.is_some()) {
+            complete_row_labels(&line.row_labels)
+        } else {
+            line.row_labels
+        };
+        match resolve_target_rows(&effective_labels, &sequence) {
+            Ok(rows) => {
+                self.targets = rows;
+                self.target_misses = 0;
+            }
+            Err(error) => return self.on_target_miss(pointer.event_count(), error),
+        }
+
+        if self.track(frame, &line, clock.now_ms()) {
+            let summary = format!("信号线台已对齐校准（4 列，共拖 {} 次）", self.drags);
+            return Some(done(pointer.event_count(), &summary));
+        }
+        let Some(column) = self.current() else {
+            // 没有可推进的列，且 `track` 没判全绿：说明有列被判死（看不出档位）。
+            // 再空转只会烧帧配额，直接说清是哪几列没搞定。
+            let missed: Vec<String> = (0..LINE_COLUMNS)
+                .filter(|&column| self.dead[column] && !self.calibrated[column])
+                .map(|column| (column + 1).to_string())
+                .collect();
+            let reason = if missed.is_empty() {
+                "4 列都没能对齐".to_owned()
+            } else {
+                format!("第 {} 列没能对齐（看不出信号线位置，已跳过）", missed.join("、"))
+            };
+            return Some(aborted(pointer.event_count(), reason));
+        };
+        self.drive_line(&line, column, pointer, clock, cancel)
+    }
+
+    /// 定位失败的处理：允许抖动几帧，超了才放弃（全程零输入）。
+    fn on_locate_miss(
+        &mut self,
+        frame: &Frame,
+        events: u64,
+        error: delta_scene::locate::LocateError,
+    ) -> Option<Az3Outcome> {
+        // 定位失败时唯一可能的好消息：黄黑斜纹「信息已校准」把面板盖住了。
+        if hatch_visible(frame) {
+            return Some(done(events, "信息已校准（黄黑斜纹已出现）"));
+        }
+        self.locate_misses += 1;
+        if self.locate_misses < LOCATE_FAIL_LIMIT {
+            return None;
+        }
+        let reason = format!("{error}{POSE_HINT}");
+        Some(aborted(events, reason))
+    }
+
+    /// LED 读失败的处理：允许抖动几帧，超了才放弃。
+    fn on_led_miss(&mut self, events: u64, error: &str) -> Option<Az3Outcome> {
+        self.led_misses += 1;
+        if self.led_misses < LED_FAIL_LIMIT {
+            return None;
+        }
+        let reason = format!("右上角数字条读不出来（要求 4 组、每组 2 位 0/1）：{error}");
+        Some(aborted(events, reason))
+    }
+
+    /// 目标行映射不出来：**这一帧一列也不许动**（`None` = 零输入继续等）。
+    ///
+    /// 这是本轮 fail-closed 的落点：不知道「这个值在第几行」就去拖，等于闭着眼睛把线
+    /// 拖到别的档位 —— 拖错之后游戏不会告诉你，4 列全错才算完。宁可零输入退出。
+    fn on_target_miss(&mut self, events: u64, error: TargetMapError) -> Option<Az3Outcome> {
+        self.target_misses += 1;
+        if self.target_misses < TARGET_FAIL_LIMIT {
+            return None;
+        }
+        Some(aborted(
+            events,
+            format!("{error}（已按零输入退出，避免拖错行）"),
+        ))
+    }
+
+    /// 更新「哪列已校准」：实机出现白色 `[]` 锁定边框或横线在目标行上连续停满 `STABLE_MS`。返回是否 4 列全部校准。
+    fn track(&mut self, frame: &Frame, line: &LocatedLine, now: u64) -> bool {
+        let has_wire = line.wire_y.iter().any(|y| y.is_some());
+        let gap = line_row_gap(line);
+        let tight_tol = (gap / 8).max(6);
+        for column in 0..LINE_COLUMNS {
+            if self.calibrated[column] {
+                continue;
+            }
+            if has_wire {
+                if let Some(center) = line.slot_center(column, self.targets[column]) {
+                    let wire_y = active_wire_y(line, column);
+                    if has_lock_bracket(frame, center, gap, wire_y) {
+                        self.calibrated[column] = true;
+                        self.aligned_since[column] = Some(now);
+                        continue;
+                    }
+                    let aligned = wire_y.is_some_and(|wy| (center.y - wy).abs() <= tight_tol);
+                    if !aligned {
+                        self.aligned_since[column] = None;
+                        continue;
+                    }
+                    let since = *self.aligned_since[column].get_or_insert(now);
+                    if now.saturating_sub(since) >= STABLE_MS {
+                        self.calibrated[column] = true;
+                    }
+                    continue;
+                }
+            }
+            let aligned = line.selected.get(column).copied().flatten() == Some(self.targets[column]);
+            if !aligned {
+                self.aligned_since[column] = None;
+                continue;
+            }
+            let since = *self.aligned_since[column].get_or_insert(now);
+            if now.saturating_sub(since) >= STABLE_MS {
+                self.calibrated[column] = true;
+            }
+        }
+        self.calibrated.iter().all(|&done| done)
+    }
+
+    /// 当前列 = 第一个还没校准、也没被判死的列。
+    fn current(&self) -> Option<usize> {
+        (0..LINE_COLUMNS).find(|&column| !self.calibrated[column] && !self.dead[column])
+    }
+
+    /// 读不出当前档位时的兜底：**归零再定位**。
+    ///
+    /// 信号线是连续可调的，实机常停在两档之间，`selected` 因此是 `None`。
+    /// 这条路不依赖「当前是第几行」，只用相对位移：
+    /// 1. 向上拖过全部档位（游戏会把线夹在顶行）；
+    /// 2. 从顶行往下数到目标行。
+    fn homing_drag(
+        &mut self,
+        line: &LocatedLine,
+        column: usize,
+        pointer: &mut impl Pointer,
+        clock: &mut impl Clock,
+        cancel: &AtomicBool,
+    ) -> Option<Az3Outcome> {
+        if self.attempts[column] >= MAX_ATTEMPTS {
+            self.dead[column] = true;
+            return self.on_column_dead(pointer.event_count());
+        }
+        let (Some(top), Some(target)) = (
+            line.slot_center(column, 0),
+            line.slot_center(column, self.targets[column]),
+        ) else {
+            return Some(aborted(pointer.event_count(), "档位坐标换算失败".to_owned()));
+        };
+        let gap = (target.y - top.y).abs().max(1);
+        let grab = PxPoint {
+            x: line.columns.get(column).copied().unwrap_or(top.x),
+            y: top.y,
+        };
+        // 第一步：向上拖过全部档位，游戏会把线夹到顶行。
+        let overshoot = -(gap * (LINE_ROWS as i32 + 1));
+        if let Err(error) = drag(pointer, grab, overshoot, cancel) {
+            return Some(aborted(pointer.event_count(), error));
+        }
+        clock.sleep_ms(SETTLE_MS);
+        // 第二步：从顶行往下数到目标行。
+        if let Err(error) = drag(pointer, grab, target.y - top.y, cancel) {
+            return Some(aborted(pointer.event_count(), error));
+        }
+        self.attempts[column] += 1;
+        self.drags += 2;
+        if self.over_drag_cap() {
+            return Some(aborted(pointer.event_count(), over_cap_reason()));
+        }
+        clock.sleep_ms(SETTLE_MS);
+        None
+    }
+
+    /// 实机信号线模式：按当前白线高度 `wire_y` 与目标行高度差换算鼠标拖动距离（支持多段按住拉动-松开-再拉动）。
+    fn drive_wire_line(
+        &mut self,
+        line: &LocatedLine,
+        column: usize,
+         wy: i32,
+        pointer: &mut impl Pointer,
+        clock: &mut impl Clock,
+        cancel: &AtomicBool,
+    ) -> Option<Az3Outcome> {
+        self.evidence[column] = true;
+        self.select_misses[column] = 0;
+        let Some(target) = line.slot_center(column, self.targets[column]) else {
+            return Some(aborted(pointer.event_count(), "档位坐标换算失败".to_owned()));
+        };
+        let gap = line_row_gap(line);
+        let tight_tol = (gap / 8).max(6);
+        let dy_wire = target.y - wy;
+        if dy_wire.abs() <= tight_tol {
+            // 白线已进入目标行容差带：松手静候 `[]` 白色锁定框弹出（或满 600ms 稳定期），绝不再乱拖。
+            return None;
+        }
+        if self.attempts[column] >= MAX_WIRE_ATTEMPTS {
+            self.dead[column] = true;
+            return self.on_column_dead(pointer.event_count());
+        }
+        let raw_dy = ((dy_wire as f32) * WIRE_DRAG_GAIN).round() as i32;
+        let max_stroke = (line.screen.h * 3 / 4).max(160);
+        let stroke_dy = raw_dy.clamp(-max_stroke, max_stroke);
+        // 实机横线台在屏幕任意位置上下拖动均可控制当前列；固定取第 3 列（屏幕中右侧），
+        // 彻底避开屏幕左上角可能放置的工具窗口或队友浮标。
+        let start_x = line
+            .columns
+            .get(2)
+            .or_else(|| line.columns.get(column))
+            .copied()
+            .unwrap_or(line.screen.x + line.screen.w * 7 / 10);
+        // 向上拉时从屏幕偏下处按住往上拖，向下拉时从屏幕偏上处按住往下拖，避免单次拉动撞到屏幕边缘。
+        let start_y = if stroke_dy < 0 {
+            line.screen.y + line.screen.h * 3 / 4
+        } else {
+            line.screen.y + line.screen.h / 4
+        };
+        let grab = PxPoint {
+            x: start_x,
+            y: start_y,
+        };
+        if let Err(error) = drag(pointer, grab, stroke_dy, cancel) {
+            return Some(aborted(pointer.event_count(), error));
+        }
+        self.attempts[column] += 1;
+        self.drags += 1;
+        if self.over_drag_cap() {
+            return Some(aborted(pointer.event_count(), over_cap_reason()));
+        }
+        clock.sleep_ms(WIRE_SETTLE_MS);
+        None
+    }
+
+    /// 驱动某一列：看得出档位/白线高度就纵拖到目标行，看不出就等下一帧（绝不盲拖）。
+    fn drive_line(
+        &mut self,
+        line: &LocatedLine,
+        column: usize,
+        pointer: &mut impl Pointer,
+        clock: &mut impl Clock,
+        cancel: &AtomicBool,
+    ) -> Option<Az3Outcome> {
+        if let Some(wy) = active_wire_y(line, column) {
+            return self.drive_wire_line(line, column, wy, pointer, clock, cancel);
+        }
+        let Some(row) = line.selected.get(column).copied().flatten() else {
+            // 读不出当前档位。**这里必须区分两种情形**，否则就是「没有证据也动手」：
+            //
+            // - 这一列**曾经**读到过档位（信号线在连续可调过程中暂时停在两档之间，
+            //   实测 y=204 距最近档位 104px、档距 109px）⇒ 归零兜底是安全的：
+            //   我们已经确认过这块屏幕、这一列确实存在；
+            // - 这一列**从来没读到过**（静止未开始画面、过场、判别层误判别的界面）
+            //   ⇒ 屏幕内容都不确定，还要按下去拖 5 个行距，就是纯盲拖。
+            //   维持旧行为：判死这一列，零输入退出。
+            if !self.evidence[column] {
+                self.dead[column] = true;
+                return self.on_column_dead(pointer.event_count());
+            }
+            self.select_misses[column] += 1;
+            if self.select_misses[column] <= SELECT_FAIL_LIMIT {
+                return self.homing_drag(line, column, pointer, clock, cancel);
+            }
+            self.dead[column] = true;
+            return self.on_column_dead(pointer.event_count());
+        };
+        self.evidence[column] = true;
+        self.select_misses[column] = 0;
+        if row == self.targets[column] {
+            // 已经在这一列的目标行上：只等「停住 600ms」，绝不再拖（否则会把对齐好的线拖走）。
+            return None;
+        }
+        if self.attempts[column] >= MAX_ATTEMPTS {
+            self.dead[column] = true;
+            return self.on_column_dead(pointer.event_count());
+        }
+        // 拖后复读（B20）：复读发现**仍然偏**就补拖，但**只补一次**；补完还偏就记 failed。
+        // 每列最多 2 次拖动（1 主 + 1 补），因此不存在来回抖动的可能。
+        let dragged_before = self.attempts[column] > 0;
+        if dragged_before && self.corrections[column] >= MAX_CORRECTIONS {
+            self.dead[column] = true;
+            return self.on_column_dead(pointer.event_count());
+        }
+        if dragged_before {
+            self.corrections[column] += 1;
+        }
+        let (Some(from), Some(to)) = (
+            line.slot_center(column, row),
+            line.slot_center(column, self.targets[column]),
+        ) else {
+            return Some(aborted(pointer.event_count(), "档位坐标换算失败".to_owned()));
+        };
+        if let Err(error) = drag(pointer, from, to.y - from.y, cancel) {
+            return Some(aborted(pointer.event_count(), error));
+        }
+        self.attempts[column] += 1;
+        self.drags += 1;
+        if self.over_drag_cap() {
+            return Some(aborted(pointer.event_count(), over_cap_reason()));
+        }
+        clock.sleep_ms(SETTLE_MS);
+        None
+    }
+
+    /// 拖动次数是否到了硬上限（跑飞时立刻收手；正常一轮最多约 28 次）。
+    ///
+    /// **为什么不用事件数**：一次拖动 = 按下 + 8 子步 + 抬起 = 10 个输入事件，
+    /// 60 个事件只有 6 次拖动 —— 会在正常一轮（4 列各 1~2 拖 + 补拖）里误报「疑似误判」。
+    /// 所以这一档的单位是**拖动次数**，不是事件数。
+    fn over_drag_cap(&self) -> bool {
+        self.drags >= delta_config::AZ3_MAX_DRAG_ACTIONS
+    }
+
+    /// 一列被判死之后：4 列全死才收工，否则继续推进剩下的列。
+    fn on_column_dead(&self, events: u64) -> Option<Az3Outcome> {
+        if !self.dead.iter().all(|&dead| dead) {
+            return None;
+        }
+        let reason = format!("4 列都没能对齐（每列拖了 {MAX_ATTEMPTS} 次仍不到目标行）");
+        Some(aborted(events, reason))
+    }
+
+}
+
+fn done(events: u64, summary: &str) -> Az3Outcome {
+    Az3Outcome::Done {
+        kind: delta_scene::Az3Kind::SignalLine,
+        steps: LINE_COLUMNS,
+        events,
+        summary: summary.to_owned(),
+        confirmed: true,
+    }
+}
+
+fn aborted(events: u64, reason: String) -> Az3Outcome {
+    Az3Outcome::Aborted {
+        kind: delta_scene::Az3Kind::SignalLine,
+        reason: format!("信号线台：{reason}"),
+        events,
+    }
+}
+
+/// 撞拖动上限时的收尾文案：必须说清「这是疑似误判」，不是「这局解不完」。
+fn over_cap_reason() -> String {
+    format!(
+        "疑似误判：已达拖动次数上限（{}），已停止注入",
+        delta_config::AZ3_MAX_DRAG_ACTIONS
+    )
+}
+
+/// 相邻档位行的平均间距（像素）。
+fn line_row_gap(line: &LocatedLine) -> i32 {
+    if line.rows.len() < 2 {
+        return 60;
+    }
+    let span = line.rows.last().copied().unwrap_or(0) - line.rows.first().copied().unwrap_or(0);
+    (span / (line.rows.len() as i32 - 1)).max(24)
+}
+
+/// 实机白线模式下补齐因局部遮挡未读出的行标签（`10=2, 11=3, 01=1, 00=0` 的剩余未使用值）。
+fn complete_row_labels(labels: &[Option<u8>; LINE_ROWS]) -> [Option<u8>; LINE_ROWS] {
+    if labels.iter().all(|l| l.is_some()) {
+        return *labels;
+    }
+    let default_order = [2u8, 3, 1, 0];
+    let mut used = [false; 4];
+    for val in labels.iter().copied().flatten() {
+        if (val as usize) < 4 {
+            used[val as usize] = true;
+        }
+    }
+    let mut remaining = default_order.into_iter().filter(|&v| !used[v as usize]);
+    let mut out = *labels;
+    for slot in &mut out {
+        if slot.is_none() {
+            *slot = remaining.next();
+        }
+    }
+    out
+}
+
+/// 取当前受控列的白线高度：优先取本列及右侧活动段 `wire_y`，若全被遮挡则回退取任一可见段高度。
+fn active_wire_y(line: &LocatedLine, column: usize) -> Option<i32> {
+    line.wire_y
+        .get(column..)
+        .and_then(|slice| slice.iter().copied().flatten().next())
+        .or_else(|| line.wire_y.iter().copied().flatten().next())
+}
+
+/// 检测目标档位四周是否已弹出白色 `[]` 锁定括号（对应实机 `image_8d4603.png` vs 未锁定 `image_8d465a.png`）。
+///
+/// 判据：
+/// 1. 中心米黄档条已点亮（`R >= 165 && G >= 145 && R - B >= 20` 占比 ≥ 30%）；
+/// 2. 档条左右外侧（`dx ∈ [0.14·gap, 0.28·gap]`，`dy ∈ [-0.24·gap, +0.24·gap]`，避开中央横线 `±4px`）
+///    同时存在高占比的亮白竖括号边（均值 ≥ 175 且色差 ≤ 50，左右两侧各自纵向覆盖率 ≥ 45%）。
+fn has_lock_bracket(frame: &Frame, center: PxPoint, gap: i32, wire_y: Option<i32>) -> bool {
+    let wy = wire_y.unwrap_or(center.y);
+    let inner_x = (gap * 8 / 100).max(3);
+    let inner_y = (gap * 20 / 100).max(6);
+    let mut beige_hits = 0u32;
+    let mut beige_total = 0u32;
+    for y in (center.y - inner_y).max(0)..=(center.y + inner_y).min(frame.h as i32 - 1) {
+        if (y - wy).abs() <= 4 {
+            continue;
+        }
+        for x in (center.x - inner_x).max(0)..=(center.x + inner_x).min(frame.w as i32 - 1) {
+            beige_total += 1;
+            let [b, g, r] = frame.pixel(x as u32, y as u32);
+            if r >= 165 && g >= 145 && r.saturating_sub(b) >= 20 {
+                beige_hits += 1;
+            }
+        }
+    }
+    if beige_total == 0 || beige_hits * 100 < beige_total * 30 {
+        return false;
+    }
+
+    let dx_min = (gap * 14 / 100).max(5);
+    let dx_max = (gap * 28 / 100).max(dx_min + 3);
+    let dy_max = (gap * 24 / 100).max(8);
+    let side_vertical_ratio = |sign: i32| -> u32 {
+        let mut rows_lit = 0u32;
+        let mut rows_total = 0u32;
+        for y in (center.y - dy_max).max(0)..=(center.y + dy_max).min(frame.h as i32 - 1) {
+            if (y - wy).abs() <= 4 {
+                continue;
+            }
+            rows_total += 1;
+            let mut row_has_white = false;
+            for dx in dx_min..=dx_max {
+                let x = center.x + sign * dx;
+                if x < 0 || x >= frame.w as i32 {
+                    continue;
+                }
+                let [b, g, r] = frame.pixel(x as u32, y as u32);
+                let max = r.max(g).max(b);
+                let min = r.min(g).min(b);
+                let mean = (u32::from(r) + u32::from(g) + u32::from(b)) / 3;
+                if mean >= 175 && (max - min) <= 50 {
+                    row_has_white = true;
+                    break;
+                }
+            }
+            if row_has_white {
+                rows_lit += 1;
+            }
+        }
+        if rows_total == 0 {
+            0
+        } else {
+            rows_lit * 100 / rows_total
+        }
+    };
+    side_vertical_ratio(-1) >= 45 && side_vertical_ratio(1) >= 45
+}
+
+/// 完成判据：屏幕里出现「黄框 + 45° 黄黑斜纹」浮层。
+fn hatch_visible(frame: &Frame) -> bool {
+    let params = DiagonalStripeParams::default();
+    detect_yellow_hatch(&frame.data, frame.w, frame.h, frame.stride, &params).unwrap_or(false)
+}
+
+/// 纵拖：按下 → 8 步相对位移 → 抬起。**抬起一定执行**（报错/取消也不许把左键卡住）。
+fn drag(
+    pointer: &mut impl Pointer,
+    from: PxPoint,
+    dy: i32,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    pointer
+        .begin(from)
+        .map_err(|error| format!("按下失败：{error}"))?;
+    let moved = push(pointer, dy, cancel);
+    let released = pointer.end().map_err(|error| format!("抬起失败：{error}"));
+    moved.and(released)
+}
+
+fn push(pointer: &mut impl Pointer, dy: i32, cancel: &AtomicBool) -> Result<(), String> {
+    let mut moved = 0;
+    for step in 0..DRAG_STEPS {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("已取消".to_owned());
+        }
+        let target = dy * (step + 1) / DRAG_STEPS;
+        pointer
+            .step(0, target - moved)
+            .map_err(|error| format!("拖动失败：{error}"))?;
+        moved = target;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // ── 100% 脱敏的合成机台（与任何真实机位无关，只复刻相对结构）──
+
+    const W: u32 = 640;
+    const H: u32 = 360;
+    const MACHINE: [u8; 3] = [148, 152, 150];
+    const BEZEL: [u8; 3] = [10, 190, 190];
+    const PANEL: [u8; 3] = [10, 55, 60];
+    const SLOT: [u8; 3] = [190, 225, 225];
+    const AMBER: [u8; 3] = [250, 210, 60];
+    const LED_DARK: [u8; 3] = [25, 25, 25];
+    const LED_GLYPH: [u8; 3] = [240, 240, 240];
+    const KNOB: [u8; 3] = [140, 40, 30];
+    const SCREEN: PxRect = PxRect {
+        x: 40,
+        y: 40,
+        w: 380,
+        h: 240,
+    };
+    const CONTENT: PxRect = PxRect {
+        x: 52,
+        y: 52,
+        w: 356,
+        h: 216,
+    };
+    const LED_PANEL: PxRect = PxRect {
+        x: 450,
+        y: 60,
+        w: 180,
+        h: 50,
+    };
+    const COLUMNS: [i32; 4] = [100, 180, 260, 340];
+    const ROWS: [i32; 4] = [90, 140, 190, 240];
+    /// 行标签底色（浅蓝绿）与数字墨色（深）。
+    const LABEL_BG: [u8; 3] = [180, 220, 215];
+    const LABEL_INK: [u8; 3] = [30, 45, 45];
+    /// 默认行标签（自上而下）—— 每局会变，测试可以换。
+    const DEFAULT_LABELS: [&str; LINE_ROWS] = ["10", "11", "01", "00"];
+    /// 标签块左缘：铺满 `columns[0]` 左侧 0.70~1.75 个行距的读数窗口（本夹具 12..66）。
+    const LABEL_X: i32 = 12;
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> PxRect {
+        PxRect { x, y, w, h }
+    }
+
+    fn ring(canvas: &mut Canvas, frame: PxRect, thickness: i32, rgb: [u8; 3]) {
+        canvas.paint(rect(frame.x, frame.y, frame.w, thickness), rgb);
+        canvas.paint(
+            rect(frame.x, frame.bottom() - thickness, frame.w, thickness),
+            rgb,
+        );
+        canvas.paint(rect(frame.x, frame.y, thickness, frame.h), rgb);
+        canvas.paint(
+            rect(frame.right() - thickness, frame.y, thickness, frame.h),
+            rgb,
+        );
+    }
+
+    struct Canvas {
+        data: Vec<u8>,
+    }
+
+    impl Canvas {
+        fn new(fill: [u8; 3]) -> Self {
+            let mut data = vec![0u8; (W * H * 4) as usize];
+            for pixel in data.as_chunks_mut::<4>().0 {
+                pixel[0] = fill[2];
+                pixel[1] = fill[1];
+                pixel[2] = fill[0];
+                pixel[3] = 255;
+            }
+            Self { data }
+        }
+
+        fn paint(&mut self, area: PxRect, rgb: [u8; 3]) -> &mut Self {
+            for y in area.y.max(0)..area.bottom().min(H as i32) {
+                for x in area.x.max(0)..area.right().min(W as i32) {
+                    let index = ((y as u32 * W + x as u32) * 4) as usize;
+                    self.data[index] = rgb[2];
+                    self.data[index + 1] = rgb[1];
+                    self.data[index + 2] = rgb[0];
+                }
+            }
+            self
+        }
+
+        fn frame(&self) -> Frame {
+            Frame::new(W, H, self.data.clone(), std::time::Instant::now()).expect("合法合成帧")
+        }
+    }
+
+    /// 一行标签块：浅蓝绿底 + 两位深色数字（`1` 画 8px 竖条、`0` 画 15px 空心环）。
+    ///
+    /// 与实机同构（`.scratch/line-probe/in/panel_clean.png` 量出来的判据）：读数靠
+    /// 「深色像素列投影恰好 2 段 + 段宽 0/1 二选一」，所以这里只要画出那两种字形。
+    fn draw_label(canvas: &mut Canvas, y: i32, text: &str) {
+        canvas.paint(rect(LABEL_X, y - 20, 54, 41), LABEL_BG);
+        for (index, digit) in text.chars().enumerate() {
+            let left = LABEL_X + 14 + index as i32 * 19;
+            let stem = rect(left, y - 9, 8, 19);
+            if digit == '1' {
+                canvas.paint(stem, LABEL_INK);
+            } else {
+                ring(&mut *canvas, rect(left, y - 9, 15, 19), 3, LABEL_INK);
+            }
+        }
+    }
+
+    /// 机台一帧：`selected` 是每列被琥珀框圈住的档位行，`labels` 是左侧 4 行标签。
+    fn machine_with(
+        selected: [Option<usize>; LINE_COLUMNS],
+        knob: bool,
+        labels: [Option<&'static str>; LINE_ROWS],
+    ) -> Frame {
+        let mut canvas = Canvas::new(MACHINE);
+        canvas.paint(SCREEN, BEZEL);
+        canvas.paint(CONTENT, PANEL);
+        for column in COLUMNS {
+            for row in ROWS {
+                canvas.paint(rect(column - 4, row - 9, 8, 18), SLOT);
+            }
+        }
+        for (index, row) in selected.iter().enumerate() {
+            let Some(row) = row else { continue };
+            let slot = rect(COLUMNS[index] - 10, ROWS[*row] - 15, 20, 30);
+            ring(&mut canvas, slot, 3, AMBER);
+        }
+        // 注：这里**不画信号线**。这些用例验的是「琥珀框 → 拖动闭环」这条老路径，
+        // 每条列都有琥珀框，够用了；信号线通道由 `delta-scene` 的合成帧覆盖
+        // （那里画了中灰阶梯线，专门验「只有受控列有框」时的读值）。
+        for (index, label) in labels.iter().enumerate() {
+            if let Some(text) = label {
+                draw_label(&mut canvas, ROWS[index], text);
+            }
+        }
+        canvas.paint(LED_PANEL, LED_DARK);
+        for index in 0..11 {
+            let area = match index % 3 {
+                2 => rect(LED_PANEL.x + 12 + index * 14, LED_PANEL.y + 22, 5, 6),
+                _ => rect(LED_PANEL.x + 12 + index * 14, LED_PANEL.y + 12, 9, 26),
+            };
+            ring(&mut canvas, area, 2, LED_GLYPH);
+        }
+        if knob {
+            canvas.paint(rect(505, 235, 30, 30), KNOB);
+        }
+        canvas.frame()
+    }
+
+    /// 默认标签的机台（既有用例都用这一版）。
+    fn machine(selected: [Option<usize>; LINE_COLUMNS], knob: bool) -> Frame {
+        machine_with(selected, knob, DEFAULT_LABELS.map(Some))
+    }
+
+    /// 固定 LED 读数（测试里不跑字形识别，只验闭环控制）。
+    fn fixed_led(_frame: &Frame, _led: PxRect) -> Result<TargetSequence, String> {
+        parse_led_sequence("10-11-01-10").map_err(|error| error.to_string())
+    }
+
+    struct MachineScreen(Rc<RefCell<Game>>);
+
+    impl Screen for MachineScreen {
+        fn grab(&mut self, _rect: PxRect) -> Result<Frame, String> {
+            let game = self.0.borrow();
+            Ok(machine_with(game.selected, game.knob, game.labels))
+        }
+
+        fn frame_rect(&self) -> PxRect {
+            rect(0, 0, W as i32, H as i32)
+        }
+    }
+
+    #[derive(Default)]
+    struct Game {
+        selected: [Option<usize>; LINE_COLUMNS],
+        knob: bool,
+        /// 左侧 4 行标签；`None` = 那一行没画（读不出）。
+        labels: [Option<&'static str>; LINE_ROWS],
+        dragging: Option<(usize, i32)>,
+        begin_points: Vec<PxPoint>,
+        steps: Vec<(i32, i32)>,
+        releases: u32,
+        events: u64,
+        /// 模拟「拖动无效」：位移被游戏吃掉。
+        stuck: bool,
+        /// 模拟「拖不到位」：无论拖多远，线只挪一档。
+        partial: bool,
+    }
+
+    impl Game {
+        fn new(selected: [Option<usize>; LINE_COLUMNS]) -> Self {
+            Self {
+                selected,
+                knob: true,
+                labels: DEFAULT_LABELS.map(Some),
+                ..Self::default()
+            }
+        }
+
+        /// 换一组行标签（验证「值 → 行」是现查的，不是写死的）。
+        fn with_labels(mut self, labels: [Option<&'static str>; LINE_ROWS]) -> Self {
+            self.labels = labels;
+            self
+        }
+    }
+
+    struct MachinePointer(Rc<RefCell<Game>>);
+
+    impl Pointer for MachinePointer {
+        fn click(&mut self, _at: PxPoint) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn key_space(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn begin(&mut self, at: PxPoint) -> Result<(), String> {
+            let mut game = self.0.borrow_mut();
+            game.begin_points.push(at);
+            game.events += 2;
+            let column = COLUMNS
+                .iter()
+                .position(|&x| (x - at.x).abs() <= 8)
+                .ok_or_else(|| format!("按下点不在任何列中心：{at:?}"))?;
+            game.dragging = Some((column, 0));
+            Ok(())
+        }
+
+        fn step(&mut self, dx: i32, dy: i32) -> Result<(), String> {
+            let mut game = self.0.borrow_mut();
+            game.events += 1;
+            game.steps.push((dx, dy));
+            let (column, moved) = game.dragging.ok_or_else(|| "未按下就拖动".to_owned())?;
+            game.dragging = Some((column, moved + dy));
+            Ok(())
+        }
+
+        fn end(&mut self) -> Result<(), String> {
+            let mut game = self.0.borrow_mut();
+            game.events += 1;
+            game.releases += 1;
+            let (column, moved) = game
+                .dragging
+                .take()
+                .ok_or_else(|| "未按下就抬起".to_owned())?;
+            if game.stuck {
+                return Ok(());
+            }
+            let gap = f32::from((ROWS[1] - ROWS[0]) as i16);
+            let current = f32::from(game.selected[column].unwrap_or(0) as i16);
+            if game.partial {
+                // 拖不到位：无论拖多远，线只挪一档。
+                let shift = if moved > 0 { 1 } else if moved < 0 { -1 } else { 0 };
+                let next = (current as i32 + shift).clamp(0, 3) as usize;
+                game.selected[column] = Some(next);
+                return Ok(());
+            }
+            let next = (current + (moved as f32 / gap)).round().clamp(0.0, 3.0) as usize;
+            game.selected[column] = Some(next);
+            Ok(())
+        }
+
+        fn event_count(&self) -> u64 {
+            self.0.borrow().events
+        }
+    }
+
+    struct TestClock {
+        now: u64,
+    }
+
+    impl Clock for TestClock {
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+
+        fn sleep_ms(&mut self, ms: u64) {
+            self.now += ms;
+        }
+    }
+
+    fn play(mut game: Game) -> (Az3Outcome, Rc<RefCell<Game>>) {
+        let shared = Rc::new(RefCell::new(std::mem::take(&mut game)));
+        let mut screen = MachineScreen(shared.clone());
+        let mut pointer = MachinePointer(shared.clone());
+        let mut clock = TestClock { now: 0 };
+        let cancel = AtomicBool::new(false);
+        let az3 = crate::tests_support::az3();
+        let outcome = run(
+            &mut screen,
+            &mut pointer,
+            &mut clock,
+            fixed_led,
+            &az3,
+            &cancel,
+        );
+        (outcome, shared)
+    }
+
+    fn reason_of(outcome: &Az3Outcome) -> String {
+        match outcome {
+            Az3Outcome::Aborted { reason, .. } => reason.clone(),
+            Az3Outcome::Done { summary, .. } => summary.clone(),
+        }
+    }
+
+    #[test]
+    fn drags_every_column_to_its_target_row_with_vertical_moves_only() {
+        // 目标 `10-11-01-10` = 行 0/1/2/0；起点全在行 3。
+        let (outcome, game) = play(Game::new([Some(3); 4]));
+        let game = game.borrow();
+        assert!(outcome.is_done(), "{outcome:?}");
+        assert_eq!(game.selected, [Some(0), Some(1), Some(2), Some(0)]);
+        assert!(
+            game.steps.iter().all(|&(dx, _)| dx == 0),
+            "只允许纵拖：{:?}",
+            game.steps
+        );
+        assert!(game.releases >= LINE_COLUMNS as u32, "每列至少按下/抬起一次");
+        let expected: Vec<PxPoint> = COLUMNS
+            .iter()
+            .map(|&x| PxPoint { x, y: ROWS[3] })
+            .collect();
+        assert_eq!(
+            game.begin_points, expected,
+            "按下点必须落在「列中心 × 当前档位」上"
+        );
+    }
+
+    #[test]
+    fn already_aligned_columns_are_never_dragged() {
+        let (outcome, game) = play(Game::new([Some(0), Some(1), Some(2), Some(0)]));
+        let game = game.borrow();
+        assert!(outcome.is_done(), "{outcome:?}");
+        assert!(game.begin_points.is_empty(), "已对齐的列一次都不许碰");
+        assert_eq!(game.events, 0, "全程零输入");
+    }
+
+    #[test]
+    fn column_never_readable_is_never_touched() {
+        // 第 2 列**从来没读到过档位**（游戏没给它画框、信号线也没落到过任何一行）。
+        //
+        // 这种情况必须零输入退出：一块「不确定是什么内容」的屏幕，还要按下去拖 5 个行距，
+        // 就是纯盲拖（实机上曾在摩斯面板上拖出 64 个乱事件）。
+        // 归零兜底只在「这一列曾经读到过」时才允许 —— 那时才确认过屏幕和列位都真实存在。
+        let (outcome, game) = play(Game::new([Some(3), None, Some(2), Some(0)]));
+        let game = game.borrow();
+        assert!(
+            game.begin_points.iter().all(|point| point.x != COLUMNS[1]),
+            "从未读到过档位的列一次都不许碰：{:?}",
+            game.begin_points
+        );
+        assert!(!outcome.is_done(), "读不全就不该报完成：{outcome:?}");
+        assert!(
+            reason_of(&outcome).contains("第 2 列没能对齐"),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn blank_frame_aborts_on_the_knob_with_zero_events() {
+        struct Blank;
+        impl Screen for Blank {
+            fn grab(&mut self, _rect: PxRect) -> Result<Frame, String> {
+                Ok(Canvas::new([0, 0, 0]).frame())
+            }
+
+            fn frame_rect(&self) -> PxRect {
+                rect(0, 0, W as i32, H as i32)
+            }
+        }
+        struct Quiet(Rc<RefCell<Game>>);
+        impl Pointer for Quiet {
+            fn click(&mut self, _at: PxPoint) -> Result<(), String> {
+                self.0.borrow_mut().events += 1;
+                Ok(())
+            }
+            fn key_space(&mut self) -> Result<(), String> {
+                self.0.borrow_mut().events += 1;
+                Ok(())
+            }
+            fn begin(&mut self, _at: PxPoint) -> Result<(), String> {
+                self.0.borrow_mut().events += 1;
+                Ok(())
+            }
+            fn step(&mut self, _dx: i32, _dy: i32) -> Result<(), String> {
+                self.0.borrow_mut().events += 1;
+                Ok(())
+            }
+            fn end(&mut self) -> Result<(), String> {
+                self.0.borrow_mut().events += 1;
+                Ok(())
+            }
+            fn event_count(&self) -> u64 {
+                self.0.borrow().events
+            }
+        }
+
+        let shared = Rc::new(RefCell::new(Game::default()));
+        let mut screen = Blank;
+        let mut pointer = Quiet(shared.clone());
+        let mut clock = TestClock { now: 0 };
+        let cancel = AtomicBool::new(false);
+        let az3 = crate::tests_support::az3();
+        let outcome = run(
+            &mut screen,
+            &mut pointer,
+            &mut clock,
+            fixed_led,
+            &az3,
+            &cancel,
+        );
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(pointer.event_count(), 0, "定位失败必须零输入");
+        assert!(reason_of(&outcome).contains("没找到红色旋钮"), "{outcome:?}");
+    }
+
+    #[test]
+    fn screen_without_knob_aborts_on_the_knob() {
+        struct NoKnob;
+        impl Screen for NoKnob {
+            fn grab(&mut self, _rect: PxRect) -> Result<Frame, String> {
+                Ok(machine([Some(0), Some(1), Some(2), Some(0)], false))
+            }
+
+            fn frame_rect(&self) -> PxRect {
+                rect(0, 0, W as i32, H as i32)
+            }
+        }
+
+        let shared = Rc::new(RefCell::new(Game::default()));
+        let mut screen = NoKnob;
+        let mut pointer = MachinePointer(shared.clone());
+        let mut clock = TestClock { now: 0 };
+        let cancel = AtomicBool::new(false);
+        let az3 = crate::tests_support::az3();
+        let outcome = run(
+            &mut screen,
+            &mut pointer,
+            &mut clock,
+            fixed_led,
+            &az3,
+            &cancel,
+        );
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(pointer.event_count(), 0);
+        assert!(reason_of(&outcome).contains("没找到红色旋钮"), "{outcome:?}");
+    }
+
+    #[test]
+    fn unreadable_led_aborts_without_touching_the_mouse() {
+        fn broken_led(_frame: &Frame, _led: PxRect) -> Result<TargetSequence, String> {
+            Err("只读到 2 组".to_owned())
+        }
+        let shared = Rc::new(RefCell::new(Game::new([Some(3); 4])));
+        let mut screen = MachineScreen(shared.clone());
+        let mut pointer = MachinePointer(shared.clone());
+        let mut clock = TestClock { now: 0 };
+        let cancel = AtomicBool::new(false);
+        let az3 = crate::tests_support::az3();
+        let outcome = run(
+            &mut screen,
+            &mut pointer,
+            &mut clock,
+            broken_led,
+            &az3,
+            &cancel,
+        );
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(pointer.event_count(), 0);
+        assert!(reason_of(&outcome).contains("数字条读不出来"), "{outcome:?}");
+    }
+
+    #[test]
+    fn a_column_that_never_moves_is_given_up_after_one_correction() {
+        let mut game = Game::new([Some(3); 4]);
+        game.stuck = true;
+        let (outcome, game) = play(game);
+        let game = game.borrow();
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(
+            game.begin_points.len(),
+            (1 + MAX_CORRECTIONS as usize) * LINE_COLUMNS,
+            "每列 1 次主拖 + 最多 {MAX_CORRECTIONS} 次补拖就放弃（B20：不许无限重试）"
+        );
+        assert!(reason_of(&outcome).contains("4 列都没能对齐"), "{outcome:?}");
+    }
+
+    #[test]
+    fn a_drag_that_lands_short_is_corrected_exactly_once() {
+        // 拖不到位（每拖一次只挪一档）：每列 1 次主拖 + 最多 1 次补拖，仍偏就记 failed。
+        let mut game = Game::new([Some(3); 4]);
+        game.partial = true;
+        let (outcome, shared) = play(game);
+        let game = shared.borrow();
+        assert!(!outcome.is_done(), "{outcome:?}");
+        let budget = 1 + MAX_CORRECTIONS as usize;
+        for (index, &column) in COLUMNS.iter().enumerate() {
+            let drags = game
+                .begin_points
+                .iter()
+                .filter(|point| (point.x - column).abs() <= 8)
+                .count();
+            assert!(drags >= 1, "第 {} 列一次都没拖", index + 1);
+            assert!(
+                drags <= budget,
+                "第 {} 列拖了 {drags} 次，超过 1 主拖 + {MAX_CORRECTIONS} 次补拖",
+                index + 1
+            );
+        }
+        assert!(
+            game.begin_points.len() > LINE_COLUMNS,
+            "至少要有一列用上补拖：{:?}",
+            game.begin_points
+        );
+        // 拖动全程只有纵向、且每子步 ≤20px（步长没被放宽）。
+        assert!(game.steps.iter().all(|&(dx, dy)| dx == 0 && dy.abs() <= 20));
+        let reason = reason_of(&outcome);
+        assert!(
+            reason.contains("列") && reason.contains("没能对齐"),
+            "放弃时要说清是哪几列没搞定：{reason}"
+        );
+    }
+
+    #[test]
+    fn drag_splits_into_eight_equal_vertical_steps() {
+        let shared = Rc::new(RefCell::new(Game::default()));
+        let mut pointer = MachinePointer(shared.clone());
+        let cancel = AtomicBool::new(false);
+        drop(drag(
+            &mut pointer,
+            PxPoint { x: 100, y: 240 },
+            -150,
+            &cancel,
+        ));
+        let game = shared.borrow();
+        assert_eq!(game.steps.len(), DRAG_STEPS as usize);
+        assert_eq!(game.steps.iter().map(|&(_, dy)| dy).sum::<i32>(), -150);
+        assert!(game.steps.iter().all(|&(dx, _)| dx == 0));
+        assert_eq!(game.releases, 1, "抬起必须发生");
+        assert!(game.dragging.is_none());
+    }
+
+    #[test]
+    fn cancel_during_drag_still_releases_the_button() {
+        let shared = Rc::new(RefCell::new(Game::default()));
+        let mut pointer = MachinePointer(shared.clone());
+        let cancel = AtomicBool::new(true);
+        let outcome = drag(&mut pointer, PxPoint { x: 100, y: 240 }, -150, &cancel);
+        assert_eq!(outcome, Err("已取消".to_owned()));
+        assert_eq!(shared.borrow().releases, 1, "取消也必须抬手，否则鼠标键会卡死");
+    }
+
+    // ── 行标签 → 目标行（本轮新增）──
+
+    #[test]
+    fn led_values_are_mapped_through_the_row_labels_not_a_fixed_table() {
+        // 每局标签顺序会变：这一局自上而下是 `01/00/11/10`。
+        // 目标序列仍是 `10-11-01-10` ⇒ 值 2/3/1/2 ⇒ 行 3/2/0/3。
+        let expected = [Some(3), Some(2), Some(0), Some(3)];
+        let game = Game::new([Some(0); 4])
+            .with_labels([Some("01"), Some("00"), Some("11"), Some("10")]);
+        let (outcome, game) = play(game);
+        let game = game.borrow();
+        assert!(outcome.is_done(), "{outcome:?}");
+        assert_eq!(
+            game.selected, expected,
+            "必须拖到「标签值对应的那一行」，不是写死的行 0/1/2/0"
+        );
+        assert!(
+            game.steps.iter().all(|&(dx, _)| dx == 0),
+            "只允许纵拖：{:?}",
+            game.steps
+        );
+    }
+
+    #[test]
+    fn a_duplicated_label_value_stops_the_run_with_zero_input() {
+        // 两行都是 `10` ⇒ 目标值 2 出现 2 次 ⇒ 目标行不唯一：一列也不许动。
+        let game = Game::new([Some(3); 4])
+            .with_labels([Some("10"), Some("10"), Some("01"), Some("00")]);
+        let (outcome, game) = play(game);
+        let game = game.borrow();
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert!(game.begin_points.is_empty(), "映射不唯一 ⇒ 零输入：{:?}", game.begin_points);
+        assert_eq!(game.events, 0, "全程零输入");
+        let reason = reason_of(&outcome);
+        assert!(
+            reason.contains("出现 2 次") && reason.contains("无法确定目标行"),
+            "要说清是哪一列、哪个值、出现几次：{reason}"
+        );
+    }
+
+    #[test]
+    fn unreadable_labels_stop_the_run_with_zero_input() {
+        // 第 3 行的标签读不出 ⇒ 那个值可能就藏在它后面，整块不可信。
+        let game = Game::new([Some(3); 4])
+            .with_labels([Some("10"), Some("11"), None, Some("00")]);
+        let (outcome, game) = play(game);
+        let game = game.borrow();
+        assert!(!outcome.is_done(), "{outcome:?}");
+        assert_eq!(game.events, 0, "读不出标签时不许有任何输入");
+        let reason = reason_of(&outcome);
+        assert!(
+            reason.contains("左侧行标签读不出") && reason.contains("1 行没读到"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn label_values_are_parsed_from_their_two_digits() {
+        assert_eq!(label_value("10"), Some(2));
+        assert_eq!(label_value("11"), Some(3));
+        assert_eq!(label_value("01"), Some(1));
+        assert_eq!(label_value("00"), Some(0));
+        assert_eq!(label_value("2"), None, "必须是两位");
+        assert_eq!(label_value("12"), None, "只允许 0/1");
+    }
+
+    #[test]
+    fn resolve_target_rows_reports_a_missing_label_before_anything_else() {
+        let sequence = parse_led_sequence("10-11-01-10").expect("合法序列");
+        assert_eq!(
+            resolve_target_rows(&[Some(2), Some(3), Some(1), None], &sequence),
+            Err(TargetMapError::LabelsUnreadable { missing: 1 })
+        );
+        // 全读出、且值是 10/11/01/00 的一个排列 ⇒ 正常查表。
+        assert_eq!(
+            resolve_target_rows(&[Some(2), Some(3), Some(1), Some(0)], &sequence),
+            Ok([0, 1, 2, 0])
+        );
+    }
+}
